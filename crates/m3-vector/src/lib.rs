@@ -5,7 +5,9 @@ use m3_error::{M3Error, Result};
 use rayon::prelude::*;
 
 mod displacement;
-pub use displacement::{enforce_displacement_guard, DisplacementRow};
+pub use displacement::{
+    displacement_permutation, enforce_displacement_guard, DisplacementRow,
+};
 
 /// Reinterpret a SQLite BLOB (`&[u8]`) as `&[f32]` with no copy.
 ///

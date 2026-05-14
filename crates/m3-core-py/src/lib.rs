@@ -120,19 +120,20 @@ fn mmr_rerank_scored(
 }
 
 /// Expansion-displacement guard. Takes `(score, is_expansion)` tuples in
-/// current ranked order, returns the reordered list.
+/// current ranked order, returns the index permutation that reorders them —
+/// indices, not the rows themselves, so callers can map back to their own row
+/// objects even when `(score, is_expansion)` pairs collide.
 #[pyfunction]
 fn enforce_displacement_guard(
     items: Vec<(f32, bool)>,
     protected_ranks: usize,
     margin: f32,
-) -> Vec<(f32, bool)> {
-    let mut rows: Vec<m3_vector::DisplacementRow> = items
+) -> Vec<usize> {
+    let rows: Vec<m3_vector::DisplacementRow> = items
         .iter()
         .map(|&(score, is_expansion)| m3_vector::DisplacementRow { score, is_expansion })
         .collect();
-    m3_vector::enforce_displacement_guard(&mut rows, protected_ranks, margin);
-    rows.into_iter().map(|r| (r.score, r.is_expansion)).collect()
+    m3_vector::displacement_permutation(&rows, protected_ranks, margin)
 }
 
 #[pyfunction]

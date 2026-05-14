@@ -9,14 +9,29 @@ description = "ONNX Runtime GLiNER NER backend for m3-dispatcher."
 
 [features]
 default = []
-# Real `ort` (ONNX Runtime) backend. Left as a documented stub: enabling this
-# requires ONNX Runtime native libraries on the build host. The default build
-# provides the pure-Rust span-decode + EP-priority logic and a stub `run`.
-onnx = []
+# Real `ort` (ONNX Runtime) backend. Non-default: enabling it pulls `ort` with
+# `load-dynamic`, which `dlopen`s a prebuilt `onnxruntime` shared library at
+# runtime — no native toolchain or import library needed at build time. The
+# caller points `ort` at the DLL via `OrtNer::new`'s `dylib_path` argument or
+# the `ORT_DYLIB_PATH` env var. The default build keeps the pure-Rust
+# span-decode + EP-priority logic with no ONNX Runtime dependency at all.
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [dependencies]
 m3-error = { workspace = true }
 m3-dispatcher = { workspace = true }
+# `load-dynamic`: dlopen the ONNX Runtime DLL at runtime (no .lib/compiler).
+# default-features off: drops `download-binaries` (no network fetch / no
+# bundled lib) — we use a runtime-installed ONNX Runtime instead.
+# `api-24`: pin the ONNX Runtime C API level `ort` binds against (rc.12's
+# default). The installed runtime is 1.25.x; the 1.24 API surface is a
+# forward-compatible subset, so a 1.25 DLL satisfies these bindings.
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-24"], optional = true }
+# default-features off: drops `onig` + `esaxx_fast`, both of which need a C++
+# compiler. `fancy-regex` is the pure-Rust regex backend — builds with no
+# native toolchain.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"], optional = true }
+ndarray = { version = "0.16", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

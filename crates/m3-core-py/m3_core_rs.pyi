@@ -138,3 +138,23 @@ class DispatcherConfig:
     def __repr__(self) -> str: ...
 
 def env_config_summary() -> dict[str, object]: ...
+
+# --- m3-embed-llamacpp (embedded backend) ----------------------------------
+#
+# `EmbeddedEmbedder` is ONLY present when the wheel is built with
+# `--features embedded`. In a default build the class is not registered, so
+# `m3_core_rs.EmbeddedEmbedder` raises AttributeError. Guard accesses with
+# `hasattr(m3_core_rs, "EmbeddedEmbedder")`.
+
+class EmbeddedEmbedder:
+    """In-process GGUF embedding model via linked llama.cpp. Construction is
+    cheap; the model loads lazily on first embed()/embedding_dim()."""
+
+    def __init__(self, model_path: str) -> None: ...
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """One embedding row per input text, each of length embedding_dim()."""
+        ...
+
+    def embedding_dim(self) -> int:
+        """Embedding dimension reported by the model (forces lazy load)."""
+        ...

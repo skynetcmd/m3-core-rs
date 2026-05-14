@@ -611,6 +611,66 @@ fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
 }
 
 // ---------------------------------------------------------------------------
+// m3-embed-llamacpp — embedded (in-process) llama.cpp backend
+// ---------------------------------------------------------------------------
+//
+// Only compiled with `--features embedded`. Without the feature the
+// `EmbeddedEmbedder` class is not registered at all, so `m3_core_rs.EmbeddedEmbedder`
+// raises `AttributeError` in Python — a clear signal the wheel was built
+// without llama.cpp.
+
+/// In-process bge-m3 (or any GGUF) embedding model via linked llama.cpp.
+/// Construction is cheap; the GGUF model loads lazily on the first
+/// `embed`/`embedding_dim` call.
+#[cfg(feature = "embedded")]
+#[pyclass(name = "EmbeddedEmbedder")]
+struct PyEmbeddedEmbedder {
+    backend: m3_embed_llamacpp::EmbeddedBackend,
+    runtime: tokio::runtime::Runtime,
+}
+
+#[cfg(feature = "embedded")]
+#[pymethods]
+impl PyEmbeddedEmbedder {
+    /// `model_path` is an absolute path to a GGUF embedding model.
+    /// Does not load the model — that happens lazily on first use.
+    #[new]
+    fn new(model_path: &str) -> PyResult<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                PyOSError::new_err(format!("failed to build tokio runtime: {e}"))
+            })?;
+        Ok(PyEmbeddedEmbedder {
+            backend: m3_embed_llamacpp::EmbeddedBackend::new(model_path),
+            runtime,
+        })
+    }
+
+    /// Embed a batch of texts. Returns one row per input, each of length
+    /// `embedding_dim()`. Blocks the calling thread: `EmbeddedBackend::run`
+    /// is async but the heavy work runs on tokio's blocking pool, so a
+    /// `block_on` here is fine (chosen for simplicity over pyo3-async-runtimes).
+    fn embed(&self, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        let batch = m3_dispatcher::Batch::new(texts, 0);
+        let out = self
+            .runtime
+            .block_on(<m3_embed_llamacpp::EmbeddedBackend as m3_dispatcher::ModelBackend>::run(
+                &self.backend,
+                batch,
+            ));
+        map_err(out).map(|b| b.rows)
+    }
+
+    /// Embedding dimension reported by the model. Forces the lazy GGUF
+    /// load on first call (no full inference needed).
+    fn embedding_dim(&self) -> PyResult<i32> {
+        map_err(self.backend.embedding_dim())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // module
 // ---------------------------------------------------------------------------
 
@@ -648,6 +708,11 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRetryPolicy>()?;
     m.add_class::<PySpan>()?;
     m.add_class::<PyDispatcherConfig>()?;
+
+    // Only present when built with `--features embedded`. Absent otherwise,
+    // so `m3_core_rs.EmbeddedEmbedder` raises AttributeError in Python.
+    #[cfg(feature = "embedded")]
+    m.add_class::<PyEmbeddedEmbedder>()?;
 
     Ok(())
 }

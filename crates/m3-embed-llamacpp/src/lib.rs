@@ -110,6 +110,27 @@ impl EmbeddedBackend {
             state: std::sync::OnceLock::new(),
         }
     }
+
+    /// Load the model (if not already cached) and return its embedding
+    /// dimension. Forces the lazy load, so the first call pays the GGUF
+    /// load cost. Only available with the `embedded` feature.
+    #[cfg(feature = "embedded")]
+    pub fn embedding_dim(&self) -> Result<i32> {
+        let model = self.loaded_model()?;
+        Ok(model.n_embd())
+    }
+
+    /// Get-or-load the cached `LoadedModel`. Internal helper shared by
+    /// `run` and `embedding_dim`.
+    #[cfg(feature = "embedded")]
+    fn loaded_model(&self) -> Result<std::sync::Arc<embedded::LoadedModel>> {
+        if let Some(m) = self.state.get() {
+            return Ok(m.clone());
+        }
+        let loaded = std::sync::Arc::new(embedded::LoadedModel::load(&self.model_path)?);
+        let _ = self.state.set(loaded.clone());
+        Ok(self.state.get().cloned().unwrap_or(loaded))
+    }
 }
 
 #[cfg(feature = "embedded")]
@@ -149,14 +170,20 @@ mod embedded {
             self.model.n_embd()
         }
 
-        /// Tokenize + embed a batch of texts with mean pooling. One row per
-        /// input text, each of length `n_embd`.
+        /// Tokenize + embed a batch of texts. One row per input text, each of
+        /// length `n_embd`.
+        ///
+        /// Pooling is CLS and output is L2-normalized to match m3-memory's
+        /// HTTP embed path: llama-server is launched with `--pooling cls` for
+        /// bge-m3, and its OpenAI-compatible `/v1/embeddings` endpoint
+        /// L2-normalizes by default. Mean pooling here produced vectors that
+        /// cosine-0.74 against the stored corpus instead of ~1.0.
         pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             let n_ctx = 8192u32;
             let ctx_params = LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(n_ctx))
                 .with_embeddings(true)
-                .with_pooling_type(LlamaPoolingType::Mean);
+                .with_pooling_type(LlamaPoolingType::Cls);
             let mut ctx = self
                 .model
                 .new_context(&self.backend, ctx_params)
@@ -184,10 +211,20 @@ mod embedded {
                 let emb = ctx
                     .embeddings_seq_ith(0)
                     .map_err(|e| M3Error::Backend(format!("read embeddings failed: {e}")))?;
-                out.push(emb.to_vec());
+                out.push(l2_normalize(emb));
             }
             Ok(out)
         }
+    }
+
+    /// L2-normalize a vector to unit length. A zero vector is returned
+    /// unchanged (no division by zero).
+    fn l2_normalize(v: &[f32]) -> Vec<f32> {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return v.to_vec();
+        }
+        v.iter().map(|x| x / norm).collect()
     }
 }
 
@@ -201,13 +238,7 @@ impl ModelBackend for EmbeddedBackend {
 
     #[cfg(feature = "embedded")]
     async fn run(&self, batch: Batch) -> Result<BatchOutput> {
-        let model = if let Some(m) = self.state.get() {
-            m.clone()
-        } else {
-            let loaded = std::sync::Arc::new(embedded::LoadedModel::load(&self.model_path)?);
-            let _ = self.state.set(loaded.clone());
-            self.state.get().cloned().unwrap_or(loaded)
-        };
+        let model = self.loaded_model()?;
         let texts = batch.texts;
         let rows = tokio::task::spawn_blocking(move || model.embed(&texts))
             .await

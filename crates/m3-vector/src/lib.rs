@@ -4,6 +4,9 @@
 use m3_error::{M3Error, Result};
 use rayon::prelude::*;
 
+mod displacement;
+pub use displacement::{enforce_displacement_guard, DisplacementRow};
+
 /// Reinterpret a SQLite BLOB (`&[u8]`) as `&[f32]` with no copy.
 ///
 /// Replaces Python's `struct.unpack`. Errors if the byte length is not a
@@ -108,4 +111,99 @@ pub fn mmr_rerank(
         selected.push(remaining.swap_remove(best_idx));
     }
     Ok(selected)
+}
+
+/// Policy-aware MMR that mirrors m3-memory's retrieval-ranking loop.
+///
+/// Unlike [`mmr_rerank`], the relevance term is a caller-supplied score per
+/// candidate (a blended FTS+vector rank score), not cosine-to-query. The
+/// diversity term is still cosine between candidate vectors.
+///
+/// `relevance[i]` and `candidate_vectors[i]` describe the same candidate.
+/// When `force_seed_first` is true, index 0 is selected first unconditionally
+/// (caller must pre-sort descending by relevance); the rest are greedily picked
+/// by `lambda * relevance[i] - (1 - lambda) * max_cosine_to_selected`. When
+/// false, selection is pure greedy from an empty `selected` set.
+///
+/// `max_sim` is 0.0 when `selected` is empty. Returns `min(k, n)` indices in
+/// selection order.
+pub fn mmr_rerank_scored(
+    relevance: &[f32],
+    candidate_vectors: &[&[f32]],
+    lambda: f32,
+    k: usize,
+    force_seed_first: bool,
+) -> Result<Vec<usize>> {
+    let n = relevance.len();
+    if candidate_vectors.len() != n {
+        return Err(M3Error::Other(format!(
+            "relevance/vector length mismatch: {} vs {}",
+            n,
+            candidate_vectors.len()
+        )));
+    }
+    let take = k.min(n);
+    let mut selected: Vec<usize> = Vec::with_capacity(take);
+    let mut remaining: Vec<usize> = (0..n).collect();
+    if take == 0 {
+        return Ok(selected);
+    }
+
+    if force_seed_first {
+        selected.push(remaining.remove(0));
+    }
+
+    while selected.len() < take {
+        let mut best_pos = 0usize;
+        let mut best_score = f32::NEG_INFINITY;
+        for (pos, &cand) in remaining.iter().enumerate() {
+            let max_sim = selected
+                .iter()
+                .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
+                .fold(0.0f32, f32::max);
+            let score = lambda * relevance[cand] - (1.0 - lambda) * max_sim;
+            if score > best_score {
+                best_score = score;
+                best_pos = pos;
+            }
+        }
+        selected.push(remaining.remove(best_pos));
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scored_force_seed_picks_index_zero_first() {
+        // index 1 has higher relevance, but force_seed_first pins index 0.
+        let v0: &[f32] = &[1.0, 0.0];
+        let v1: &[f32] = &[0.0, 1.0];
+        let v2: &[f32] = &[1.0, 1.0];
+        let rel = [0.5, 0.9, 0.1];
+        let cands = [v0, v1, v2];
+        let out = mmr_rerank_scored(&rel, &cands, 0.7, 3, true).unwrap();
+        assert_eq!(out[0], 0);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn scored_no_seed_is_pure_greedy() {
+        let v0: &[f32] = &[1.0, 0.0];
+        let v1: &[f32] = &[0.0, 1.0];
+        let rel = [0.5, 0.9];
+        let cands = [v0, v1];
+        let out = mmr_rerank_scored(&rel, &cands, 0.7, 2, false).unwrap();
+        assert_eq!(out, vec![1, 0]);
+    }
+
+    #[test]
+    fn scored_k_greater_than_n() {
+        let v0: &[f32] = &[1.0, 0.0];
+        let rel = [0.5];
+        let cands = [v0];
+        assert_eq!(mmr_rerank_scored(&rel, &cands, 0.7, 9, true).unwrap(), vec![0]);
+    }
 }

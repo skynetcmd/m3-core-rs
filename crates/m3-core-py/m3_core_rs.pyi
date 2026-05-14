@@ -19,6 +19,16 @@ def cosine_batch(query: list[float], corpus: list[list[float]]) -> list[float]: 
 def mmr_rerank(
     query: list[float], candidates: list[list[float]], lambda_: float, k: int
 ) -> list[int]: ...
+def mmr_rerank_scored(
+    relevance: list[float],
+    candidate_vectors: list[list[float]],
+    lambda_: float,
+    k: int,
+    force_seed_first: bool,
+) -> list[int]: ...
+def enforce_displacement_guard(
+    items: list[tuple[float, bool]], protected_ranks: int, margin: float
+) -> list[tuple[float, bool]]: ...
 def blob_as_f32(blob: bytes) -> list[float]: ...
 def f32_as_blob(vec: list[float]) -> bytes: ...
 

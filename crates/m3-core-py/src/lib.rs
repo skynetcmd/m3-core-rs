@@ -102,6 +102,40 @@ fn mmr_rerank(
 }
 
 #[pyfunction]
+fn mmr_rerank_scored(
+    relevance: Vec<f32>,
+    candidate_vectors: Vec<Vec<f32>>,
+    lambda: f32,
+    k: usize,
+    force_seed_first: bool,
+) -> PyResult<Vec<usize>> {
+    let refs: Vec<&[f32]> = candidate_vectors.iter().map(|v| v.as_slice()).collect();
+    map_err(m3_vector::mmr_rerank_scored(
+        &relevance,
+        &refs,
+        lambda,
+        k,
+        force_seed_first,
+    ))
+}
+
+/// Expansion-displacement guard. Takes `(score, is_expansion)` tuples in
+/// current ranked order, returns the reordered list.
+#[pyfunction]
+fn enforce_displacement_guard(
+    items: Vec<(f32, bool)>,
+    protected_ranks: usize,
+    margin: f32,
+) -> Vec<(f32, bool)> {
+    let mut rows: Vec<m3_vector::DisplacementRow> = items
+        .iter()
+        .map(|&(score, is_expansion)| m3_vector::DisplacementRow { score, is_expansion })
+        .collect();
+    m3_vector::enforce_displacement_guard(&mut rows, protected_ranks, margin);
+    rows.into_iter().map(|r| (r.score, r.is_expansion)).collect()
+}
+
+#[pyfunction]
 fn blob_as_f32(blob: Vec<u8>) -> PyResult<Vec<f32>> {
     map_err(m3_vector::blob_as_f32(&blob)).map(|s| s.to_vec())
 }
@@ -566,6 +600,8 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank, m)?)?;
+    m.add_function(wrap_pyfunction!(mmr_rerank_scored, m)?)?;
+    m.add_function(wrap_pyfunction!(enforce_displacement_guard, m)?)?;
     m.add_function(wrap_pyfunction!(blob_as_f32, m)?)?;
     m.add_function(wrap_pyfunction!(f32_as_blob, m)?)?;
     m.add_function(wrap_pyfunction!(redact, m)?)?;

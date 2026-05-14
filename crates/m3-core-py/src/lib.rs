@@ -642,10 +642,21 @@ fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// In-process bge-m3 (or any GGUF) embedding model via linked llama.cpp.
 /// Construction is cheap; the GGUF model loads lazily on the first
 /// `embed`/`embedding_dim` call.
+///
+/// ## Dispatcher wiring (CHANGE 3)
+///
+/// `embed` no longer calls `EmbeddedBackend::run` directly — it routes through
+/// `m3_dispatcher::Dispatcher<EmbeddedBackend>`, the same coalescer the HTTP
+/// path uses. The stream count flows env var -> `DispatcherConfig::streams` ->
+/// `EmbeddedBackend` context-pool size, so the dispatcher's slot semaphore and
+/// the backend's worker-thread pool always agree (no point in a 4-context pool
+/// behind an 8-slot dispatcher). For introspection / `embedding_dim` a handle
+/// to the raw backend is kept alongside the dispatcher.
 #[cfg(feature = "embedded")]
 #[pyclass(name = "EmbeddedEmbedder")]
 struct PyEmbeddedEmbedder {
-    backend: m3_embed_llamacpp::EmbeddedBackend,
+    dispatcher: m3_dispatcher::Dispatcher<m3_embed_llamacpp::EmbeddedBackend>,
+    backend: std::sync::Arc<m3_embed_llamacpp::EmbeddedBackend>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -654,39 +665,68 @@ struct PyEmbeddedEmbedder {
 impl PyEmbeddedEmbedder {
     /// `model_path` is an absolute path to a GGUF embedding model.
     /// Does not load the model — that happens lazily on first use.
+    ///
+    /// The dispatcher config is built from the `M3_*` env layer; `streams`
+    /// (`M3_EMBED_STREAMS`) sizes both the dispatcher and the backend's
+    /// context pool.
     #[new]
     fn new(model_path: &str) -> PyResult<Self> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        // Multi-thread runtime: the embed worker pool blocks on
+        // `spawn_blocking`, and `Dispatcher::new` spawns a scheduler task.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| {
                 PyOSError::new_err(format!("failed to build tokio runtime: {e}"))
             })?;
+
+        let cfg = config::dispatcher_config_from_env();
+        let streams = cfg.streams;
+        // env var -> DispatcherConfig::streams -> EmbeddedBackend pool size.
+        // `Dispatcher::new` takes the backend by value, so a second cheap
+        // handle is kept for `embedding_dim` introspection. Both share the one
+        // process-global `LlamaBackend` (llama.cpp allows only a single
+        // `init()` per process); each lazily loads its own `LlamaModel` +
+        // worker pool on first use. In practice `embed` is what gets called,
+        // so the introspection handle's pool usually never loads.
+        let backend = std::sync::Arc::new(
+            m3_embed_llamacpp::EmbeddedBackend::with_streams(model_path, streams),
+        );
+        let dispatcher_backend =
+            m3_embed_llamacpp::EmbeddedBackend::with_streams(model_path, streams);
+        // `Dispatcher::new` calls `tokio::spawn` — must run inside the runtime.
+        let dispatcher = {
+            let _guard = runtime.enter();
+            m3_dispatcher::Dispatcher::new(cfg, dispatcher_backend)
+        };
+
         Ok(PyEmbeddedEmbedder {
-            backend: m3_embed_llamacpp::EmbeddedBackend::new(model_path),
+            dispatcher,
+            backend,
             runtime,
         })
     }
 
     /// Embed a batch of texts. Returns one row per input, each of length
-    /// `embedding_dim()`. Blocks the calling thread: `EmbeddedBackend::run`
-    /// is async but the heavy work runs on tokio's blocking pool, so a
-    /// `block_on` here is fine (chosen for simplicity over pyo3-async-runtimes).
+    /// `embedding_dim()`. Routes through the dispatcher's `embed_batch`, which
+    /// applies the slot semaphore + circuit breaker before handing the batch
+    /// to the multi-stream `EmbeddedBackend`. Blocks the calling thread.
     fn embed(&self, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
-        let batch = m3_dispatcher::Batch::new(texts, 0);
-        let out = self
-            .runtime
-            .block_on(<m3_embed_llamacpp::EmbeddedBackend as m3_dispatcher::ModelBackend>::run(
-                &self.backend,
-                batch,
-            ));
-        map_err(out).map(|b| b.rows)
+        let out = self.runtime.block_on(self.dispatcher.embed_batch(texts));
+        map_err(out)
     }
 
     /// Embedding dimension reported by the model. Forces the lazy GGUF
     /// load on first call (no full inference needed).
     fn embedding_dim(&self) -> PyResult<i32> {
         map_err(self.backend.embedding_dim())
+    }
+
+    /// Configured concurrent stream count (`M3_EMBED_STREAMS`). Equal to both
+    /// the dispatcher's slot count and the backend's context-pool size.
+    fn streams(&self) -> usize {
+        self.backend.streams()
     }
 }
 

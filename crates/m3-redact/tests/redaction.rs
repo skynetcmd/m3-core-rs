@@ -1,100 +1,162 @@
-//! Per-pattern redaction coverage. Stands in for the pending Python-parity
-//! corpus test (corpus not yet available in this workspace).
+//! Parity tests mirroring chatlog_redaction.py's `__main__` self-tests
+//! (lines ~230-281) plus per-group, eval-order, PII-gating, custom-regex,
+//! bad-regex, and disabled-config coverage.
 
-use m3_redact::{redact, RedactionProfile};
+use m3_redact::{scrub, RedactionConfig, Redactor};
 
-fn p() -> RedactionProfile {
-    RedactionProfile::default()
+fn cfg(enabled: bool, patterns: &[&str], custom: &[&str], redact_pii: bool) -> RedactionConfig {
+    RedactionConfig {
+        enabled,
+        patterns: patterns.iter().map(|s| s.to_string()).collect(),
+        custom_regex: custom.iter().map(|s| s.to_string()).collect(),
+        redact_pii,
+    }
 }
 
 #[test]
-fn aws_access_key_positive() {
-    let r = redact("key is AKIAIOSFODNN7EXAMPLE done", &p());
-    assert!(r.text.contains("[REDACTED:aws_access_key]"));
-    assert_eq!(r.hits, 1);
-    assert_eq!(r.breakdown.get("aws_access_key"), Some(&1));
+fn disabled_config_is_noop() {
+    let c = cfg(false, &[], &[], false);
+    let r = scrub("sk-ant-foobar12345678901234567890", &c);
+    assert_eq!(r.content, "sk-ant-foobar12345678901234567890");
+    assert_eq!(r.match_count, 0);
+    assert!(r.groups_fired.is_empty());
 }
 
 #[test]
-fn aws_access_key_negative() {
-    let r = redact("AKIA is too short", &p());
-    assert_eq!(r.hits, 0);
+fn api_keys_group() {
+    let c = cfg(true, &["api_keys"], &[], false);
+    let r = scrub(
+        "here is sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890 keep it safe",
+        &c,
+    );
+    assert_eq!(r.match_count, 1);
+    assert!(r.groups_fired.contains(&"api_keys".to_string()));
+    assert!(r.content.contains("[REDACTED:api_keys]"));
 }
 
 #[test]
-fn anthropic_key_positive() {
-    let r = redact("sk-ant-api03-AbCdEf0123456789AbCdEf done", &p());
-    assert!(r.text.contains("[REDACTED:anthropic_key]"));
-    assert_eq!(r.hits, 1);
+fn github_tokens_group() {
+    let c = cfg(true, &["github_tokens"], &[], false);
+    let input = format!("token: ghp_{}", "a".repeat(36));
+    let r = scrub(&input, &c);
+    assert_eq!(r.match_count, 1);
+    assert!(r.content.contains("[REDACTED:github_tokens]"));
 }
 
 #[test]
-fn openai_key_positive_and_anthropic_not_misclassified() {
-    let generic = redact("token sk-AbCdEf0123456789AbCdEfGh end", &p());
-    assert!(generic.text.contains("[REDACTED:openai_key]"));
-    let anth = redact("sk-ant-abcdefghij0123456789kl end", &p());
-    assert!(anth.text.contains("[REDACTED:anthropic_key]"));
-    assert!(!anth.text.contains("[REDACTED:openai_key]"));
+fn bearer_tokens_group() {
+    let c = cfg(true, &["bearer_tokens"], &[], false);
+    let r = scrub("Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123", &c);
+    assert!(r.content.contains("[REDACTED:bearer_tokens]"));
+    assert!(r.match_count >= 1);
 }
 
 #[test]
-fn google_api_key_positive() {
-    let r = redact("g AIzaSyA1234567890abcdefABCDEF_ghijk-lmn x", &p());
-    assert!(r.text.contains("[REDACTED:google_api_key]"));
+fn jwt_group() {
+    let c = cfg(true, &["jwt"], &[], false);
+    let tok = "eyJhbGciOiJIUzI1NiIs.eyJzdWIiOiIxMjM0NTY3.SflKxwRJSMeKKF2QT4";
+    let r = scrub(&format!("jwt={tok} end"), &c);
+    assert_eq!(r.match_count, 1);
+    assert!(r.content.contains("[REDACTED:jwt]"));
 }
 
 #[test]
-fn github_token_positive() {
-    let r = redact("ghp_0123456789abcdefABCDEF0123456789abcd here", &p());
-    assert!(r.text.contains("[REDACTED:github_token]"));
+fn aws_keys_group() {
+    let c = cfg(true, &["aws_keys"], &[], false);
+    let r = scrub("key AKIAIOSFODNN7EXAMPLE end", &c);
+    assert_eq!(r.match_count, 1);
+    assert!(r.content.contains("[REDACTED:aws_keys]"));
 }
 
 #[test]
-fn email_positive_negative() {
-    let r = redact("reach me at alice@example.com please", &p());
-    assert!(r.text.contains("[REDACTED:email]"));
-    let neg = redact("not an email: foo@bar", &p());
-    assert_eq!(neg.hits, 0);
+fn custom_regex_group() {
+    let c = cfg(true, &["custom_regex"], &[r"MY_SECRET_\d+"], false);
+    let r = scrub("MY_SECRET_123 and MY_SECRET_456", &c);
+    assert_eq!(r.match_count, 2);
+    assert!(r.groups_fired.contains(&"custom_regex".to_string()));
 }
 
 #[test]
-fn ipv4_positive_negative() {
-    let r = redact("host 192.168.1.42 listening", &p());
-    assert!(r.text.contains("[REDACTED:ipv4]"));
-    let neg = redact("version 999.999.999.999 nope", &p());
-    assert_eq!(neg.hits, 0);
+fn bad_custom_regex_does_not_crash() {
+    let c = cfg(true, &["custom_regex"], &["[unclosed"], false);
+    let red = Redactor::new(&c);
+    assert!(!red.compile_errors().is_empty(), "expected a compile error");
+    let r = red.apply("irrelevant");
+    assert_eq!(r.match_count, 0);
+    assert!(!r.compile_errors.is_empty());
 }
 
 #[test]
-fn fixed_prefix_scan() {
-    let r = redact("slack xoxb-123456789012-abcdefABCDEF token", &p());
-    assert!(r.text.contains("[REDACTED:known_prefix]"));
-    assert_eq!(r.breakdown.get("known_prefix"), Some(&1));
+fn pii_gating_off_by_default() {
+    // "pii" in patterns but redact_pii false -> not active.
+    let c = cfg(true, &["pii"], &[], false);
+    let r = scrub("reach me at alice@example.com", &c);
+    assert_eq!(r.match_count, 0);
+    assert!(!r.content.contains("[REDACTED:pii]"));
 }
 
 #[test]
-fn multiple_kinds_breakdown() {
-    let input = "mail alice@example.com ip 10.0.0.1 key AKIAIOSFODNN7EXAMPLE";
-    let r = redact(input, &p());
-    assert_eq!(r.hits, 3);
-    assert_eq!(r.breakdown.get("email"), Some(&1));
-    assert_eq!(r.breakdown.get("ipv4"), Some(&1));
-    assert_eq!(r.breakdown.get("aws_access_key"), Some(&1));
+fn pii_gating_on() {
+    let c = cfg(true, &["pii"], &[], true);
+    let r = scrub("reach me at alice@example.com", &c);
+    assert_eq!(r.match_count, 1);
+    assert!(r.content.contains("[REDACTED:pii]"));
+}
+
+#[test]
+fn pii_needs_pattern_entry_too() {
+    // redact_pii true but "pii" not in patterns -> not active.
+    let c = cfg(true, &["api_keys"], &[], true);
+    let r = scrub("reach me at alice@example.com", &c);
+    assert_eq!(r.match_count, 0);
+}
+
+#[test]
+fn evaluation_order_and_groups_fired() {
+    let c = cfg(true, &["api_keys", "github_tokens", "pii"], &[], true);
+    let input = format!(
+        "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890 ghp_{} a@b.com",
+        "a".repeat(36)
+    );
+    let r = scrub(&input, &c);
+    assert_eq!(r.groups_fired, vec!["api_keys", "github_tokens", "pii"]);
+    assert_eq!(r.match_count, 3);
+}
+
+#[test]
+fn eval_order_sensitive_input() {
+    // openai_generic (sk-[A-Za-z0-9]{20,}) would also match an sk-ant key's
+    // tail, but anthropic runs first within api_keys and consumes it.
+    let c = cfg(true, &["api_keys"], &[], false);
+    let r = scrub("sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345", &c);
+    assert_eq!(r.match_count, 1);
+    assert_eq!(r.content, "[REDACTED:api_keys]");
 }
 
 #[test]
 fn clean_text_unchanged() {
+    let c = cfg(true, &["api_keys", "github_tokens"], &[], false);
     let input = "the quick brown fox jumps over the lazy dog";
-    let r = redact(input, &p());
-    assert_eq!(r.text, input);
-    assert_eq!(r.hits, 0);
+    let r = scrub(input, &c);
+    assert_eq!(r.content, input);
+    assert_eq!(r.match_count, 0);
+    assert!(r.groups_fired.is_empty());
 }
 
 #[test]
-fn idempotent_redaction() {
-    let input = "mail alice@example.com ip 10.0.0.1 key AKIAIOSFODNN7EXAMPLE";
-    let once = redact(input, &p());
-    let twice = redact(&once.text, &p());
-    assert_eq!(once.text, twice.text);
-    assert_eq!(twice.hits, 0, "markers must not themselves match patterns");
+fn empty_string() {
+    let c = cfg(true, &["api_keys"], &[], false);
+    let r = scrub("", &c);
+    assert_eq!(r.content, "");
+    assert_eq!(r.match_count, 0);
+}
+
+#[test]
+fn redactor_reusable() {
+    let c = cfg(true, &["aws_keys"], &[], false);
+    let red = Redactor::new(&c);
+    let r1 = red.apply("AKIAIOSFODNN7EXAMPLE");
+    let r2 = red.apply("nothing here");
+    assert_eq!(r1.match_count, 1);
+    assert_eq!(r2.match_count, 0);
 }

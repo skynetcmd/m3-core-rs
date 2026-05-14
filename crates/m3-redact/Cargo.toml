@@ -10,4 +10,3 @@ description = "Multi-pattern secret redaction for captured turns."
 [dependencies]
 m3-error = { workspace = true }
 regex = "1"
-aho-corasick = "1"

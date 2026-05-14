@@ -150,35 +150,60 @@ fn f32_as_blob(vec: Vec<f32>) -> Vec<u8> {
 // m3-redact
 // ---------------------------------------------------------------------------
 
-/// Outcome of a redaction pass: scrubbed text, total hit count, per-kind counts.
-#[pyclass(name = "RedactionResult")]
-struct PyRedactionResult {
-    #[pyo3(get)]
-    text: String,
-    #[pyo3(get)]
-    hits: usize,
-    #[pyo3(get)]
-    breakdown: std::collections::BTreeMap<String, usize>,
+/// Last `scrub()` call's custom_regex compile errors. Mirrors the Python
+/// `chatlog_redaction.get_compile_errors()` contract. Thread-local so a
+/// caller reads back its own call's errors.
+use std::cell::RefCell;
+thread_local! {
+    static REDACTION_COMPILE_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
-#[pymethods]
-impl PyRedactionResult {
-    fn __repr__(&self) -> String {
-        format!("RedactionResult(hits={}, kinds={})", self.hits, self.breakdown.len())
-    }
-}
-
-/// Scrub secrets from `text`. `profile` selects a named profile; `None` or an
-/// unknown name uses the default pattern set.
-#[pyfunction]
-#[pyo3(signature = (text, profile=None))]
-fn redact(text: &str, profile: Option<&str>) -> PyRedactionResult {
-    let prof = match profile {
-        Some(name) => m3_redact::RedactionProfile::named(name),
-        None => m3_redact::RedactionProfile::default(),
+/// Build a `RedactionConfig` from the `redaction` config dict, exactly as
+/// `chatlog_redaction.py`'s `scrub` reads it (keys: enabled, patterns,
+/// custom_regex, redact_pii). Missing keys take Python's `.get()` defaults.
+fn redaction_config_from_dict(config: &Bound<'_, PyDict>) -> PyResult<m3_redact::RedactionConfig> {
+    let enabled = match config.get_item("enabled")? {
+        Some(v) => v.extract::<bool>()?,
+        None => false,
     };
-    let r = m3_redact::redact(text, &prof);
-    PyRedactionResult { text: r.text, hits: r.hits, breakdown: r.breakdown }
+    let patterns = match config.get_item("patterns")? {
+        Some(v) => v.extract::<Vec<String>>()?,
+        None => Vec::new(),
+    };
+    let custom_regex = match config.get_item("custom_regex")? {
+        Some(v) => v.extract::<Vec<String>>()?,
+        None => Vec::new(),
+    };
+    let redact_pii = match config.get_item("redact_pii")? {
+        Some(v) => v.extract::<bool>()?,
+        None => false,
+    };
+    Ok(m3_redact::RedactionConfig {
+        enabled,
+        patterns,
+        custom_regex,
+        redact_pii,
+    })
+}
+
+/// Byte-exact port of `chatlog_redaction.scrub`. Takes the `redaction` config
+/// dict, returns `(scrubbed_content, match_count, groups_fired)`. custom_regex
+/// compile errors are stashed; read them with `redaction_compile_errors()`.
+#[pyfunction]
+fn scrub(content: &str, config: &Bound<'_, PyDict>) -> PyResult<(String, usize, Vec<String>)> {
+    let cfg = redaction_config_from_dict(config)?;
+    let result = m3_redact::scrub(content, &cfg);
+    REDACTION_COMPILE_ERRORS.with(|e| {
+        *e.borrow_mut() = result.compile_errors.clone();
+    });
+    Ok((result.content, result.match_count, result.groups_fired))
+}
+
+/// custom_regex compilation errors from the most recent `scrub()` call on
+/// this thread. Parity with `chatlog_redaction.get_compile_errors()`.
+#[pyfunction]
+fn redaction_compile_errors() -> Vec<String> {
+    REDACTION_COMPILE_ERRORS.with(|e| e.borrow().clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +630,8 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(enforce_displacement_guard, m)?)?;
     m.add_function(wrap_pyfunction!(blob_as_f32, m)?)?;
     m.add_function(wrap_pyfunction!(f32_as_blob, m)?)?;
-    m.add_function(wrap_pyfunction!(redact, m)?)?;
+    m.add_function(wrap_pyfunction!(scrub, m)?)?;
+    m.add_function(wrap_pyfunction!(redaction_compile_errors, m)?)?;
     m.add_function(wrap_pyfunction!(fuse, m)?)?;
     m.add_function(wrap_pyfunction!(extract_signals, m)?)?;
     m.add_function(wrap_pyfunction!(decide_route, m)?)?;
@@ -614,7 +640,6 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(estimate_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(env_config_summary, m)?)?;
 
-    m.add_class::<PyRedactionResult>()?;
     m.add_class::<PyRankRow>()?;
     m.add_class::<PyRouteSignals>()?;
     m.add_class::<PyRouteDecision>()?;

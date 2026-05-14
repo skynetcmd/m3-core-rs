@@ -40,12 +40,30 @@ def test_vector() -> None:
 
 
 def test_redact() -> None:
-    r = m.redact("contact me at user@example.com please")
-    assert "[REDACTED:email]" in r.text
-    assert r.hits == 1
-    assert r.breakdown.get("email") == 1
-    r2 = m.redact("nothing here", "strict")
-    assert r2.hits == 0
+    cfg = {
+        "enabled": True,
+        "patterns": ["pii"],
+        "custom_regex": [],
+        "redact_pii": True,
+    }
+    scrubbed, n, groups = m.scrub("contact me at user@example.com please", cfg)
+    assert "[REDACTED:pii]" in scrubbed
+    assert n == 1
+    assert groups == ["pii"]
+    scrubbed2, n2, groups2 = m.scrub("nothing here", cfg)
+    assert n2 == 0 and groups2 == []
+    # disabled config is a no-op
+    off = {"enabled": False, "patterns": [], "custom_regex": [], "redact_pii": False}
+    assert m.scrub("user@example.com", off) == ("user@example.com", 0, [])
+    # bad custom regex doesn't crash; error is retrievable
+    bad = {
+        "enabled": True,
+        "patterns": ["custom_regex"],
+        "custom_regex": ["[unclosed"],
+        "redact_pii": False,
+    }
+    m.scrub("irrelevant", bad)
+    assert m.redaction_compile_errors()
 
 
 def test_rank() -> None:

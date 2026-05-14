@@ -34,13 +34,16 @@ def f32_as_blob(vec: list[float]) -> bytes: ...
 
 # --- m3-redact -------------------------------------------------------------
 
-class RedactionResult:
-    text: str
-    hits: int
-    breakdown: dict[str, int]
-    def __repr__(self) -> str: ...
+def scrub(content: str, config: dict) -> tuple[str, int, list[str]]:
+    """Byte-exact port of chatlog_redaction.scrub. `config` is the `redaction`
+    sub-dict (keys: enabled, patterns, custom_regex, redact_pii). Returns
+    (scrubbed_content, match_count, groups_fired)."""
+    ...
 
-def redact(text: str, profile: Optional[str] = ...) -> RedactionResult: ...
+def redaction_compile_errors() -> list[str]:
+    """custom_regex compile errors from the most recent scrub() call on this
+    thread. Parity with chatlog_redaction.get_compile_errors()."""
+    ...
 
 # --- m3-rank ---------------------------------------------------------------
 

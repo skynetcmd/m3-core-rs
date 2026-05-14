@@ -258,20 +258,28 @@ mod tests {
         assert!(format!("{err}").contains("embedded backend not compiled"));
     }
 
-    // Compile-level wiring check for the real backend. Does NOT run inference:
-    // that needs a GGUF model file on disk. This only proves the type links
-    // against llama-cpp-2 and that `run` returns an error (not a stub string)
-    // when the model path is bogus.
+    /// End-to-end inference against a real GGUF model. Opt-in: set
+    /// `M3_TEST_GGUF` to a GGUF embedding model path. Skipped when unset so
+    /// CI without a model file stays green.
     #[cfg(feature = "embedded")]
     #[tokio::test]
-    async fn embedded_backend_constructs_and_links() {
-        let b = EmbeddedBackend::new("does-not-exist.gguf");
-        let err = b.run(Batch::new(vec!["x".into()], 1)).await.unwrap_err();
-        let msg = format!("{err}");
-        assert!(!msg.contains("not compiled"), "should be the real backend");
+    async fn embedded_backend_runs_real_inference() {
+        let Ok(model_path) = std::env::var("M3_TEST_GGUF") else {
+            eprintln!("M3_TEST_GGUF unset — skipping real-inference test");
+            return;
+        };
+        let b = EmbeddedBackend::new(model_path);
+        let out = b
+            .run(Batch::new(vec!["hello world".into(), "a different sentence".into()], 4))
+            .await
+            .expect("embedding run should succeed");
+        assert_eq!(out.rows.len(), 2, "one embedding row per input text");
+        let dim = out.rows[0].len();
+        assert!(dim > 0, "embedding dimension must be non-zero");
+        assert_eq!(out.rows[1].len(), dim, "all rows share one dimension");
         assert!(
-            msg.contains("failed to load gguf model") || msg.contains("llama backend init"),
-            "unexpected error: {msg}"
+            out.rows[0].iter().any(|&x| x != 0.0),
+            "embedding must not be all zeros"
         );
     }
 }

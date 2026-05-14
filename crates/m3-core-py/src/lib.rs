@@ -156,6 +156,13 @@ fn f32_as_blob(vec: Vec<f32>) -> Vec<u8> {
 use std::cell::RefCell;
 thread_local! {
     static REDACTION_COMPILE_ERRORS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Compiled-`Redactor` cache: (config, redactor). Compiling the ~17
+    /// built-in regexes per call made the Rust path ~13x slower than the
+    /// Python one (which caches by config hash). The config is effectively
+    /// static per process, so a single last-config slot suffices — recompile
+    /// only when the config actually changes.
+    static REDACTOR_CACHE: RefCell<Option<(m3_redact::RedactionConfig, m3_redact::Redactor)>> =
+        const { RefCell::new(None) };
 }
 
 /// Build a `RedactionConfig` from the `redaction` config dict, exactly as
@@ -189,10 +196,23 @@ fn redaction_config_from_dict(config: &Bound<'_, PyDict>) -> PyResult<m3_redact:
 /// Byte-exact port of `chatlog_redaction.scrub`. Takes the `redaction` config
 /// dict, returns `(scrubbed_content, match_count, groups_fired)`. custom_regex
 /// compile errors are stashed; read them with `redaction_compile_errors()`.
+///
+/// The compiled `Redactor` is cached per-thread keyed by config — a repeated
+/// call with the same config skips regex recompilation entirely.
 #[pyfunction]
 fn scrub(content: &str, config: &Bound<'_, PyDict>) -> PyResult<(String, usize, Vec<String>)> {
     let cfg = redaction_config_from_dict(config)?;
-    let result = m3_redact::scrub(content, &cfg);
+    let result = REDACTOR_CACHE.with(|cache| {
+        let mut slot = cache.borrow_mut();
+        let needs_rebuild = match slot.as_ref() {
+            Some((cached_cfg, _)) => cached_cfg != &cfg,
+            None => true,
+        };
+        if needs_rebuild {
+            *slot = Some((cfg.clone(), m3_redact::Redactor::new(&cfg)));
+        }
+        slot.as_ref().unwrap().1.apply(content)
+    });
     REDACTION_COMPILE_ERRORS.with(|e| {
         *e.borrow_mut() = result.compile_errors.clone();
     });

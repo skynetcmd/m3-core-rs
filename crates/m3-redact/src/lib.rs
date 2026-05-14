@@ -15,7 +15,12 @@ use regex::Regex;
 
 /// Redaction configuration — mirrors the `redaction` sub-dict of the chat log
 /// config consumed by `chatlog_redaction.py`.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` so callers can cache a compiled `Redactor` keyed by the
+/// config it was built from, skipping recompilation when the config is
+/// unchanged (the common case — redaction config is effectively static
+/// per process).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionConfig {
     pub enabled: bool,
     /// Which built-in groups (and `"custom_regex"`, `"pii"`) are active.

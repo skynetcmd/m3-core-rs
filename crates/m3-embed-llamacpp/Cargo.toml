@@ -1,0 +1,26 @@
+[package]
+name = "m3-embed-llamacpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "llama.cpp embedding backend for m3-dispatcher."
+
+[features]
+default = []
+# Real llama-cpp-rs FFI backend. Left as a documented stub: enabling this
+# requires a locally built llama.cpp (CUDA/Metal/etc). The default build ships
+# the HTTP backend only.
+embedded = []
+
+[dependencies]
+m3-error = { workspace = true }
+m3-dispatcher = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

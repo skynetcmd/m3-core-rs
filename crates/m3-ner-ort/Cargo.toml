@@ -1,0 +1,22 @@
+[package]
+name = "m3-ner-ort"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ONNX Runtime GLiNER NER backend for m3-dispatcher."
+
+[features]
+default = []
+# Real `ort` (ONNX Runtime) backend. Left as a documented stub: enabling this
+# requires ONNX Runtime native libraries on the build host. The default build
+# provides the pure-Rust span-decode + EP-priority logic and a stub `run`.
+onnx = []
+
+[dependencies]
+m3-error = { workspace = true }
+m3-dispatcher = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

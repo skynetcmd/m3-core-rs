@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "m3-core-rs"
+description = "PyO3-backed Rust core for m3-memory (Project Oxidation)."
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dynamic = ["version"]
+
+[tool.maturin]
+module-name = "m3_core_rs"
+features = ["pyo3/extension-module"]

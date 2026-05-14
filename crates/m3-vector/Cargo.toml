@@ -1,0 +1,21 @@
+[package]
+name = "m3-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SIMD cosine similarity and MMR reranking."
+
+[features]
+default = []
+# Opt-in std::simd path; requires a nightly toolchain.
+nightly-simd = []
+
+[dependencies]
+m3-error = { workspace = true }
+bytemuck = "1"
+rayon = "1"
+
+[dev-dependencies]
+proptest = "1"

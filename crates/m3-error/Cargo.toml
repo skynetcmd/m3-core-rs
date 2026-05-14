@@ -1,0 +1,10 @@
+[package]
+name = "m3-error"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared error type for the m3-core-rs workspace."
+
+[dependencies]

@@ -1,0 +1,27 @@
+[package]
+name = "m3-core-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "PyO3 bindings for m3-core-rs; the only crate Python sees."
+
+[lib]
+name = "m3_core_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+m3-error = { workspace = true }
+m3-hash = { workspace = true }
+m3-vector = { workspace = true }
+m3-dispatcher = { workspace = true }
+m3-embed-llamacpp = { workspace = true }
+m3-ner-ort = { workspace = true }
+m3-redact = { workspace = true }
+m3-rank = { workspace = true }
+m3-route = { workspace = true }
+m3-graph = { workspace = true }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+log = "0.4"
+env_logger = "0.11"

@@ -1,0 +1,12 @@
+[package]
+name = "m3-rank"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Hybrid FTS5 + vector rank-fusion merge."
+
+[dependencies]
+m3-error = { workspace = true }
+m3-vector = { workspace = true }

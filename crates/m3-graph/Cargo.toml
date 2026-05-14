@@ -1,0 +1,12 @@
+[package]
+name = "m3-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "In-memory graph index and multi-hop traversal."
+
+[dependencies]
+m3-error = { workspace = true }
+petgraph = "0.6"

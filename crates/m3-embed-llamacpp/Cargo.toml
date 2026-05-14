@@ -9,10 +9,10 @@ description = "llama.cpp embedding backend for m3-dispatcher."
 
 [features]
 default = []
-# Real llama-cpp-rs FFI backend. Left as a documented stub: enabling this
-# requires a locally built llama.cpp (CUDA/Metal/etc). The default build ships
-# the HTTP backend only.
-embedded = []
+# Real llama-cpp-rs FFI backend. Enabling this cmake-builds llama.cpp from
+# source (CPU-only here) via llama-cpp-sys-2. The default build ships the
+# HTTP backend only and pulls no llama.cpp dependency at all.
+embedded = ["dep:llama-cpp-2"]
 
 [dependencies]
 m3-error = { workspace = true }
@@ -21,6 +21,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
+# Only compiled when the `embedded` feature is on. CPU-only: no cuda/metal/etc.
+llama-cpp-2 = { version = "0.1.146", optional = true, default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

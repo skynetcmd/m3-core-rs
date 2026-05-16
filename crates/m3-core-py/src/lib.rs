@@ -90,6 +90,78 @@ fn cosine_batch(query: Vec<f32>, corpus: Vec<Vec<f32>>) -> PyResult<Vec<f32>> {
     map_err(m3_vector::cosine_batch(&query, &refs))
 }
 
+/// Cosine of `query` against a list of packed-blob embeddings. `dim` is the
+/// embedding dimension. Each `bytes`-typed blob must be exactly `dim * 4`
+/// bytes (sequence of little-endian f32s); any other length scores 0.0 for
+/// that row. Releases the GIL while rayon scores in parallel.
+///
+/// This is the retrieval hot-path primitive — eliminates a per-row Python
+/// `struct.unpack` + `list` allocation and a `Vec<Vec<f32>>` FFI hop. Callers
+/// pass raw SQLite BLOB bytes directly.
+#[pyfunction]
+fn cosine_batch_packed(
+    py: Python<'_>,
+    query: Vec<f32>,
+    blobs: Vec<Vec<u8>>,
+    dim: usize,
+) -> PyResult<Vec<f32>> {
+    py.detach(||{
+        let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+        map_err(m3_vector::cosine_batch_packed(&query, &refs, dim))
+    })
+}
+
+/// Vectorized hybrid scoring — body of the per-row Python scoring loop in
+/// `memory_search_scored_impl`, fully rayon-parallel. Releases the GIL.
+///
+/// All input lists must be the same length (one entry per candidate).
+/// Returns one final blended score per candidate. Caller still layers on
+/// role/intent boosts and recency/temporal adjustments downstream.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn hybrid_score_batch(
+    py: Python<'_>,
+    vector_scores: Vec<f32>,
+    bm25_scores: Vec<f32>,
+    content_lens: Vec<u32>,
+    importances: Vec<f32>,
+    title_overlaps: Vec<f32>,
+    vector_weight: f32,
+    importance_weight: f32,
+    title_match_boost: f32,
+    short_turn_threshold: u32,
+) -> PyResult<Vec<f32>> {
+    py.detach(||{
+        map_err(m3_vector::hybrid_score_batch(
+            &vector_scores,
+            &bm25_scores,
+            &content_lens,
+            &importances,
+            &title_overlaps,
+            vector_weight,
+            importance_weight,
+            title_match_boost,
+            short_turn_threshold,
+        ))
+    })
+}
+
+/// Rank-based linear recency bonus aligned to `valid_froms`. Items with
+/// empty / None `valid_from` get 0.0. Dated items get
+/// `bias * rank / (n_dated - 1)` after lex-sort. Bonus is `0.0` everywhere
+/// when fewer than two dated items exist or `bias <= 0`.
+///
+/// Returns a list aligned 1:1 with `valid_froms`; caller adds to existing
+/// hybrid scores.
+#[pyfunction]
+fn recency_bonus_ranks(
+    py: Python<'_>,
+    valid_froms: Vec<Option<String>>,
+    bias: f32,
+) -> Vec<f32> {
+    py.detach(||m3_vector::recency_bonus_ranks(&valid_froms, bias))
+}
+
 #[pyfunction]
 fn mmr_rerank(
     query: Vec<f32>,
@@ -745,6 +817,9 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hash_provider, m)?)?;
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(cosine_batch_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(hybrid_score_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(recency_bonus_ranks, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank_scored, m)?)?;
     m.add_function(wrap_pyfunction!(enforce_displacement_guard, m)?)?;

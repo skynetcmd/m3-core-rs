@@ -79,6 +79,136 @@ pub fn cosine_batch(query: &[f32], corpus: &[&[f32]]) -> Result<Vec<f32>> {
     Ok(corpus.par_iter().map(|v| cosine_unchecked(query, v)).collect())
 }
 
+/// Score `query` against every packed-blob embedding in `blobs`, in parallel.
+///
+/// Each blob must be exactly `dim * 4` bytes (a sequence of little-endian f32s
+/// — the on-disk layout produced by `f32_as_blob`). A blob of any other length
+/// scores 0.0 for that row rather than erroring; this matches the Python
+/// fallback's behavior on ragged inputs and keeps a single corrupt row from
+/// killing an entire batch retrieval.
+///
+/// This is the load-bearing primitive for the retrieval hot path: the caller
+/// passes raw SQLite BLOB bytes straight in, avoiding a per-row `struct.unpack`
+/// + Python `list` allocation and a `Vec<Vec<f32>>` FFI marshalling step.
+pub fn cosine_batch_packed(query: &[f32], blobs: &[&[u8]], dim: usize) -> Result<Vec<f32>> {
+    if query.len() != dim {
+        return Err(M3Error::VectorDimMismatch { expected: dim, got: query.len() });
+    }
+    let expected_bytes = dim * 4;
+    Ok(blobs
+        .par_iter()
+        .map(|b| {
+            if b.len() != expected_bytes {
+                return 0.0;
+            }
+            match bytemuck::try_cast_slice::<u8, f32>(b) {
+                Ok(v) => cosine_unchecked(query, v),
+                Err(_) => 0.0,
+            }
+        })
+        .collect())
+}
+
+/// Vectorized per-row hybrid score combining cosine, BM25, length penalty,
+/// title-overlap, and importance — the body of the per-row Python loop in
+/// `memory_search_scored_impl`, fully data-parallel.
+///
+/// All input slices must have identical length `N` (one entry per candidate).
+/// Returns a `Vec<f32>` of length `N` with the same blended score the Python
+/// path computes. Caller still adds role/intent boosts and temporal/recency
+/// adjustments downstream — those are sparse or query-conditional and don't
+/// vectorize cleanly.
+///
+/// Formula per row `i`:
+///   raw      = vector_scores[i] * vector_weight + (1/(1+|bm25_scores[i]|)) * (1 - vector_weight)
+///   penalty  = if content_lens[i] < short_turn_threshold
+///                then max(0.3, content_lens[i] / short_turn_threshold)
+///                else 1.0
+///   final[i] = raw * penalty
+///            + title_match_boost * title_overlaps[i]
+///            + importance_weight * importances[i]
+#[allow(clippy::too_many_arguments)]
+pub fn hybrid_score_batch(
+    vector_scores: &[f32],
+    bm25_scores: &[f32],
+    content_lens: &[u32],
+    importances: &[f32],
+    title_overlaps: &[f32],
+    vector_weight: f32,
+    importance_weight: f32,
+    title_match_boost: f32,
+    short_turn_threshold: u32,
+) -> Result<Vec<f32>> {
+    let n = vector_scores.len();
+    if bm25_scores.len() != n
+        || content_lens.len() != n
+        || importances.len() != n
+        || title_overlaps.len() != n
+    {
+        return Err(M3Error::Other(format!(
+            "hybrid_score_batch length mismatch: vec={}, bm25={}, lens={}, imp={}, titles={}",
+            n,
+            bm25_scores.len(),
+            content_lens.len(),
+            importances.len(),
+            title_overlaps.len(),
+        )));
+    }
+    let stt = short_turn_threshold.max(1) as f32;
+    let bm25_weight = 1.0 - vector_weight;
+    Ok((0..n)
+        .into_par_iter()
+        .map(|i| {
+            let bm25_norm = 1.0 / (1.0 + bm25_scores[i].abs());
+            let raw = vector_scores[i] * vector_weight + bm25_norm * bm25_weight;
+            let clen = content_lens[i] as f32;
+            let penalty = if (content_lens[i]) < short_turn_threshold {
+                (clen / stt).max(0.3)
+            } else {
+                1.0
+            };
+            raw * penalty
+                + title_match_boost * title_overlaps[i]
+                + importance_weight * importances[i]
+        })
+        .collect())
+}
+
+/// Rank-based linear recency bonus aligned to `valid_froms`.
+///
+/// Items with `Some(non-empty)` `valid_from` are sorted lexicographically (ISO-8601
+/// sorts correctly as strings). The oldest dated item gets bonus 0, the newest gets
+/// `bias`, with linear interpolation between. Items with `None` or empty strings
+/// get bonus 0. When fewer than two dated items exist, returns all zeros.
+///
+/// Returned vector aligns 1:1 with the input — apply by adding to the existing
+/// hybrid score.
+pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32> {
+    let n = valid_froms.len();
+    let mut out = vec![0.0f32; n];
+    if bias <= 0.0 || n < 2 {
+        return out;
+    }
+    // Collect (original_index, valid_from_str) for non-empty entries.
+    let mut dated: Vec<(usize, &str)> = valid_froms
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| match v {
+            Some(s) if !s.is_empty() => Some((i, s.as_str())),
+            _ => None,
+        })
+        .collect();
+    if dated.len() < 2 {
+        return out;
+    }
+    dated.sort_by(|a, b| a.1.cmp(b.1));
+    let denom = (dated.len() - 1) as f32;
+    for (rank, (orig_idx, _)) in dated.into_iter().enumerate() {
+        out[orig_idx] = bias * (rank as f32) / denom;
+    }
+    out
+}
+
 /// Maximal Marginal Relevance rerank over candidate vectors.
 ///
 /// Selects `min(k, candidates.len())` indices balancing relevance to `query`
@@ -207,5 +337,99 @@ mod tests {
         let rel = [0.5];
         let cands = [v0];
         assert_eq!(mmr_rerank_scored(&rel, &cands, 0.7, 9, true).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn cosine_batch_packed_matches_unchecked() {
+        let q: &[f32] = &[1.0, 0.0, 0.0, 0.0];
+        let v0: &[f32] = &[1.0, 0.0, 0.0, 0.0];
+        let v1: &[f32] = &[0.0, 1.0, 0.0, 0.0];
+        let v2: &[f32] = &[0.5, 0.5, 0.0, 0.0];
+        let b0 = f32_as_blob(v0).to_vec();
+        let b1 = f32_as_blob(v1).to_vec();
+        let b2 = f32_as_blob(v2).to_vec();
+        let blobs: Vec<&[u8]> = vec![&b0, &b1, &b2];
+        let got = cosine_batch_packed(q, &blobs, 4).unwrap();
+        let want = vec![
+            cosine_unchecked(q, v0),
+            cosine_unchecked(q, v1),
+            cosine_unchecked(q, v2),
+        ];
+        assert_eq!(got.len(), 3);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-6, "got={g}, want={w}");
+        }
+    }
+
+    #[test]
+    fn cosine_batch_packed_ragged_zero_fills() {
+        let q: &[f32] = &[1.0, 0.0];
+        let v0: &[f32] = &[1.0, 0.0];
+        let b_good = f32_as_blob(v0).to_vec();
+        let b_short: Vec<u8> = vec![0u8; 7]; // not multiple of 4 * 2
+        let blobs: Vec<&[u8]> = vec![&b_good, &b_short];
+        let got = cosine_batch_packed(q, &blobs, 2).unwrap();
+        assert!((got[0] - 1.0).abs() < 1e-6);
+        assert_eq!(got[1], 0.0);
+    }
+
+    #[test]
+    fn cosine_batch_packed_query_dim_mismatch_errors() {
+        let q: &[f32] = &[1.0, 0.0, 0.0];
+        let blobs: Vec<&[u8]> = vec![];
+        assert!(cosine_batch_packed(q, &blobs, 4).is_err());
+    }
+
+    #[test]
+    fn hybrid_score_batch_parity_with_python_formula() {
+        let vec_s = vec![0.9f32, 0.5];
+        let bm = vec![1.0f32, 4.0];
+        let lens = vec![100u32, 10];
+        let imp = vec![0.0f32, 1.0];
+        let titles = vec![0.5f32, 0.0];
+        // vw=0.7, iw=0.1, tmb=0.15, stt=40
+        let out = hybrid_score_batch(&vec_s, &bm, &lens, &imp, &titles, 0.7, 0.1, 0.15, 40).unwrap();
+        // Row 0: bm25_norm = 1/(1+1) = 0.5; raw = 0.9*0.7 + 0.5*0.3 = 0.63+0.15 = 0.78
+        //        len 100 >= 40 -> penalty 1.0; final = 0.78 + 0.15*0.5 + 0.1*0.0 = 0.855
+        // Row 1: bm25_norm = 1/(1+4) = 0.2; raw = 0.5*0.7 + 0.2*0.3 = 0.35+0.06 = 0.41
+        //        len 10 < 40 -> penalty max(0.3, 10/40) = max(0.3, 0.25) = 0.3
+        //        final = 0.41*0.3 + 0.15*0 + 0.1*1 = 0.123 + 0.1 = 0.223
+        assert!((out[0] - 0.855).abs() < 1e-5, "got {}", out[0]);
+        assert!((out[1] - 0.223).abs() < 1e-5, "got {}", out[1]);
+    }
+
+    #[test]
+    fn hybrid_score_batch_length_mismatch_errors() {
+        let r = hybrid_score_batch(&[1.0], &[1.0, 2.0], &[1], &[0.0], &[0.0], 0.7, 0.1, 0.15, 40);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn recency_bonus_ranks_linear_interpolation() {
+        let v = vec![
+            Some("2025-01-01".to_string()),
+            Some("".to_string()),
+            None,
+            Some("2026-01-01".to_string()),
+            Some("2025-06-01".to_string()),
+        ];
+        let b = recency_bonus_ranks(&v, 1.0);
+        // dated: idx 0 (2025-01-01, rank 0), idx 4 (2025-06-01, rank 1), idx 3 (2026-01-01, rank 2)
+        // denom = 2
+        assert_eq!(b[1], 0.0);
+        assert_eq!(b[2], 0.0);
+        assert!((b[0] - 0.0).abs() < 1e-6);
+        assert!((b[4] - 0.5).abs() < 1e-6);
+        assert!((b[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recency_bonus_ranks_degenerate_cases() {
+        assert_eq!(recency_bonus_ranks(&[], 1.0), Vec::<f32>::new());
+        assert_eq!(recency_bonus_ranks(&[Some("x".to_string())], 1.0), vec![0.0]);
+        assert_eq!(recency_bonus_ranks(&[None, None], 1.0), vec![0.0, 0.0]);
+        // zero bias -> all zero regardless
+        let v = vec![Some("a".to_string()), Some("b".to_string())];
+        assert_eq!(recency_bonus_ranks(&v, 0.0), vec![0.0, 0.0]);
     }
 }

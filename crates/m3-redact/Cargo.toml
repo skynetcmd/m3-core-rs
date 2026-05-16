@@ -10,3 +10,10 @@ description = "Multi-pattern secret redaction for captured turns."
 [dependencies]
 m3-error = { workspace = true }
 regex = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "redact_bench"
+harness = false

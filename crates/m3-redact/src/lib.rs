@@ -12,6 +12,9 @@
 //! when the config hash is unchanged, so amortized cost is the same).
 
 use regex::Regex;
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::collections::HashSet;
 
 /// Redaction configuration — mirrors the `redaction` sub-dict of the chat log
 /// config consumed by `chatlog_redaction.py`.
@@ -20,24 +23,13 @@ use regex::Regex;
 /// config it was built from, skipping recompilation when the config is
 /// unchanged (the common case — redaction config is effectively static
 /// per process).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RedactionConfig {
     pub enabled: bool,
     /// Which built-in groups (and `"custom_regex"`, `"pii"`) are active.
     pub patterns: Vec<String>,
     pub custom_regex: Vec<String>,
     pub redact_pii: bool,
-}
-
-impl Default for RedactionConfig {
-    fn default() -> Self {
-        RedactionConfig {
-            enabled: false,
-            patterns: Vec::new(),
-            custom_regex: Vec::new(),
-            redact_pii: false,
-        }
-    }
 }
 
 /// Outcome of a `scrub` pass.
@@ -134,13 +126,13 @@ impl Redactor {
             };
         }
 
-        let pat_set: Vec<&str> = config.patterns.iter().map(|s| s.as_str()).collect();
+        let pat_set: HashSet<&str> = config.patterns.iter().map(|s| s.as_str()).collect();
 
         for &group_name in EVALUATION_ORDER {
             match group_name {
                 "pii" => {
                     // PII only active if "pii" in patterns AND redact_pii.
-                    if !(pat_set.contains(&"pii") && config.redact_pii) {
+                    if !(pat_set.contains("pii") && config.redact_pii) {
                         continue;
                     }
                     if let Some(specs) = builtin_group("pii") {
@@ -152,7 +144,7 @@ impl Redactor {
                     }
                 }
                 "custom_regex" => {
-                    if !(pat_set.contains(&"custom_regex") && !config.custom_regex.is_empty()) {
+                    if !pat_set.contains("custom_regex") || config.custom_regex.is_empty() {
                         continue;
                     }
                     let mut compiled: Vec<Regex> = Vec::new();
@@ -169,7 +161,7 @@ impl Redactor {
                     }
                 }
                 _ => {
-                    if !pat_set.contains(&group_name) {
+                    if !pat_set.contains(group_name) {
                         continue;
                     }
                     if let Some(specs) = builtin_group(group_name) {
@@ -209,7 +201,7 @@ impl Redactor {
             };
         }
 
-        let mut scrubbed = content.to_string();
+        let mut scrubbed: Cow<'_, str> = Cow::Borrowed(content);
         let mut total_matches = 0usize;
         let mut groups_fired: Vec<String> = Vec::new();
 
@@ -217,10 +209,22 @@ impl Redactor {
             let mut group_matches = 0usize;
             let marker = format!("[REDACTED:{group_name}]");
             for re in patterns {
-                // Count matches against the CURRENT string (earlier patterns
-                // in the group already mutated it), then replace all.
-                group_matches += re.find_iter(&scrubbed).count();
-                scrubbed = re.replace_all(&scrubbed, marker.as_str()).into_owned();
+                // Single-pass count + replace via Replacer closure side effect.
+                let count = Cell::new(0usize);
+                let replaced = re.replace_all(&scrubbed, |_caps: &regex::Captures| {
+                    count.set(count.get() + 1);
+                    marker.as_str()
+                });
+                let n = count.get();
+                group_matches += n;
+                if n > 0 {
+                    // Match occurred — `replaced` is an owned String borrowing
+                    // from nothing tied to `scrubbed`; reassign.
+                    scrubbed = Cow::Owned(replaced.into_owned());
+                }
+                // If n == 0, `replaced` is Cow::Borrowed re-borrowing from
+                // `scrubbed`; drop it without touching `scrubbed` so the
+                // outer Cow stays Borrowed when no pattern ever matched.
             }
             if group_matches > 0 {
                 total_matches += group_matches;
@@ -229,11 +233,47 @@ impl Redactor {
         }
 
         ScrubResult {
-            content: scrubbed,
+            content: scrubbed.into_owned(),
             match_count: total_matches,
             groups_fired,
             compile_errors: self.compile_errors.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wave-6a: apply() on a clean 4KB input must return byte-identical
+    /// content. The Cow path means no per-pattern allocation churn — this
+    /// test pins down the functional behavior; the bench measures speed.
+    #[test]
+    fn apply_clean_4kb_byte_identical() {
+        let cfg = RedactionConfig {
+            enabled: true,
+            patterns: vec![
+                "api_keys".into(),
+                "bearer_tokens".into(),
+                "jwt".into(),
+                "aws_keys".into(),
+                "github_tokens".into(),
+                "pii".into(),
+            ],
+            custom_regex: vec![],
+            redact_pii: true,
+        };
+        let r = Redactor::new(&cfg);
+        let body = "All systems nominal. Task completed without anomalies. ";
+        let mut s = String::with_capacity(4096);
+        while s.len() < 4096 {
+            s.push_str(body);
+        }
+        s.truncate(4096);
+        let out = r.apply(&s);
+        assert_eq!(out.content, s);
+        assert_eq!(out.match_count, 0);
+        assert!(out.groups_fired.is_empty());
     }
 }
 

@@ -90,14 +90,15 @@ fn cosine_batch(query: Vec<f32>, corpus: Vec<Vec<f32>>) -> PyResult<Vec<f32>> {
     map_err(m3_vector::cosine_batch(&query, &refs))
 }
 
+/// DEPRECATED: prefer `cosine_batch_packed_flat`, which takes a single
+/// contiguous bytes buffer and avoids per-row Python -> Rust copies on the
+/// GIL-attached thread. This signature copies each blob into a fresh `Vec<u8>`
+/// before `py.detach` and remains only for backward compatibility.
+///
 /// Cosine of `query` against a list of packed-blob embeddings. `dim` is the
 /// embedding dimension. Each `bytes`-typed blob must be exactly `dim * 4`
 /// bytes (sequence of little-endian f32s); any other length scores 0.0 for
 /// that row. Releases the GIL while rayon scores in parallel.
-///
-/// This is the retrieval hot-path primitive — eliminates a per-row Python
-/// `struct.unpack` + `list` allocation and a `Vec<Vec<f32>>` FFI hop. Callers
-/// pass raw SQLite BLOB bytes directly.
 #[pyfunction]
 fn cosine_batch_packed(
     py: Python<'_>,
@@ -107,6 +108,44 @@ fn cosine_batch_packed(
 ) -> PyResult<Vec<f32>> {
     py.detach(||{
         let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+        map_err(m3_vector::cosine_batch_packed(&query, &refs, dim))
+    })
+}
+
+/// Flat-bytes hot-path variant of `cosine_batch_packed`.
+///
+/// `blobs` is one contiguous `bytes` buffer of `n_rows * dim * 4` bytes; row
+/// `i` lives at `blobs[i*dim*4 .. (i+1)*dim*4]`. The number of rows is
+/// `blobs.len() / (dim * 4)` and the function errors with `ValueError` if
+/// `blobs.len()` is not evenly divisible by `dim * 4`.
+///
+/// **Pass a `bytes` object** (not `bytearray`, not a `list`): PyO3 borrows
+/// `&[u8]` directly from the underlying buffer with zero copies. The whole
+/// point of this entry point is eliminating the per-row `Vec<u8>` copy that
+/// the deprecated `cosine_batch_packed` performs on the GIL-attached thread.
+/// Releases the GIL while rayon scores in parallel.
+#[pyfunction]
+fn cosine_batch_packed_flat(
+    py: Python<'_>,
+    query: Vec<f32>,
+    blobs: &[u8],
+    dim: usize,
+) -> PyResult<Vec<f32>> {
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
+    if row_bytes == 0 {
+        return Err(PyValueError::new_err("dim must be > 0"));
+    }
+    if !blobs.len().is_multiple_of(row_bytes) {
+        return Err(PyValueError::new_err(format!(
+            "blobs length {} is not a multiple of dim*4 = {}",
+            blobs.len(),
+            row_bytes,
+        )));
+    }
+    py.detach(|| {
+        let refs: Vec<&[u8]> = blobs.chunks_exact(row_bytes).collect();
         map_err(m3_vector::cosine_batch_packed(&query, &refs, dim))
     })
 }
@@ -164,31 +203,122 @@ fn recency_bonus_ranks(
 
 #[pyfunction]
 fn mmr_rerank(
+    py: Python<'_>,
     query: Vec<f32>,
     candidates: Vec<Vec<f32>>,
     lambda: f32,
     k: usize,
 ) -> PyResult<Vec<usize>> {
-    let refs: Vec<&[f32]> = candidates.iter().map(|v| v.as_slice()).collect();
-    map_err(m3_vector::mmr_rerank(&query, &refs, lambda, k))
+    py.detach(|| {
+        let refs: Vec<&[f32]> = candidates.iter().map(|v| v.as_slice()).collect();
+        map_err(m3_vector::mmr_rerank(&query, &refs, lambda, k))
+    })
 }
 
 #[pyfunction]
 fn mmr_rerank_scored(
+    py: Python<'_>,
     relevance: Vec<f32>,
     candidate_vectors: Vec<Vec<f32>>,
     lambda: f32,
     k: usize,
     force_seed_first: bool,
 ) -> PyResult<Vec<usize>> {
-    let refs: Vec<&[f32]> = candidate_vectors.iter().map(|v| v.as_slice()).collect();
-    map_err(m3_vector::mmr_rerank_scored(
-        &relevance,
-        &refs,
-        lambda,
-        k,
-        force_seed_first,
-    ))
+    py.detach(|| {
+        let refs: Vec<&[f32]> = candidate_vectors.iter().map(|v| v.as_slice()).collect();
+        map_err(m3_vector::mmr_rerank_scored(
+            &relevance,
+            &refs,
+            lambda,
+            k,
+            force_seed_first,
+        ))
+    })
+}
+
+/// Flat-bytes hot-path variant of `mmr_rerank`.
+///
+/// `candidates` is one contiguous `bytes` buffer of `n_rows * dim * 4` bytes
+/// (little-endian f32s). Number of rows is `candidates.len() / (dim * 4)` —
+/// errors with `ValueError` if the length is not evenly divisible or the byte
+/// slice fails to cast to `&[f32]` (alignment). Pass a `bytes` object so PyO3
+/// can borrow `&[u8]` zero-copy. Releases the GIL while MMR runs.
+#[pyfunction]
+fn mmr_rerank_packed(
+    py: Python<'_>,
+    query: Vec<f32>,
+    candidates: &[u8],
+    dim: usize,
+    lambda: f32,
+    k: usize,
+) -> PyResult<Vec<usize>> {
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
+    if row_bytes == 0 {
+        return Err(PyValueError::new_err("dim must be > 0"));
+    }
+    if !candidates.len().is_multiple_of(row_bytes) {
+        return Err(PyValueError::new_err(format!(
+            "candidates length {} is not a multiple of dim*4 = {}",
+            candidates.len(),
+            row_bytes,
+        )));
+    }
+    let floats: &[f32] = bytemuck::try_cast_slice::<u8, f32>(candidates)
+        .map_err(|e| PyValueError::new_err(format!("candidates byte->f32 cast failed: {e}")))?;
+    py.detach(|| {
+        let refs: Vec<&[f32]> = floats.chunks_exact(dim).collect();
+        map_err(m3_vector::mmr_rerank(&query, &refs, lambda, k))
+    })
+}
+
+/// Flat-bytes hot-path variant of `mmr_rerank_scored`. Same byte-layout
+/// contract as `mmr_rerank_packed`. Releases the GIL while MMR runs.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn mmr_rerank_scored_packed(
+    py: Python<'_>,
+    relevance: Vec<f32>,
+    candidate_vectors: &[u8],
+    dim: usize,
+    lambda: f32,
+    k: usize,
+    force_seed_first: bool,
+) -> PyResult<Vec<usize>> {
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
+    if row_bytes == 0 {
+        return Err(PyValueError::new_err("dim must be > 0"));
+    }
+    if !candidate_vectors.len().is_multiple_of(row_bytes) {
+        return Err(PyValueError::new_err(format!(
+            "candidate_vectors length {} is not a multiple of dim*4 = {}",
+            candidate_vectors.len(),
+            row_bytes,
+        )));
+    }
+    let floats: &[f32] = bytemuck::try_cast_slice::<u8, f32>(candidate_vectors)
+        .map_err(|e| PyValueError::new_err(format!("candidate_vectors byte->f32 cast failed: {e}")))?;
+    let n_rows = floats.len() / dim;
+    if relevance.len() != n_rows {
+        return Err(PyValueError::new_err(format!(
+            "relevance length {} != n_rows {} (derived from candidate_vectors / dim*4)",
+            relevance.len(),
+            n_rows,
+        )));
+    }
+    py.detach(|| {
+        let refs: Vec<&[f32]> = floats.chunks_exact(dim).collect();
+        map_err(m3_vector::mmr_rerank_scored(
+            &relevance,
+            &refs,
+            lambda,
+            k,
+            force_seed_first,
+        ))
+    })
 }
 
 /// Expansion-displacement guard. Takes `(score, is_expansion)` tuples in
@@ -690,6 +820,24 @@ impl PyDispatcherConfig {
     }
 }
 
+/// Wave 9.0 — label of the active embedded compute backend. Returns
+/// `"cpu"` for the default `embedded` build, `"cuda"` / `"vulkan"` /
+/// `"metal"` when the matching feature is enabled, and `"none"` when the
+/// wheel was built without `embedded` at all. Wave 9.4 will surface this in
+/// backend stats; for now it lets Python tests assert which backend the
+/// wheel is linked against.
+#[pyfunction]
+fn embed_backend_label() -> &'static str {
+    #[cfg(feature = "embedded")]
+    {
+        m3_embed_llamacpp::active_backend()
+    }
+    #[cfg(not(feature = "embedded"))]
+    {
+        "none"
+    }
+}
+
 /// Resolved `M3_*` config snapshot — what the env layer produced before any
 /// kwarg overrides. Lets Python introspect the §9.6 env wiring.
 #[pyfunction]
@@ -698,6 +846,10 @@ fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("M3_EMBED_STREAMS", config::embed_streams())?;
     d.set_item("M3_EMBED_COALESCE_MS", config::embed_coalesce_ms())?;
     d.set_item("M3_EMBED_MAX_BATCH_TOKENS", config::embed_max_batch_tokens())?;
+    d.set_item("M3_EMBED_CTX", config::embed_ctx())?;
+    d.set_item("M3_EMBED_SEQ_MAX", config::embed_seq_max())?;
+    d.set_item("M3_EMBED_N_BATCH", config::embed_n_batch())?;
+    d.set_item("M3_EMBED_N_UBATCH", config::embed_n_ubatch())?;
     d.set_item("M3_HASH_PROVIDER", config::hash_provider())?;
     Ok(d.into())
 }
@@ -736,13 +888,19 @@ struct PyEmbeddedEmbedder {
 #[pymethods]
 impl PyEmbeddedEmbedder {
     /// `model_path` is an absolute path to a GGUF embedding model.
-    /// Does not load the model — that happens lazily on first use.
+    ///
+    /// `warmup` (Fix #2, default `True`): when true, the constructor forces
+    /// the GGUF load + worker-pool spin-up + per-context warmup decode
+    /// synchronously inside `new()`. The very first real `embed()` call then
+    /// only pays the per-batch cost. Pass `warmup=False` to keep the legacy
+    /// lazy behavior (cold cost paid on first `embed`/`embedding_dim`).
     ///
     /// The dispatcher config is built from the `M3_*` env layer; `streams`
     /// (`M3_EMBED_STREAMS`) sizes both the dispatcher and the backend's
     /// context pool.
     #[new]
-    fn new(model_path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (model_path, warmup=None))]
+    fn new(model_path: &str, warmup: Option<bool>) -> PyResult<Self> {
         // Multi-thread runtime: the embed worker pool blocks on
         // `spawn_blocking`, and `Dispatcher::new` spawns a scheduler task.
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -755,37 +913,60 @@ impl PyEmbeddedEmbedder {
 
         let cfg = config::dispatcher_config_from_env();
         let streams = cfg.streams;
+        let n_ctx = config::embed_ctx();
+        let seq_max = config::embed_seq_max();
+        let n_batch = config::embed_n_batch();
+        let n_ubatch = config::embed_n_ubatch();
         // env var -> DispatcherConfig::streams -> EmbeddedBackend pool size.
-        // `Dispatcher::new` takes the backend by value, so a second cheap
-        // handle is kept for `embedding_dim` introspection. Both share the one
-        // process-global `LlamaBackend` (llama.cpp allows only a single
-        // `init()` per process); each lazily loads its own `LlamaModel` +
-        // worker pool on first use. In practice `embed` is what gets called,
-        // so the introspection handle's pool usually never loads.
-        let backend = std::sync::Arc::new(
-            m3_embed_llamacpp::EmbeddedBackend::with_streams(model_path, streams),
+        // n_ctx flows from M3_EMBED_CTX (default 8192) — total token budget per decode call.
+        // seq_max flows from M3_EMBED_SEQ_MAX (default 32) — sequences packed per decode call.
+        // n_batch / n_ubatch flow from M3_EMBED_N_BATCH (default 2048) and
+        // M3_EMBED_N_UBATCH (default 512) — wave-3 fix #1 decouples llama.cpp's
+        // prompt-process batch + micro-batch ceilings from n_ctx.
+        //
+        // Fix #12 (shape b): `Dispatcher::new` already wraps its backend in
+        // `Arc<B>` internally, so we build ONE `EmbeddedBackend`, hand it to the
+        // dispatcher, and pull the exact same `Arc<EmbeddedBackend>` back out
+        // via `dispatcher.backend()` for `embedding_dim` / `streams`. This
+        // guarantees a single underlying `Arc<ContextPool>` (and therefore a
+        // single GGUF load + worker-thread pool) per `PyEmbeddedEmbedder`.
+        let single_backend = m3_embed_llamacpp::EmbeddedBackend::with_streams_ctx_seqmax_batch(
+            model_path, streams, n_ctx, seq_max, n_batch, n_ubatch,
         );
-        let dispatcher_backend =
-            m3_embed_llamacpp::EmbeddedBackend::with_streams(model_path, streams);
         // `Dispatcher::new` calls `tokio::spawn` — must run inside the runtime.
         let dispatcher = {
             let _guard = runtime.enter();
-            m3_dispatcher::Dispatcher::new(cfg, dispatcher_backend)
+            m3_dispatcher::Dispatcher::new(cfg, single_backend)
         };
+        let backend = dispatcher.backend().clone();
 
-        Ok(PyEmbeddedEmbedder {
+        let me = PyEmbeddedEmbedder {
             dispatcher,
             backend,
             runtime,
-        })
+        };
+        // Fix #2: synchronous warmup. `embedding_dim()` triggers the
+        // ContextPool::load path, which now performs a per-worker decode +
+        // embedding read before reporting ready — so by the time this returns,
+        // the next embed() call lands on a fully-warm context.
+        if warmup.unwrap_or(true) {
+            map_err(me.backend.embedding_dim())?;
+        }
+        Ok(me)
     }
 
     /// Embed a batch of texts. Returns one row per input, each of length
     /// `embedding_dim()`. Routes through the dispatcher's `embed_batch`, which
     /// applies the slot semaphore + circuit breaker before handing the batch
     /// to the multi-stream `EmbeddedBackend`. Blocks the calling thread.
-    fn embed(&self, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
-        let out = self.runtime.block_on(self.dispatcher.embed_batch(texts));
+    ///
+    /// Releases the GIL across the `runtime.block_on` so other Python threads
+    /// can make progress while llama.cpp decodes. The `Vec<String>` extraction
+    /// happens before the detach (GIL-required); inside the detach closure
+    /// nothing touches Python — `dispatcher`, `runtime`, and the owned
+    /// `texts: Vec<String>` are all pure Rust.
+    fn embed(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        let out = py.detach(|| self.runtime.block_on(self.dispatcher.embed_batch(texts)));
         map_err(out)
     }
 
@@ -818,10 +999,13 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(cosine_batch_packed_flat, m)?)?;
     m.add_function(wrap_pyfunction!(hybrid_score_batch, m)?)?;
     m.add_function(wrap_pyfunction!(recency_bonus_ranks, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank_scored, m)?)?;
+    m.add_function(wrap_pyfunction!(mmr_rerank_packed, m)?)?;
+    m.add_function(wrap_pyfunction!(mmr_rerank_scored_packed, m)?)?;
     m.add_function(wrap_pyfunction!(enforce_displacement_guard, m)?)?;
     m.add_function(wrap_pyfunction!(blob_as_f32, m)?)?;
     m.add_function(wrap_pyfunction!(f32_as_blob, m)?)?;
@@ -834,6 +1018,7 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_spans, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_tokens, m)?)?;
     m.add_function(wrap_pyfunction!(env_config_summary, m)?)?;
+    m.add_function(wrap_pyfunction!(embed_backend_label, m)?)?;
 
     m.add_class::<PyRankRow>()?;
     m.add_class::<PyRouteSignals>()?;

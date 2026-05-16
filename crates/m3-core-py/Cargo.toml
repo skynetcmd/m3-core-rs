@@ -23,6 +23,7 @@ m3-rank = { workspace = true }
 m3-route = { workspace = true }
 m3-graph = { workspace = true }
 pyo3 = { version = "0.28", features = ["extension-module"] }
+bytemuck = "1"
 log = "0.4"
 env_logger = "0.11"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
@@ -33,3 +34,11 @@ default = []
 # from source and exposes the in-process `EmbeddedEmbedder` PyO3 class.
 # NON-DEFAULT — the default build compiles with no llama.cpp.
 embedded = ["m3-embed-llamacpp/embedded"]
+# GPU variants pull in `embedded` so #[cfg(feature = "embedded")]-gated items
+# (PyEmbeddedEmbedder class, embed_backend_label dispatch) are compiled in.
+# Without this inherit, a `--features embedded-cuda` wheel would lack the
+# Python class entirely — the m3-embed-llamacpp side enables the GPU
+# backend C build, but the binding crate's gates need `embedded` too.
+embedded-cuda   = ["embedded", "m3-embed-llamacpp/embedded-cuda"]
+embedded-vulkan = ["embedded", "m3-embed-llamacpp/embedded-vulkan"]
+embedded-metal  = ["embedded", "m3-embed-llamacpp/embedded-metal"]

@@ -12,3 +12,9 @@ dynamic = ["version"]
 [tool.maturin]
 module-name = "m3_core_rs"
 features = ["pyo3/extension-module"]
+# Mixed Rust/Python layout: `python/m3_core_rs/__init__.py` runs first and
+# registers CUDA/Vulkan DLL search directories via `os.add_dll_directory`
+# before the compiled `.pyd` is loaded. Required on Windows for any GPU
+# feature build because Python ignores `PATH` for extension DLL resolution
+# since 3.8. See the docstring in that __init__.py.
+python-source = "python"

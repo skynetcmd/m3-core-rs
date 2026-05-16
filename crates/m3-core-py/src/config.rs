@@ -28,6 +28,40 @@ pub fn embed_max_batch_tokens() -> usize {
     env_or("M3_EMBED_MAX_BATCH_TOKENS", 2048)
 }
 
+/// `M3_EMBED_CTX` — total KV-cache token budget per worker context.
+/// Defaults to 8192 (BGE-M3 training context). Shared across all sequences in
+/// one decode call: effective per-sequence capacity = M3_EMBED_CTX / M3_EMBED_SEQ_MAX.
+/// Texts longer than that per-seq limit are decoded alone (using the full budget).
+/// KV memory per worker ≈ M3_EMBED_CTX × 96 KB (BGE-M3 fp16 KV estimate).
+pub fn embed_ctx() -> u32 {
+    env_or("M3_EMBED_CTX", 8192u32)
+}
+
+/// `M3_EMBED_SEQ_MAX` — max sequences packed into one llama.cpp decode call per
+/// worker context. Higher values amortise the per-decode overhead across more
+/// texts; lower values reduce KV-cache memory per context. Default: 32.
+/// Each worker context's total token budget per decode is capped by `M3_EMBED_CTX`
+/// regardless of this setting, so effective seqs/decode = min(seq_max, ctx/avg_tokens).
+pub fn embed_seq_max() -> u32 {
+    env_or("M3_EMBED_SEQ_MAX", 32u32)
+}
+
+/// `M3_EMBED_N_BATCH` — llama.cpp's prompt-process batch ceiling (wave-3 fix #1).
+/// Decoupled from `n_ctx` so an over-provisioned KV budget doesn't force a
+/// proportionally over-provisioned compute tile. Default: 2048 (the value that
+/// gives the best throughput-per-allocator-pressure tradeoff for BGE-M3 sized
+/// inputs in the wave-0 baseline). Clamped to `[1, n_ctx]` at the embed crate.
+pub fn embed_n_batch() -> u32 {
+    env_or("M3_EMBED_N_BATCH", 2048u32)
+}
+
+/// `M3_EMBED_N_UBATCH` — llama.cpp's micro-batch (the inner SIMD tile size,
+/// wave-3 fix #1). Smaller than `n_batch`; tuned independently. Default: 512.
+/// Clamped to `[1, n_batch]` at the embed crate.
+pub fn embed_n_ubatch() -> u32 {
+    env_or("M3_EMBED_N_UBATCH", 512u32)
+}
+
 /// `M3_HASH_PROVIDER` — preferred hash backend label.
 pub fn hash_provider() -> String {
     env::var("M3_HASH_PROVIDER").unwrap_or_else(|_| "ring".to_string())

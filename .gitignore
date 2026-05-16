@@ -3,3 +3,14 @@
 Cargo.lock
 *.pdb
 __pycache__/
+
+# Bench artifacts — local timings, stderr captures, parity JSONs, hardware-
+# revealing paths. Per CLAUDE.md, bench data does not ship to public origin.
+reports/
+embedded_build.log
+dist/
+crates/*/dist/
+
+# Wheels — built locally, redistributed via CI/release process, not via git.
+*.whl
+

@@ -37,6 +37,12 @@ pub struct RouteDecision {
 /// Fixed branch set. Tie-break is lexicographic on these names.
 const BRANCHES: [&str; 4] = ["entity", "lexical", "semantic", "temporal"];
 
+// Indices into the scores array — must match BRANCHES order (alphabetical).
+const BRANCH_ENTITY: usize = 0;
+const BRANCH_LEXICAL: usize = 1;
+const BRANCH_SEMANTIC: usize = 2;
+const BRANCH_TEMPORAL: usize = 3;
+
 fn recency_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -68,13 +74,15 @@ pub fn extract_signals(query: &str) -> RouteSignals {
         .find(query)
         .map(|m| m.as_str().to_lowercase());
     let trimmed = query.trim_end();
-    let question_form = trimmed.ends_with('?')
-        || {
-            let lower = query.trim_start().to_lowercase();
-            ["who", "what", "when", "where", "why", "how", "which", "did", "is", "are", "was", "were"]
-                .iter()
-                .any(|w| lower.starts_with(&format!("{w} ")))
-        };
+    let question_form = trimmed.ends_with('?') || {
+        // First-word ASCII case-insensitive check — allocation-free.
+        let first_word = query.split_whitespace().next().unwrap_or("");
+        const PREFIXES: &[&str] = &[
+            "who", "what", "when", "where", "why", "how",
+            "which", "did", "is", "are", "was", "were",
+        ];
+        PREFIXES.iter().any(|&p| first_word.eq_ignore_ascii_case(p))
+    };
 
     RouteSignals { token_count, has_entity_hint, recency_cue, intent_marker, question_form }
 }
@@ -85,66 +93,69 @@ pub fn extract_signals(query: &str) -> RouteSignals {
 /// and explicitly tested.
 pub fn decide_route(query: &str, signals: &RouteSignals) -> RouteDecision {
     let _ = query;
-    let mut scores: Vec<(&str, f32)> = BRANCHES.iter().map(|b| (*b, 0.0f32)).collect();
-    let add = |scores: &mut Vec<(&str, f32)>, branch: &str, w: f32| {
-        if let Some(s) = scores.iter_mut().find(|(b, _)| *b == branch) {
-            s.1 += w;
-        }
-    };
+    let mut scores = [0.0f32; 4];
 
     // temporal: recency cues dominate.
     if signals.recency_cue {
-        add(&mut scores, "temporal", 3.0);
+        scores[BRANCH_TEMPORAL] += 3.0;
     }
     // entity: entity-shaped spans.
     if signals.has_entity_hint {
-        add(&mut scores, "entity", 3.0);
+        scores[BRANCH_ENTITY] += 3.0;
     }
     // lexical: short keyword-style queries with no question form.
     if signals.token_count <= 3 {
-        add(&mut scores, "lexical", 2.0);
+        scores[BRANCH_LEXICAL] += 2.0;
     }
     if !signals.question_form {
-        add(&mut scores, "lexical", 1.0);
+        scores[BRANCH_LEXICAL] += 1.0;
     }
     // semantic: longer, natural-language / question-form queries.
     if signals.question_form {
-        add(&mut scores, "semantic", 2.0);
+        scores[BRANCH_SEMANTIC] += 2.0;
     }
     if signals.token_count >= 6 {
-        add(&mut scores, "semantic", 2.0);
+        scores[BRANCH_SEMANTIC] += 2.0;
     }
     // intent markers nudge toward semantic unless they are recall-flavoured.
     if let Some(intent) = &signals.intent_marker {
         match intent.as_str() {
-            "recall" | "remember" => add(&mut scores, "temporal", 1.0),
+            "recall" | "remember" => scores[BRANCH_TEMPORAL] += 1.0,
             "compare" | "explain" | "define" | "summarize" | "summarise" => {
-                add(&mut scores, "semantic", 1.5)
+                scores[BRANCH_SEMANTIC] += 1.5
             }
-            _ => add(&mut scores, "semantic", 0.5),
+            _ => scores[BRANCH_SEMANTIC] += 0.5,
         }
     }
     // Baseline so an all-zero query still resolves deterministically.
-    add(&mut scores, "semantic", 0.1);
+    scores[BRANCH_SEMANTIC] += 0.1;
 
-    // Pick max score; lexicographic tie-break (BRANCHES is already sorted, so
-    // a stable scan keeps the lexicographically-first winner on ties).
-    let mut best = scores[0];
-    for &cand in scores.iter().skip(1) {
-        if cand.1 > best.1 {
-            best = cand;
+    // Pick max score; lexicographic tie-break — BRANCHES is alphabetical, so
+    // iterate in index order and only replace on strictly-greater. The lowest
+    // index (lexicographically first name) wins ties.
+    let mut best_idx = 0usize;
+    let mut best_score = scores[0];
+    for (i, &s) in scores.iter().enumerate().skip(1) {
+        if s > best_score {
+            best_score = s;
+            best_idx = i;
         }
     }
 
-    let total: f32 = scores.iter().map(|(_, s)| *s).sum();
-    let confidence = if total > 0.0 { best.1 / total } else { 0.0 };
+    let total: f32 = scores.iter().sum();
+    let confidence = if total > 0.0 { best_score / total } else { 0.0 };
 
-    let signal_breakdown = scores
+    let signal_breakdown = BRANCHES
         .iter()
-        .map(|(b, s)| (b.to_string(), *s))
+        .zip(scores.iter())
+        .map(|(b, s)| ((*b).to_string(), *s))
         .collect();
 
-    RouteDecision { branch: best.0.to_string(), confidence, signal_breakdown }
+    RouteDecision {
+        branch: BRANCHES[best_idx].to_string(),
+        confidence,
+        signal_breakdown,
+    }
 }
 
 #[cfg(test)]

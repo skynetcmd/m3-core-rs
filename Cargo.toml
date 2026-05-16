@@ -6,6 +6,7 @@ members = [
     "crates/m3-vector",
     "crates/m3-dispatcher",
     "crates/m3-embed-llamacpp",
+    "crates/m3-embed-server",
     "crates/m3-ner-ort",
     "crates/m3-redact",
     "crates/m3-rank",

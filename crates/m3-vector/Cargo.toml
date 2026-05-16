@@ -9,13 +9,18 @@ description = "SIMD cosine similarity and MMR reranking."
 
 [features]
 default = []
-# Opt-in std::simd path; requires a nightly toolchain.
-nightly-simd = []
 
 [dependencies]
 m3-error = { workspace = true }
 bytemuck = "1"
 rayon = "1"
+wide = "0.7"
 
 [dev-dependencies]
 proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+rand = "0.8"
+
+[[bench]]
+name = "vector_bench"
+harness = false

@@ -1,8 +1,8 @@
 //! SIMD cosine similarity and MMR reranking (Phase 2).
-#![cfg_attr(feature = "nightly-simd", feature(portable_simd))]
 
 use m3_error::{M3Error, Result};
 use rayon::prelude::*;
+use wide::f32x8;
 
 mod displacement;
 pub use displacement::{
@@ -30,32 +30,29 @@ pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
     Ok(cosine_unchecked(a, b))
 }
 
-/// Cosine without the length check; auto-vectorizable chunked accumulation.
+/// Cosine without the length check; SIMD-accumulated via the `wide` crate
+/// (AVX2/SSE2/NEON where available, scalar fallback otherwise).
 fn cosine_unchecked(a: &[f32], b: &[f32]) -> f32 {
     const LANES: usize = 8;
-    let mut dot = [0.0f32; LANES];
-    let mut na = [0.0f32; LANES];
-    let mut nb = [0.0f32; LANES];
-
     let chunks = a.len() / LANES;
+    let mut dot = f32x8::ZERO;
+    let mut na = f32x8::ZERO;
+    let mut nb = f32x8::ZERO;
     for c in 0..chunks {
         let base = c * LANES;
-        for l in 0..LANES {
-            let x = a[base + l];
-            let y = b[base + l];
-            dot[l] += x * y;
-            na[l] += x * x;
-            nb[l] += y * y;
-        }
+        // Loading via fixed-size array gives the compiler a known-length
+        // contiguous load (cheaper than the `From<&[f32]>` match-on-length).
+        let av_arr: [f32; LANES] = a[base..base + LANES].try_into().unwrap();
+        let bv_arr: [f32; LANES] = b[base..base + LANES].try_into().unwrap();
+        let av = f32x8::new(av_arr);
+        let bv = f32x8::new(bv_arr);
+        dot = av.mul_add(bv, dot);
+        na = av.mul_add(av, na);
+        nb = bv.mul_add(bv, nb);
     }
-    let mut d = 0.0f32;
-    let mut sa = 0.0f32;
-    let mut sb = 0.0f32;
-    for l in 0..LANES {
-        d += dot[l];
-        sa += na[l];
-        sb += nb[l];
-    }
+    let mut d = dot.reduce_add();
+    let mut sa = na.reduce_add();
+    let mut sb = nb.reduce_add();
     for i in (chunks * LANES)..a.len() {
         d += a[i] * b[i];
         sa += a[i] * a[i];
@@ -155,23 +152,49 @@ pub fn hybrid_score_batch(
         )));
     }
     let stt = short_turn_threshold.max(1) as f32;
+    let inv_stt = 1.0 / stt;
+    let stt_threshold = short_turn_threshold;
     let bm25_weight = 1.0 - vector_weight;
-    Ok((0..n)
-        .into_par_iter()
-        .map(|i| {
-            let bm25_norm = 1.0 / (1.0 + bm25_scores[i].abs());
-            let raw = vector_scores[i] * vector_weight + bm25_norm * bm25_weight;
-            let clen = content_lens[i] as f32;
-            let penalty = if (content_lens[i]) < short_turn_threshold {
-                (clen / stt).max(0.3)
-            } else {
-                1.0
-            };
-            raw * penalty
-                + title_match_boost * title_overlaps[i]
-                + importance_weight * importances[i]
-        })
-        .collect())
+
+    // Below ~256 rows, rayon overhead exceeds the gain on this body; go
+    // sequential. Above the threshold, use the parallel index-mapped path
+    // (rayon doesn't have a clean 5-way `par_iter` zip).
+    if n < 256 {
+        Ok(vector_scores
+            .iter()
+            .zip(bm25_scores.iter())
+            .zip(content_lens.iter())
+            .zip(importances.iter())
+            .zip(title_overlaps.iter())
+            .map(|((((vs, bm), cl), imp), title)| {
+                let bm25_norm = 1.0 / (1.0 + bm.abs());
+                let raw = vs * vector_weight + bm25_norm * bm25_weight;
+                let penalty = if *cl < stt_threshold {
+                    ((*cl as f32) * inv_stt).max(0.3)
+                } else {
+                    1.0
+                };
+                raw * penalty + title_match_boost * title + importance_weight * imp
+            })
+            .collect())
+    } else {
+        Ok((0..n)
+            .into_par_iter()
+            .map(|i| {
+                let bm25_norm = 1.0 / (1.0 + bm25_scores[i].abs());
+                let raw = vector_scores[i] * vector_weight + bm25_norm * bm25_weight;
+                let cl = content_lens[i];
+                let penalty = if cl < stt_threshold {
+                    ((cl as f32) * inv_stt).max(0.3)
+                } else {
+                    1.0
+                };
+                raw * penalty
+                    + title_match_boost * title_overlaps[i]
+                    + importance_weight * importances[i]
+            })
+            .collect())
+    }
 }
 
 /// Rank-based linear recency bonus aligned to `valid_froms`.
@@ -189,19 +212,55 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
     if bias <= 0.0 || n < 2 {
         return out;
     }
-    // Collect (original_index, valid_from_str) for non-empty entries.
-    let mut dated: Vec<(usize, &str)> = valid_froms
+    // Parse ISO-8601 to a packed u64 once per row; integer compare is much
+    // cheaper than lexicographic string compare. Accepts "YYYY-MM-DD" and
+    // "YYYY-MM-DDTHH:MM:SS..." forms; missing parts default to 0. Unparseable
+    // strings collapse to 0 (treated as oldest), matching the prior string
+    // sort's behavior on non-ISO inputs.
+    fn iso_to_u64(s: &str) -> u64 {
+        let mut parts = [0u64; 6]; // year, month, day, hour, min, sec
+        let mut idx = 0usize;
+        let mut current = 0u64;
+        let mut digits = 0u32;
+        for ch in s.bytes() {
+            if ch.is_ascii_digit() {
+                current = current * 10 + (ch - b'0') as u64;
+                digits += 1;
+            } else if digits > 0 {
+                if idx < 6 {
+                    parts[idx] = current;
+                    idx += 1;
+                }
+                current = 0;
+                digits = 0;
+                if idx >= 6 {
+                    break;
+                }
+            }
+        }
+        if digits > 0 && idx < 6 {
+            parts[idx] = current;
+        }
+        parts[0] * 10_000_000_000
+            + parts[1] * 100_000_000
+            + parts[2] * 1_000_000
+            + parts[3] * 10_000
+            + parts[4] * 100
+            + parts[5]
+    }
+
+    let mut dated: Vec<(usize, u64)> = valid_froms
         .iter()
         .enumerate()
         .filter_map(|(i, v)| match v {
-            Some(s) if !s.is_empty() => Some((i, s.as_str())),
+            Some(s) if !s.is_empty() => Some((i, iso_to_u64(s))),
             _ => None,
         })
         .collect();
     if dated.len() < 2 {
         return out;
     }
-    dated.sort_by(|a, b| a.1.cmp(b.1));
+    dated.sort_unstable_by_key(|&(_, k)| k);
     let denom = (dated.len() - 1) as f32;
     for (rank, (orig_idx, _)) in dated.into_iter().enumerate() {
         out[orig_idx] = bias * (rank as f32) / denom;
@@ -421,6 +480,45 @@ mod tests {
         assert!((b[0] - 0.0).abs() < 1e-6);
         assert!((b[4] - 0.5).abs() < 1e-6);
         assert!((b[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_simd_matches_scalar_reference_various_lengths() {
+        // Inline scalar reference: simplest possible accumulation, no SIMD.
+        fn cosine_scalar_ref(a: &[f32], b: &[f32]) -> f32 {
+            let mut d = 0.0f32;
+            let mut sa = 0.0f32;
+            let mut sb = 0.0f32;
+            for i in 0..a.len() {
+                d += a[i] * b[i];
+                sa += a[i] * a[i];
+                sb += b[i] * b[i];
+            }
+            if sa == 0.0 || sb == 0.0 {
+                return 0.0;
+            }
+            (d / (sa.sqrt() * sb.sqrt())).clamp(-1.0, 1.0)
+        }
+        // Cheap deterministic xorshift PRNG to avoid extra deps in the test.
+        let mut state: u32 = 0xC0FFEE;
+        let mut rand_f32 = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Map u32 -> f32 in [-1, 1).
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for &len in &[1usize, 7, 8, 9, 16, 100, 1024] {
+            let a: Vec<f32> = (0..len).map(|_| rand_f32()).collect();
+            let b: Vec<f32> = (0..len).map(|_| rand_f32()).collect();
+            let got = cosine_unchecked(&a, &b);
+            let want = cosine_scalar_ref(&a, &b);
+            assert!(
+                (got - want).abs() < 1e-5,
+                "len={len}: got={got}, want={want}, diff={}",
+                (got - want).abs()
+            );
+        }
     }
 
     #[test]

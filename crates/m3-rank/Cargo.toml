@@ -10,3 +10,11 @@ description = "Hybrid FTS5 + vector rank-fusion merge."
 [dependencies]
 m3-error = { workspace = true }
 m3-vector = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+rand = "0.8"
+
+[[bench]]
+name = "rank_bench"
+harness = false

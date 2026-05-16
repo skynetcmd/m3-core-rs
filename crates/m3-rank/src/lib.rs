@@ -6,7 +6,6 @@
 
 use m3_error::Result;
 use m3_vector::mmr_rerank;
-use std::collections::HashMap;
 
 /// Which result set a `RankRow` came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,35 +65,34 @@ pub fn fuse(
     min_max_normalize(&mut fts);
     min_max_normalize(&mut vector);
 
-    let mut acc: HashMap<String, RankRow> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    // Pre-multiply contributions, so we can compare directly.
+    for r in fts.iter_mut() {
+        r.score *= weights.fts;
+    }
+    for r in vector.iter_mut() {
+        r.score *= weights.vector;
+    }
 
-    let absorb = |row: RankRow, w: f32, acc: &mut HashMap<String, RankRow>, order: &mut Vec<String>| {
-        let contribution = row.score * w;
-        match acc.get_mut(&row.id) {
-            Some(existing) => {
-                if contribution > existing.score {
-                    existing.score = contribution;
+    // Concatenate, then sort by id (string compare).
+    let mut all: Vec<RankRow> = Vec::with_capacity(fts.len() + vector.len());
+    all.extend(fts);
+    all.extend(vector);
+    all.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+
+    // Linear merge: consecutive rows with same id -> take the max contribution.
+    let mut fused: Vec<RankRow> = Vec::with_capacity(all.len());
+    for row in all {
+        match fused.last_mut() {
+            Some(last) if last.id == row.id => {
+                if row.score > last.score {
+                    last.score = row.score;
+                    last.source = row.source;
                 }
             }
-            None => {
-                order.push(row.id.clone());
-                acc.insert(
-                    row.id.clone(),
-                    RankRow { id: row.id, score: contribution, source: row.source },
-                );
-            }
+            _ => fused.push(row),
         }
-    };
-
-    for r in fts {
-        absorb(r, weights.fts, &mut acc, &mut order);
-    }
-    for r in vector {
-        absorb(r, weights.vector, &mut acc, &mut order);
     }
 
-    let mut fused: Vec<RankRow> = order.into_iter().map(|id| acc.remove(&id).unwrap()).collect();
     // Descending by score; ties broken by id for determinism.
     fused.sort_by(|a, b| {
         b.score

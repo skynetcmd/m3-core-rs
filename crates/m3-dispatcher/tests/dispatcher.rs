@@ -102,6 +102,42 @@ async fn circuit_breaker_opens_after_n_failures() {
     assert!(msg.contains("circuit breaker open"), "got: {msg}");
 }
 
+/// Counts how many times the backend was actually invoked.
+struct CountingBackend {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ModelBackend for CountingBackend {
+    async fn run(&self, batch: Batch) -> Result<BatchOutput> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let rows = batch.texts.iter().map(|_| vec![0.0]).collect();
+        Ok(BatchOutput::new(rows))
+    }
+}
+
+#[tokio::test]
+async fn embed_with_deadline_in_past_short_circuits() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let backend = CountingBackend { calls: calls.clone() };
+    let cfg = DispatcherConfig {
+        coalesce_window_ms: 5,
+        ..Default::default()
+    };
+    let disp = Dispatcher::new(cfg, backend);
+    // Deadline already in the past at submission.
+    let past = std::time::Instant::now() - Duration::from_secs(1);
+    let err = disp
+        .embed_with_deadline("hi".into(), past)
+        .await
+        .expect_err("past deadline must error");
+    assert!(
+        format!("{err}").contains("job deadline exceeded"),
+        "got: {err}"
+    );
+    // Backend must not have been touched.
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn backpressure_rejects_when_queue_full() {
     // streams=1 -> channel cap = 4. One slot, backend hangs, so nothing drains.

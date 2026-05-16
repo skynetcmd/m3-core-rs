@@ -6,6 +6,8 @@
 //! strictly positive). Otherwise the primary is swapped up. The crate stays
 //! generic: the caller classifies each row as expansion or primary.
 
+use std::collections::VecDeque;
+
 /// One ranked row: its score and whether it is an expansion (vs. primary).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplacementRow {
@@ -34,18 +36,27 @@ pub fn displacement_permutation(
     // same evolving order the in-place variant would.
     let mut work: Vec<DisplacementRow> = items.to_vec();
     let limit = protected_ranks.min(n);
+    // Precompute primary-row indices in original order. After a swap, the
+    // swapped-out primary becomes an expansion at `rank` (already past), and
+    // we never push it back — so a single front-drained deque is sufficient.
+    let mut primaries: VecDeque<usize> = work
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| (!r.is_expansion).then_some(i))
+        .collect();
     for rank in 0..limit {
         if !work[rank].is_expansion {
+            // This rank is a primary; pop it from the deque if present at front.
+            while primaries.front().is_some_and(|&p| p <= rank) {
+                primaries.pop_front();
+            }
             continue;
         }
-        let mut next_primary: Option<usize> = None;
-        for j in (rank + 1)..n {
-            if !work[j].is_expansion {
-                next_primary = Some(j);
-                break;
-            }
+        // Drain stale primary indices at/before this rank.
+        while primaries.front().is_some_and(|&p| p <= rank) {
+            primaries.pop_front();
         }
-        let Some(pidx) = next_primary else {
+        let Some(&pidx) = primaries.front() else {
             continue;
         };
         let score = work[rank].score;
@@ -55,6 +66,9 @@ pub fn displacement_permutation(
         }
         work.swap(rank, pidx);
         perm.swap(rank, pidx);
+        // The primary moved to `rank` (done); the old expansion now sits at
+        // `pidx` as an expansion. Discard the consumed primary index.
+        primaries.pop_front();
     }
     perm
 }
@@ -68,9 +82,27 @@ pub fn enforce_displacement_guard(
     protected_ranks: usize,
     margin: f32,
 ) {
-    let perm = displacement_permutation(items, protected_ranks, margin);
-    let reordered: Vec<DisplacementRow> = perm.iter().map(|&i| items[i]).collect();
-    items.copy_from_slice(&reordered);
+    let mut perm = displacement_permutation(items, protected_ranks, margin);
+    // Apply the permutation in place via cycle decomposition. DisplacementRow
+    // is Copy, so we can save one element per cycle and rotate the rest.
+    for start in 0..perm.len() {
+        if perm[start] == start {
+            continue;
+        }
+        let mut current = start;
+        let saved = items[start];
+        loop {
+            let next = perm[current];
+            if next == start {
+                break;
+            }
+            items[current] = items[next];
+            perm[current] = current;
+            current = next;
+        }
+        items[current] = saved;
+        perm[current] = current;
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +155,40 @@ mod tests {
         let once = v.clone();
         enforce_displacement_guard(&mut v, 3, 2.0);
         assert_eq!(v, once);
+    }
+
+    #[test]
+    fn deep_permutation_matches_reference() {
+        // 8 items: 5 expansions interleaved with 3 primaries.
+        // Pattern (idx: type/score):
+        //   0: E 1.0, 1: E 0.9, 2: P 0.4, 3: E 0.8, 4: E 0.7,
+        //   5: P 0.3, 6: E 0.6, 7: P 0.2
+        let mk = || {
+            vec![
+                row(1.0, true),
+                row(0.9, true),
+                row(0.4, false),
+                row(0.8, true),
+                row(0.7, true),
+                row(0.3, false),
+                row(0.6, true),
+                row(0.2, false),
+            ]
+        };
+        let pr = 5;
+        let margin = 2.0;
+        // Reference: compute perm, then build a fresh Vec the old way.
+        let src = mk();
+        let perm = displacement_permutation(&src, pr, margin);
+        let reference: Vec<DisplacementRow> = perm.iter().map(|&i| src[i]).collect();
+        // In-place application.
+        let mut actual = mk();
+        enforce_displacement_guard(&mut actual, pr, margin);
+        assert_eq!(actual, reference);
+        // Idempotency on the deeper case.
+        let once = actual.clone();
+        enforce_displacement_guard(&mut actual, pr, margin);
+        assert_eq!(actual, once);
     }
 
     #[test]

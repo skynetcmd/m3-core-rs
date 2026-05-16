@@ -73,34 +73,44 @@ manually if you want a clean uninstall.
 
 ### Logs
 
-Service-mode logs land at:
+Service-mode logs land in:
 
 ```
-%PROGRAMDATA%\m3-embed-server\service.log
+%PROGRAMDATA%\m3-embed-server\service.log.YYYY-MM-DD
 ```
 
-Tail with:
+Logs roll daily (UTC) via `tracing-appender`; the active day's file is the
+newest one. `install` does **not** create any files in this directory until
+the service first runs.
+
+Tail the current day's log:
 
 ```powershell
-Get-Content -Wait $env:PROGRAMDATA\m3-embed-server\service.log
+Get-ChildItem $env:PROGRAMDATA\m3-embed-server\service.log.* |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1 |
+    Get-Content -Wait
 ```
 
-Log rotation is **not** built in — for long-running deployments, plan on an
-external rotator (Task Scheduler running PowerShell `Compress-Archive` weekly,
-or similar). See follow-ups below.
+Old rolled files are pruned automatically on service startup: anything older
+than 14 days is deleted. No external rotator needed.
+
+Foreground / dev mode keeps the original `env_logger` stderr behaviour — only
+service mode uses the rolling-file appender.
 
 ### Recovery actions (restart on crash)
 
-The `windows-service` 0.8 crate does not expose `ChangeServiceConfig2`-style
-recovery actions. After `install`, run this **once** (elevated) to set restart
-on failure:
+Configured automatically by `install` via a `sc.exe failure` call:
 
-```powershell
-sc.exe failure m3-embed-server reset= 60 actions= restart/5000/restart/5000/restart/5000
+```
+reset window: 60 s, actions: restart/5000/restart/5000/restart/5000
 ```
 
-This restarts the service up to 3 times with a 5 s delay, resetting the
-counter after 60 s without a failure.
+i.e. restart the service up to 3 times with a 5 s delay, resetting the
+counter after 60 s without a failure. If the `sc.exe` call fails (rare —
+usually missing elevation), `install` prints a WARN with the exact command
+to run by hand and continues; the service is already registered at that
+point.
 
 ## Config file format
 
@@ -125,9 +135,5 @@ when both are set (handy for ad-hoc overrides in foreground mode).
 
 ## Follow-ups
 
-- Recovery actions need a one-line `sc.exe failure` shim or a manual step
-  (see above). `windows-service` 0.8 doesn't expose the API.
-- Log rotation is not built in; use an external rotator or add the
-  `tracing-appender` rolling-file crate in a future wave.
 - Non-Windows targets only support foreground mode. Adding systemd unit
   generation would be a parallel "sovereign install" story for Linux.

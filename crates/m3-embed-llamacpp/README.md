@@ -58,14 +58,6 @@ to Python as `m3_core_rs.embed_backend_label()`): one of `"cpu"`,
 1. Install Xcode Command Line Tools: `xcode-select --install`.
 2. Build: `cargo build -p m3-embed-server --release --features embedded-metal`.
 
-> **Caveat — `embedded-metal` on non-Apple targets.** llama-cpp-sys-2's
-> `build.rs` only emits `framework=Metal/MetalKit` link directives when the
-> target OS is Apple. On Linux/Windows, enabling `embedded-metal` builds
-> successfully but produces a CPU-only artifact (the `metal` cargo feature is
-> a no-op there). Always cross-check `active_backend()` at runtime if you rely
-> on Metal acceleration. Do **not** ship a Linux/Windows wheel built with
-> `--features embedded-metal` expecting GPU offload.
-
 ### Mutual exclusivity
 GPU features are mutually exclusive (enforced via `compile_error!` in
 `src/lib.rs`). Cargo will let you specify multiple, but the build will fail

@@ -49,29 +49,70 @@ fn service_main(args: Vec<OsString>) {
 /// Called from `main` when argv is `run-as-service`. Hands control to SCM,
 /// which will call back into `service_main` on its own thread.
 pub fn run_dispatcher() -> Result<(), Box<dyn std::error::Error>> {
-    init_service_logging()?;
+    // Hold the appender guard for the lifetime of this function — dropping it
+    // flushes and closes the non-blocking writer. service_dispatcher::start
+    // blocks until SCM signals stop, so the guard lives across the whole
+    // service runtime.
+    let _log_guard = init_service_logging()?;
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
     Ok(())
 }
 
-fn init_service_logging() -> std::io::Result<()> {
-    let log_path = config::default_log_path();
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Prune `service.log.YYYY-MM-DD` files older than 14 days in `log_dir`.
+/// Best-effort: errors are swallowed (we don't want pruning failures to
+/// prevent service startup).
+fn prune_old_logs(log_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(14 * 24 * 60 * 60));
+    let Some(cutoff) = cutoff else { return; };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+        // Match rolled logs: "service.log.YYYY-MM-DD". Leave the active
+        // "service.log" file alone (tracing-appender::rolling::daily writes
+        // dated filenames by default, but be conservative).
+        if !name.starts_with("service.log.") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue; };
+        let Ok(modified) = meta.modified() else { continue; };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(&path);
+        }
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    // env_logger writes through std::io::Write — use a Mutex-wrapped File via
-    // the `Pipe` target so concurrent log macros serialize cleanly.
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    );
-    builder.target(env_logger::Target::Pipe(Box::new(file)));
+}
+
+fn init_service_logging() -> std::io::Result<tracing_appender::non_blocking::WorkerGuard> {
+    let log_path = config::default_log_path();
+    let log_dir: std::path::PathBuf = log_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&log_dir)?;
+
+    // Drop old rolled files (>14 days) before opening today's file.
+    prune_old_logs(&log_dir);
+
+    // Daily-rotated, non-blocking writer. Produces files of the form
+    // `<log_dir>/service.log.YYYY-MM-DD`.
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "service.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Bridge any `log::` macro calls (existing code paths use them) into the
+    // tracing subscriber, then install the file-targeted subscriber.
+    let _ = tracing_log::LogTracer::init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(filter)
+        .finish();
     // Ignore double-init errors so foreground -> service tests are tolerant.
-    let _ = builder.try_init();
-    Ok(())
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    Ok(guard)
 }
 
 fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
@@ -181,6 +222,18 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         service_manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
     service.set_description(SERVICE_DESC)?;
 
+    // Best-effort: configure SCM recovery actions. `windows-service` 0.8
+    // doesn't expose `ChangeServiceConfig2`, so we shell out to sc.exe (base
+    // Windows since XP). A failure here is non-fatal — the service is
+    // already registered, the operator can re-run the command by hand.
+    match configure_recovery_actions() {
+        Ok(()) => println!("recovery actions: restart x3, 5s delay, 60s reset window"),
+        Err(e) => eprintln!(
+            "WARN: recovery actions not configured ({e}). Run manually:\n  \
+             sc.exe failure {SERVICE_NAME} reset= 60 actions= restart/5000/restart/5000/restart/5000"
+        ),
+    }
+
     // Snapshot current env into the config file so SYSTEM-account service
     // can find the GGUF. Don't clobber an existing file.
     let cfg_path = config::default_config_path();
@@ -198,10 +251,36 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     println!("Next steps:");
     println!("  1. Edit {} to confirm [embed].gguf is set.", cfg_path.display());
     println!("  2. Start it:  m3-embed-server start    (or: sc start {SERVICE_NAME})");
-    println!();
-    println!("NOTE: recovery actions (restart on crash) are not set by this installer.");
-    println!("      Configure via Services.msc -> Properties -> Recovery, or run:");
-    println!("      sc failure {SERVICE_NAME} reset= 60 actions= restart/5000/restart/5000/restart/5000");
+    Ok(())
+}
+
+/// Configure SCM recovery actions for the service. Equivalent to:
+///   sc.exe failure m3-embed-server reset= 60 actions= restart/5000/restart/5000/restart/5000
+/// Note: sc.exe is *picky* — there must be a space AFTER the `=` in each
+/// `key= value` pair, and the args must be passed as separate tokens (not a
+/// single command-line string).
+fn configure_recovery_actions() -> Result<(), String> {
+    let output = std::process::Command::new("sc.exe")
+        .args([
+            "failure",
+            SERVICE_NAME,
+            "reset=",
+            "60",
+            "actions=",
+            "restart/5000/restart/5000/restart/5000",
+        ])
+        .output()
+        .map_err(|e| format!("failed to spawn sc.exe: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "sc.exe failure exited {}: {} {}",
+            output.status,
+            stderr.trim(),
+            stdout.trim()
+        ));
+    }
     Ok(())
 }
 

@@ -920,9 +920,11 @@ impl PyEmbeddedEmbedder {
         // env var -> DispatcherConfig::streams -> EmbeddedBackend pool size.
         // n_ctx flows from M3_EMBED_CTX (default 8192) — total token budget per decode call.
         // seq_max flows from M3_EMBED_SEQ_MAX (default 32) — sequences packed per decode call.
-        // n_batch / n_ubatch flow from M3_EMBED_N_BATCH (default 2048) and
-        // M3_EMBED_N_UBATCH (default 512) — wave-3 fix #1 decouples llama.cpp's
-        // prompt-process batch + micro-batch ceilings from n_ctx.
+        // n_batch / n_ubatch flow from M3_EMBED_N_BATCH / M3_EMBED_N_UBATCH,
+        // both defaulting to M3_EMBED_CTX. The BERT encoder asserts
+        // `n_ubatch >= n_tokens` over the whole decode batch (a chunk can hold
+        // up to n_ctx tokens), so n_ctx is the only encoder-safe default; the
+        // embed crate floors any smaller value up to n_ctx.
         //
         // Fix #12 (shape b): `Dispatcher::new` already wraps its backend in
         // `Arc<B>` internally, so we build ONE `EmbeddedBackend`, hand it to the

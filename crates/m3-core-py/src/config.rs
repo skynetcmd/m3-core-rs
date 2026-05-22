@@ -23,9 +23,18 @@ pub fn embed_coalesce_ms() -> u64 {
     env_or("M3_EMBED_COALESCE_MS", 3)
 }
 
-/// `M3_EMBED_MAX_BATCH_TOKENS` — per-batch token ceiling.
+/// `M3_EMBED_MAX_BATCH_TOKENS` — the dispatcher's coalescing ceiling: how many
+/// tokens' worth of separate jobs are packed into one batch before it is
+/// flushed to the worker pool. Defaults to `M3_EMBED_STREAMS * M3_EMBED_CTX` so
+/// a single coalescing window can fill *every* worker's context at once — the
+/// earlier flat 2048 default capped a batch at roughly one context's worth,
+/// under-feeding the `streams`-wide pool by a factor of `streams`. This knob
+/// bounds host-side queue memory only; per-worker GPU KV-cache stays bounded by
+/// `M3_EMBED_CTX` regardless. `saturating_mul` guards the (unrealistic) overflow
+/// case on 32-bit targets.
 pub fn embed_max_batch_tokens() -> usize {
-    env_or("M3_EMBED_MAX_BATCH_TOKENS", 2048)
+    let default = embed_streams().saturating_mul(embed_ctx() as usize);
+    env_or("M3_EMBED_MAX_BATCH_TOKENS", default)
 }
 
 /// `M3_EMBED_CTX` — total KV-cache token budget per worker context.
@@ -46,20 +55,25 @@ pub fn embed_seq_max() -> u32 {
     env_or("M3_EMBED_SEQ_MAX", 32u32)
 }
 
-/// `M3_EMBED_N_BATCH` — llama.cpp's prompt-process batch ceiling (wave-3 fix #1).
-/// Decoupled from `n_ctx` so an over-provisioned KV budget doesn't force a
-/// proportionally over-provisioned compute tile. Default: 2048 (the value that
-/// gives the best throughput-per-allocator-pressure tradeoff for BGE-M3 sized
-/// inputs in the wave-0 baseline). Clamped to `[1, n_ctx]` at the embed crate.
+/// `M3_EMBED_N_BATCH` — llama.cpp's prompt-process batch ceiling. Defaults to
+/// `M3_EMBED_CTX` (8192). It must be >= `n_ubatch`, and `n_ubatch` must cover
+/// the largest decode chunk — which `embed_on_ctx` bounds at `n_ctx` — so the
+/// only encoder-safe default is `n_batch == n_ctx`. The earlier 2048 default
+/// (decoupled from `n_ctx` in wave-3 fix #1) crashed the BERT encoder's
+/// `GGML_ASSERT(n_ubatch >= n_tokens)` on routine BGE-M3 inputs. Operators may
+/// still raise it above `n_ctx`; the embed crate floors any smaller value.
 pub fn embed_n_batch() -> u32 {
-    env_or("M3_EMBED_N_BATCH", 2048u32)
+    env_or("M3_EMBED_N_BATCH", embed_ctx())
 }
 
-/// `M3_EMBED_N_UBATCH` — llama.cpp's micro-batch (the inner SIMD tile size,
-/// wave-3 fix #1). Smaller than `n_batch`; tuned independently. Default: 512.
-/// Clamped to `[1, n_batch]` at the embed crate.
+/// `M3_EMBED_N_UBATCH` — llama.cpp's micro-batch (the inner SIMD tile size).
+/// Defaults to `M3_EMBED_CTX` (8192). The BERT encoder asserts `n_ubatch >=
+/// n_tokens` for the whole batch and a decode chunk can be up to `n_ctx`
+/// tokens, so `n_ubatch` below `n_ctx` is unsafe — the embed crate floors it
+/// up to `n_ctx`. The earlier 512 default was the source of the encoder crash
+/// on any text/chunk over 512 tokens.
 pub fn embed_n_ubatch() -> u32 {
-    env_or("M3_EMBED_N_UBATCH", 512u32)
+    env_or("M3_EMBED_N_UBATCH", embed_ctx())
 }
 
 /// `M3_HASH_PROVIDER` — preferred hash backend label.

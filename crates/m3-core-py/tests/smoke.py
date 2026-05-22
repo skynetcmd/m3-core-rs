@@ -149,9 +149,54 @@ def test_dispatcher_and_env() -> None:
         "M3_EMBED_STREAMS",
         "M3_EMBED_COALESCE_MS",
         "M3_EMBED_MAX_BATCH_TOKENS",
+        "M3_EMBED_CTX",
+        "M3_EMBED_N_BATCH",
+        "M3_EMBED_N_UBATCH",
         "M3_HASH_PROVIDER",
     ):
         assert key in summary, key
+
+    # Regression guard: n_ubatch / n_batch must default to n_ctx. The BERT
+    # encoder asserts `n_ubatch >= n_tokens` over the whole decode batch, and a
+    # chunk can be as large as n_ctx — so a default below n_ctx (the old 512 /
+    # 2048) crashes the encoder on routine BGE-M3 inputs. See to-do a57dac19.
+    assert summary["M3_EMBED_N_UBATCH"] == summary["M3_EMBED_CTX"], (
+        "M3_EMBED_N_UBATCH default must equal M3_EMBED_CTX (encoder-safe); "
+        f"got n_ubatch={summary['M3_EMBED_N_UBATCH']} ctx={summary['M3_EMBED_CTX']}"
+    )
+    assert summary["M3_EMBED_N_BATCH"] == summary["M3_EMBED_CTX"], (
+        "M3_EMBED_N_BATCH default must equal M3_EMBED_CTX; "
+        f"got n_batch={summary['M3_EMBED_N_BATCH']} ctx={summary['M3_EMBED_CTX']}"
+    )
+
+    # Regression guard: the dispatcher's coalescing ceiling must default to
+    # streams * ctx so one coalescing window can fill the whole worker pool.
+    # The earlier flat 2048 under-fed the pool by a factor of `streams`.
+    assert (
+        summary["M3_EMBED_MAX_BATCH_TOKENS"]
+        == summary["M3_EMBED_STREAMS"] * summary["M3_EMBED_CTX"]
+    ), (
+        "M3_EMBED_MAX_BATCH_TOKENS default must equal STREAMS * CTX; got "
+        f"{summary['M3_EMBED_MAX_BATCH_TOKENS']} vs "
+        f"{summary['M3_EMBED_STREAMS']} * {summary['M3_EMBED_CTX']}"
+    )
+
+    # n_ubatch / n_batch track n_ctx when ctx is raised via env; and
+    # max_batch_tokens recomputes from the new ctx too.
+    os.environ["M3_EMBED_CTX"] = "4096"
+    bumped = m.env_config_summary()
+    assert bumped["M3_EMBED_N_UBATCH"] == 4096, bumped["M3_EMBED_N_UBATCH"]
+    assert bumped["M3_EMBED_N_BATCH"] == 4096, bumped["M3_EMBED_N_BATCH"]
+    assert (
+        bumped["M3_EMBED_MAX_BATCH_TOKENS"]
+        == bumped["M3_EMBED_STREAMS"] * 4096
+    ), bumped["M3_EMBED_MAX_BATCH_TOKENS"]
+    del os.environ["M3_EMBED_CTX"]
+
+    # An explicit M3_EMBED_MAX_BATCH_TOKENS still overrides the computed default.
+    os.environ["M3_EMBED_MAX_BATCH_TOKENS"] = "1024"
+    assert m.env_config_summary()["M3_EMBED_MAX_BATCH_TOKENS"] == 1024
+    del os.environ["M3_EMBED_MAX_BATCH_TOKENS"]
 
     # env var is picked up when set
     os.environ["M3_EMBED_STREAMS"] = "16"

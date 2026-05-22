@@ -42,27 +42,89 @@ pub struct ResolvedConfig {
     pub max_batch_tokens: usize,
 }
 
-/// Default location for the service config file:
-/// `%PROGRAMDATA%\m3-embed-server\config.toml` on Windows,
-/// `/etc/m3-embed-server/config.toml` elsewhere (rarely used; foreground only).
-pub fn default_config_path() -> PathBuf {
-    if cfg!(windows) {
-        let base = std::env::var("PROGRAMDATA")
-            .unwrap_or_else(|_| "C:\\ProgramData".into());
-        PathBuf::from(base).join("m3-embed-server").join("config.toml")
+/// Per-user base directory for config (`$XDG_CONFIG_HOME` or `~/.config` on
+/// Linux, `~/Library/Application Support` on macOS). Falls back to the current
+/// directory only if `$HOME` is somehow unset.
+#[cfg(not(windows))]
+fn user_config_base() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home()
+            .map(|h| h.join("Library").join("Application Support"))
+            .unwrap_or_else(|| PathBuf::from("."))
     } else {
-        PathBuf::from("/etc/m3-embed-server/config.toml")
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| home().map(|h| h.join(".config")))
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 }
 
-/// Default location for the service log file.
+/// Per-user base directory for logs/state (`$XDG_STATE_HOME` or
+/// `~/.local/state` on Linux, `~/Library/Logs` on macOS).
+///
+/// `allow(dead_code)`: only `default_log_path` calls this, and that in turn is
+/// consumed by the Windows service and the macOS launchd agent — not the Linux
+/// systemd path (which logs to the journal, no file path). So a Linux build
+/// legitimately leaves both unused.
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn user_state_base() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home()
+            .map(|h| h.join("Library").join("Logs"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| home().map(|h| h.join(".local").join("state")))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
+#[cfg(not(windows))]
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Default location for the service config file. The Unix service runs as a
+/// *per-user* agent (launchd / systemd --user), so config lives under the
+/// user's config dir — `%PROGRAMDATA%\m3-embed-server\config.toml` on Windows,
+/// `~/.config/m3-embed-server/config.toml` (Linux) or
+/// `~/Library/Application Support/m3-embed-server/config.toml` (macOS).
+pub fn default_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let base = std::env::var("PROGRAMDATA")
+            .unwrap_or_else(|_| "C:\\ProgramData".into());
+        PathBuf::from(base).join("m3-embed-server").join("config.toml")
+    }
+    #[cfg(not(windows))]
+    {
+        user_config_base().join("m3-embed-server").join("config.toml")
+    }
+}
+
+/// Default location for the service log file. Per-user on Unix to match the
+/// per-user service model (no root-owned `/var/log` write).
+///
+/// `allow(dead_code)`: consumed by the Windows service (`service.rs`) and the
+/// macOS launchd agent (`StandardOutPath`), but not the Linux systemd unit,
+/// which logs to the journal — so a Linux build leaves this unused.
+#[allow(dead_code)]
 pub fn default_log_path() -> PathBuf {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
         let base = std::env::var("PROGRAMDATA")
             .unwrap_or_else(|_| "C:\\ProgramData".into());
         PathBuf::from(base).join("m3-embed-server").join("service.log")
-    } else {
-        PathBuf::from("/var/log/m3-embed-server.log")
+    }
+    #[cfg(not(windows))]
+    {
+        user_state_base().join("m3-embed-server").join("service.log")
     }
 }
 
@@ -130,8 +192,14 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
 }
 
 /// Capture the current shell's env vars and serialize them as a starter
-/// config.toml. Called by the `install` subcommand so the SYSTEM-account
+/// config.toml. Called by the Windows `install` subcommand so the SYSTEM-account
 /// service inherits the operator's intended settings.
+///
+/// `allow(dead_code)`: Windows-service-only. The Unix installers
+/// (`service_unix`) pin `M3_EMBED_GGUF` directly into the launchd plist /
+/// systemd unit's `Environment=`, so they need no config.toml snapshot — this
+/// function is legitimately unused on a Unix build.
+#[allow(dead_code)]
 pub fn snapshot_env_to_file() -> FileConfig {
     FileConfig {
         embed: EmbedSection {
@@ -149,6 +217,9 @@ pub fn snapshot_env_to_file() -> FileConfig {
     }
 }
 
+/// `allow(dead_code)`: paired with `snapshot_env_to_file` — Windows-service-only
+/// (the Unix installers pin config into the unit file instead).
+#[allow(dead_code)]
 pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

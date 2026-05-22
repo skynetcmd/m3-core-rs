@@ -21,11 +21,13 @@ mod server;
 #[cfg(all(windows, feature = "embedded"))]
 mod service;
 // Platform-neutral unit-file templating — compiles everywhere so its render
-// tests run on the (Windows) CI box; consumed by service_unix on Unix. On
-// Windows the functions are exercised only by the test module, so silence the
-// unused-code lint there.
+// tests run on any CI box; consumed by service_unix on Unix. Each item is used
+// by exactly one platform path (render_plist/LAUNCHD_LABEL → macOS,
+// render_unit/SERVICE_NAME → Linux), so *every* single-platform build leaves
+// some of them unused. `allow(dead_code)` module-wide is correct here — the
+// `#[cfg(test)]` render tests exercise all of them regardless of host.
 #[cfg(feature = "embedded")]
-#[cfg_attr(windows, allow(dead_code))]
+#[allow(dead_code)]
 mod unit_render;
 #[cfg(all(not(windows), feature = "embedded"))]
 mod service_unix;

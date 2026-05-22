@@ -1150,7 +1150,7 @@ mod tests {
 
     /// Wave 9.1: confirm the compute-cap detector returns without panicking,
     /// whether or not `nvidia-smi` is on PATH. Builds only under embedded-cuda.
-    #[cfg(all(feature = "embedded-cuda"))]
+    #[cfg(feature = "embedded-cuda")]
     #[test]
     fn detect_cuda_compute_cap_doesnt_panic() {
         let _ = super::embedded::detect_cuda_compute_cap();
@@ -1158,7 +1158,7 @@ mod tests {
 
     /// Wave 9.1: second call must respect whatever the first call set. Once
     /// GGML_CUDA_DISABLE_GRAPHS is present, the helper must leave it alone.
-    #[cfg(all(feature = "embedded-cuda"))]
+    #[cfg(feature = "embedded-cuda")]
     #[test]
     fn maybe_disable_cuda_graphs_idempotent() {
         super::embedded::maybe_disable_cuda_graphs_for_blackwell();

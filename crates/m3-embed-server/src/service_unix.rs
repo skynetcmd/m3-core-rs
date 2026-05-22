@@ -66,6 +66,15 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
 // ===========================================================================
 // macOS — launchd user agent
 // ===========================================================================
+//
+// VERIFICATION STATUS: this module was written and reviewed but, as of
+// 2026-05-22, NEVER COMPILED — the feature was developed on Windows and the
+// Linux/systemd sibling verified on a Debian box, but no macOS host was
+// available and cross-compiling to *-apple-darwin fails at the llama.cpp/ring
+// C build. Before relying on the launchd path, run `cargo build/test/clippy
+// -p m3-embed-server --features embedded` on a real Mac plus a launchctl
+// install/status/stop/uninstall smoke test. Full checklist: m3-memory to-do
+// `c5508907` ("Verify the macOS launchd path in m3-embed-server").
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;

@@ -62,7 +62,13 @@ fn user_config_base() -> PathBuf {
 
 /// Per-user base directory for logs/state (`$XDG_STATE_HOME` or
 /// `~/.local/state` on Linux, `~/Library/Logs` on macOS).
+///
+/// `allow(dead_code)`: only `default_log_path` calls this, and that in turn is
+/// consumed by the Windows service and the macOS launchd agent — not the Linux
+/// systemd path (which logs to the journal, no file path). So a Linux build
+/// legitimately leaves both unused.
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn user_state_base() -> PathBuf {
     if cfg!(target_os = "macos") {
         home()
@@ -104,6 +110,11 @@ pub fn default_config_path() -> PathBuf {
 
 /// Default location for the service log file. Per-user on Unix to match the
 /// per-user service model (no root-owned `/var/log` write).
+///
+/// `allow(dead_code)`: consumed by the Windows service (`service.rs`) and the
+/// macOS launchd agent (`StandardOutPath`), but not the Linux systemd unit,
+/// which logs to the journal — so a Linux build leaves this unused.
+#[allow(dead_code)]
 pub fn default_log_path() -> PathBuf {
     #[cfg(windows)]
     {
@@ -181,8 +192,14 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
 }
 
 /// Capture the current shell's env vars and serialize them as a starter
-/// config.toml. Called by the `install` subcommand so the SYSTEM-account
+/// config.toml. Called by the Windows `install` subcommand so the SYSTEM-account
 /// service inherits the operator's intended settings.
+///
+/// `allow(dead_code)`: Windows-service-only. The Unix installers
+/// (`service_unix`) pin `M3_EMBED_GGUF` directly into the launchd plist /
+/// systemd unit's `Environment=`, so they need no config.toml snapshot — this
+/// function is legitimately unused on a Unix build.
+#[allow(dead_code)]
 pub fn snapshot_env_to_file() -> FileConfig {
     FileConfig {
         embed: EmbedSection {
@@ -200,6 +217,9 @@ pub fn snapshot_env_to_file() -> FileConfig {
     }
 }
 
+/// `allow(dead_code)`: paired with `snapshot_env_to_file` — Windows-service-only
+/// (the Unix installers pin config into the unit file instead).
+#[allow(dead_code)]
 pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

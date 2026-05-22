@@ -357,10 +357,13 @@ pub mod linux {
 }
 
 // ===========================================================================
-// Platform dispatch — what `main.rs` calls. macОС / Linux route to the modules
+// Platform dispatch — what `main.rs` calls. macOS / Linux route to the modules
 // above; any other Unix returns a clear unsupported-platform error.
 // ===========================================================================
 
+// `allow(unused_macros)`: only the `#[cfg(not(any(macos, linux)))]` dispatch
+// arms expand this, so a macOS or Linux build never references it.
+#[allow(unused_macros)]
 macro_rules! unsupported {
     ($verb:expr) => {
         Err(format!(

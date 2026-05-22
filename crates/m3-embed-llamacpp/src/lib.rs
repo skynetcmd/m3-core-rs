@@ -316,19 +316,19 @@ pub struct EmbeddedBackend {
 
 impl EmbeddedBackend {
     /// Construct with the default pool size (4 streams), default ctx (8192), and default seq_max (32).
-    /// Default n_batch = min(n_ctx, 2048), n_ubatch = min(n_batch, 512).
+    /// Default n_batch = n_ubatch = n_ctx (the encoder-safe value; see `with_streams_ctx_seqmax`).
     pub fn new(model_path: impl Into<String>) -> Self {
         Self::with_streams_ctx_seqmax(model_path, 4, 8192, 32)
     }
 
     /// Construct with an explicit context-pool size.
-    /// Defaults: n_batch = min(n_ctx, 2048), n_ubatch = min(n_batch, 512).
+    /// Defaults: n_batch = n_ubatch = n_ctx (the encoder-safe value).
     pub fn with_streams(model_path: impl Into<String>, streams: usize) -> Self {
         Self::with_streams_ctx_seqmax(model_path, streams, 8192, 32)
     }
 
     /// Construct with explicit stream count and per-context token window.
-    /// Defaults: n_batch = min(n_ctx, 2048), n_ubatch = min(n_batch, 512).
+    /// Defaults: n_batch = n_ubatch = n_ctx (the encoder-safe value).
     pub fn with_streams_and_ctx(model_path: impl Into<String>, streams: usize, n_ctx: u32) -> Self {
         Self::with_streams_ctx_seqmax(model_path, streams, n_ctx, 32)
     }
@@ -336,22 +336,34 @@ impl EmbeddedBackend {
     /// Construct with explicit stream count, per-context token window, and max sequences per decode.
     /// `n_ctx` is the total token budget per decode call (shared across all sequences in a chunk).
     /// `seq_max` caps how many sequences are packed into one decode call per worker thread.
-    /// Defaults n_batch / n_ubatch as documented on `with_streams_ctx_seqmax_batch`.
+    /// Defaults n_batch = n_ubatch = n_ctx (encoder-safe; see body for why).
     pub fn with_streams_ctx_seqmax(model_path: impl Into<String>, streams: usize, n_ctx: u32, seq_max: u32) -> Self {
-        // Wave-3 fix #1 defaults: cap n_batch at 2048, n_ubatch at 512 — these
-        // are the values that bench wave 0 showed give the best
-        // throughput-per-allocator-pressure tradeoff for BGE-M3 sized inputs,
-        // and they also work well for short-batch cases.
-        let n_batch = n_ctx.min(2048);
-        let n_ubatch = n_batch.min(512);
+        // n_batch / n_ubatch default to n_ctx. llama.cpp's BERT encoder asserts
+        // `n_ubatch >= n_tokens` for the WHOLE batch it is handed, and a chunk in
+        // `embed_on_ctx` can pack up to `n_ctx` tokens (across `seq_max` seqs, or
+        // one solo long text). The earlier wave-3 default of `n_ubatch = 512`
+        // therefore crashed the encoder — `GGML_ASSERT(cparams.n_ubatch >=
+        // n_tokens)` — on any text/chunk over 512 tokens, which for BGE-M3
+        // (8192-token trained ctx) is routine. `n_ctx` is the simplest default
+        // safe for every chunk the worker can build (a tighter per-decode bound
+        // exists but would couple this constructor to `embed_on_ctx`'s chunker).
+        let n_batch = n_ctx;
+        let n_ubatch = n_ctx;
         Self::with_streams_ctx_seqmax_batch(model_path, streams, n_ctx, seq_max, n_batch, n_ubatch)
     }
 
     /// Full-control constructor (wave-3 fix #1). All five tunables explicit:
     /// pool size, context budget, max sequences/decode, n_batch (prompt-process
     /// batch ceiling), and n_ubatch (micro-batch / SIMD tile). Existing
-    /// constructors above are thin shims that pass sensible defaults
-    /// (`n_batch = min(n_ctx, 2048)`, `n_ubatch = min(n_batch, 512)`).
+    /// constructors above are thin shims that pass `n_batch = n_ubatch = n_ctx`.
+    ///
+    /// Note: `n_batch` and `n_ubatch` are raised to a floor of `n_ctx` here.
+    /// `embed_on_ctx` bounds a decode chunk at `n_ctx` tokens and the BERT
+    /// encoder asserts `n_ubatch >= n_tokens` over the whole batch, so `n_ctx`
+    /// is the simplest value guaranteed safe for every chunk the worker can
+    /// build. A smaller value would crash at `encode()` time; rather than let
+    /// that happen the constructor floors it AND logs a one-line warning to
+    /// stderr so a deliberate small setting isn't silently discarded.
     pub fn with_streams_ctx_seqmax_batch(
         model_path: impl Into<String>,
         streams: usize,
@@ -361,9 +373,23 @@ impl EmbeddedBackend {
         n_ubatch: u32,
     ) -> Self {
         let n_ctx = n_ctx.max(64);
-        // n_batch must be >= n_ubatch and >= 1; clamp into [1, n_ctx].
-        let n_batch = n_batch.max(1).min(n_ctx);
-        let n_ubatch = n_ubatch.max(1).min(n_batch);
+        // Floor n_batch / n_ubatch at n_ctx (see doc comment for the encoder
+        // assert). n_batch must also stay >= n_ubatch. A value above n_ctx is
+        // harmless — just a larger prompt-process tile — so it passes through.
+        let (n_batch, n_ubatch) = {
+            let req_batch = n_batch;
+            let req_ubatch = n_ubatch;
+            let n_batch = n_batch.max(n_ctx);
+            let n_ubatch = n_ubatch.max(n_ctx).min(n_batch);
+            if req_batch < n_batch || req_ubatch < n_ubatch {
+                eprintln!(
+                    "m3-embed: n_batch/n_ubatch ({req_batch}/{req_ubatch}) below \
+                     n_ctx ({n_ctx}); raised to {n_batch}/{n_ubatch} — the BERT \
+                     encoder requires n_ubatch >= the largest decode chunk"
+                );
+            }
+            (n_batch, n_ubatch)
+        };
         Self {
             model_path: model_path.into(),
             streams: streams.max(1),
@@ -687,11 +713,12 @@ pub mod embedded {
         n_batch: u32,
         n_ubatch: u32,
     ) {
-        // Wave-3 fix #1: decouple n_batch / n_ubatch from n_ctx, and turn on
-        // flash attention explicitly. Previously n_batch == n_ubatch == n_ctx
-        // (8192 by default) which over-provisions the prompt-process tile
-        // wildly for normal embed batches. Flash-attn cuts attention memory
-        // bandwidth ~3x on long inputs.
+        // n_batch / n_ubatch reach here already floored to >= n_ctx by the
+        // constructor — the BERT encoder asserts `n_ubatch >= n_tokens` and a
+        // decode chunk can be as large as n_ctx, so they cannot be smaller.
+        // Flash attention is turned on explicitly: it cuts attention memory
+        // bandwidth ~3x on long inputs, and an explicit setter keeps the
+        // per-context log line unambiguous against any future default flip.
         //
         // The flash-attn setter in llama-cpp-2 0.1.146 is
         // `with_flash_attention_policy(llama_cpp_sys_2::llama_flash_attn_type)`.
@@ -1150,7 +1177,7 @@ mod tests {
 
     /// Wave 9.1: confirm the compute-cap detector returns without panicking,
     /// whether or not `nvidia-smi` is on PATH. Builds only under embedded-cuda.
-    #[cfg(all(feature = "embedded-cuda"))]
+    #[cfg(feature = "embedded-cuda")]
     #[test]
     fn detect_cuda_compute_cap_doesnt_panic() {
         let _ = super::embedded::detect_cuda_compute_cap();
@@ -1158,7 +1185,7 @@ mod tests {
 
     /// Wave 9.1: second call must respect whatever the first call set. Once
     /// GGML_CUDA_DISABLE_GRAPHS is present, the helper must leave it alone.
-    #[cfg(all(feature = "embedded-cuda"))]
+    #[cfg(feature = "embedded-cuda")]
     #[test]
     fn maybe_disable_cuda_graphs_idempotent() {
         super::embedded::maybe_disable_cuda_graphs_for_blackwell();

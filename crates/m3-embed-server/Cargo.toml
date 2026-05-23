@@ -10,9 +10,9 @@ description = "OpenAI-compatible HTTP embedding server backed by m3-embed-llamac
 [features]
 default = []
 # CPU embed backend — required. Forwards to m3-embed-llamacpp/embedded.
-# Future GPU variants (cuda/vulkan/metal) can be added here later, but the
-# 8082 fallback role is explicitly CPU-only.
 embedded = ["m3-embed-llamacpp/embedded"]
+# Metal GPU backend (macOS).
+embedded-metal = ["m3-embed-llamacpp/embedded-metal"]
 
 [dependencies]
 m3-embed-llamacpp = { workspace = true, features = [] }

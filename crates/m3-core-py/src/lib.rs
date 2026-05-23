@@ -348,6 +348,65 @@ fn f32_as_blob(vec: Vec<f32>) -> Vec<u8> {
     m3_vector::f32_as_blob(&vec).to_vec()
 }
 
+#[pyfunction]
+fn token_jaccard(a: &str, b: &str) -> f32 {
+    m3_vector::token_jaccard(a, b)
+}
+
+#[pyfunction]
+fn token_jaccard_batch(query: &str, candidates: Vec<String>) -> Vec<f32> {
+    let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+    m3_vector::token_jaccard_batch(query, &refs)
+}
+
+#[pyfunction]
+fn rank_hybrid(
+    py: Python<'_>,
+    relevance: Vec<f32>,
+    contents: Vec<String>,
+    embeddings: Vec<Vec<f32>>,
+    lambda: f32,
+    k: usize,
+) -> PyResult<Vec<usize>> {
+    py.detach(|| {
+        let refs: Vec<&[f32]> = embeddings.iter().map(|v| v.as_slice()).collect();
+        let c_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
+        map_err(m3_vector::rank_hybrid(&relevance, &c_refs, &refs, lambda, k))
+    })
+}
+
+#[pyfunction]
+fn rank_hybrid_packed(
+    py: Python<'_>,
+    relevance: Vec<f32>,
+    contents: Vec<String>,
+    embeddings: &[u8],
+    dim: usize,
+    lambda: f32,
+    k: usize,
+) -> PyResult<Vec<usize>> {
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
+    if row_bytes == 0 {
+        return Err(PyValueError::new_err("dim must be > 0"));
+    }
+    if !embeddings.len().is_multiple_of(row_bytes) {
+        return Err(PyValueError::new_err(format!(
+            "embeddings length {} is not a multiple of dim*4 = {}",
+            embeddings.len(),
+            row_bytes,
+        )));
+    }
+    let floats: &[f32] = bytemuck::try_cast_slice::<u8, f32>(embeddings)
+        .map_err(|e| PyValueError::new_err(format!("embeddings byte->f32 cast failed: {e}")))?;
+    py.detach(|| {
+        let refs: Vec<&[f32]> = floats.chunks_exact(dim).collect();
+        let c_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
+        map_err(m3_vector::rank_hybrid(&relevance, &c_refs, &refs, lambda, k))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // m3-redact
 // ---------------------------------------------------------------------------
@@ -740,6 +799,65 @@ fn ep_priority(platform: &str) -> PyResult<Vec<&'static str>> {
     Ok(m3_ner_ort::ep_priority(platform_from_str(platform)?))
 }
 
+#[cfg(feature = "onnx")]
+#[pyclass(name = "OrtNer")]
+struct PyOrtNer {
+    inner: std::sync::Arc<m3_ner_ort::OrtNer>,
+    runtime: tokio::runtime::Runtime,
+}
+
+#[cfg(feature = "onnx")]
+#[pymethods]
+impl PyOrtNer {
+    #[new]
+    #[pyo3(signature = (model_path, tokenizer_path, labels, platform="cpu_only", threshold=0.5))]
+    fn new(
+        model_path: String,
+        tokenizer_path: String,
+        labels: Vec<String>,
+        platform: &str,
+        threshold: f32,
+    ) -> PyResult<Self> {
+        let p = platform_from_str(platform)?;
+        let inner = m3_ner_ort::OrtNer::new(
+            model_path,
+            tokenizer_path,
+            None,
+            labels,
+            threshold,
+            m3_ner_ort::Quant::Fp32,
+            p,
+        )
+        .map_err(|e| PyValueError::new_err(format!("failed to load NER model: {e}")))?;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|e| PyOSError::new_err(format!("failed to build tokio runtime: {e}")))?;
+
+        Ok(PyOrtNer {
+            inner: std::sync::Arc::new(inner),
+            runtime,
+        })
+    }
+
+    fn run(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<Vec<f32>>> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            let batch = m3_dispatcher::Batch::new(texts, 0);
+            use m3_dispatcher::ModelBackend;
+            let out = self.runtime.block_on(inner.run(batch));
+            map_err(out).map(|b| b.rows)
+        })
+    }
+
+    #[getter]
+    fn labels(&self) -> Vec<String> {
+        self.inner.labels().to_vec()
+    }
+}
+
 /// Decode a flattened GLiNER span-score tensor. `shape` is
 /// `(max_spans, span_width, num_labels)`.
 #[pyfunction]
@@ -1009,8 +1127,12 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mmr_rerank_packed, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank_scored_packed, m)?)?;
     m.add_function(wrap_pyfunction!(enforce_displacement_guard, m)?)?;
+    m.add_function(wrap_pyfunction!(rank_hybrid, m)?)?;
+    m.add_function(wrap_pyfunction!(rank_hybrid_packed, m)?)?;
     m.add_function(wrap_pyfunction!(blob_as_f32, m)?)?;
     m.add_function(wrap_pyfunction!(f32_as_blob, m)?)?;
+    m.add_function(wrap_pyfunction!(token_jaccard, m)?)?;
+    m.add_function(wrap_pyfunction!(token_jaccard_batch, m)?)?;
     m.add_function(wrap_pyfunction!(scrub, m)?)?;
     m.add_function(wrap_pyfunction!(redaction_compile_errors, m)?)?;
     m.add_function(wrap_pyfunction!(fuse, m)?)?;
@@ -1029,6 +1151,8 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCircuitBreaker>()?;
     m.add_class::<PyRetryPolicy>()?;
     m.add_class::<PySpan>()?;
+    #[cfg(feature = "onnx")]
+    m.add_class::<PyOrtNer>()?;
     m.add_class::<PyDispatcherConfig>()?;
 
     // Only present when built with `--features embedded`. Absent otherwise,

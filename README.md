@@ -3,8 +3,6 @@
 Rust compute core for m3-memory ("Project Oxidation"). A Cargo workspace of focused,
 independently-useful crates plus a PyO3 binding crate (`m3-core-py`) consumed by m3-memory.
 
-See `m3_oxidation_plan.md` for the full phased plan.
-
 ## Crates
 
 | Crate | Phase | Purpose |

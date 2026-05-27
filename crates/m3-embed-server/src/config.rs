@@ -145,15 +145,24 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     env_str(key).and_then(|v| v.parse().ok())
 }
 
-/// Resolve config with priority: env var > file value > default.
-/// Returns an error only if `gguf` is unresolved (it has no default).
+/// Resolve config with priority:
+///   env var (M3_EMBED_GGUF)
+///   > file value ([embed].gguf in config.toml)
+///   > **discovery cascade** (B5: probe common BGE-M3 GGUF locations)
+///   > error.
+///
+/// Returns an error only if all sources fail.
 pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
     let gguf = env_str("M3_EMBED_GGUF")
         .or_else(|| file.embed.gguf.clone())
+        .or_else(discover_gguf)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "M3_EMBED_GGUF is unset and config.toml has no [embed].gguf — \
-                 set the env var or run `m3-embed-server install` with the env set."
+                "M3_EMBED_GGUF is unset, config.toml has no [embed].gguf, \
+                 and no BGE-M3 GGUF was found in the standard discovery \
+                 paths (LM Studio cache, ~/models, ~/.cache/m3/models). \
+                 Set the env var or run `m3-embed-server install` with the \
+                 env set."
             )
         })?;
 
@@ -227,4 +236,157 @@ pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
     let s = toml::to_string_pretty(cfg)?;
     std::fs::write(path, s)?;
     Ok(())
+}
+
+// ── B5: GGUF discovery cascade ──────────────────────────────────────────────
+//
+// Probed in order; first existing match wins. Each candidate is a directory
+// to glob for any `*bge-m3*.gguf` or `*BGE-M3*.gguf` file. The cascade exists
+// so a fresh install on a machine with LM Studio already configured "just
+// works" without the operator needing to find and type the GGUF path.
+//
+// Order matters: LM Studio cache first (most users have BGE-M3 from m3 setup
+// or other agent installs), then m3 own cache, then plain ~/models.
+
+/// Discover a BGE-M3 GGUF in standard cache locations. Returns the first
+/// matching path, or None if none of the candidate dirs contain one.
+fn discover_gguf() -> Option<String> {
+    for dir in discovery_candidate_dirs() {
+        if let Some(p) = find_bge_m3_gguf_in(&dir) {
+            return Some(p.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Candidate base directories, in priority order.
+///
+/// `pub(crate)` so the `doctor` subcommand can show users where it looked.
+pub(crate) fn discovery_candidate_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+
+    // 1. LM Studio model cache — the most common source on developer boxes.
+    //    Both the new ".lmstudio/models" and the legacy "Library" path on
+    //    macOS.
+    if let Some(h) = home_dir() {
+        out.push(h.join(".lmstudio").join("models"));
+        #[cfg(target_os = "macos")]
+        out.push(h.join("Library").join("Application Support").join("LM Studio").join("models"));
+    }
+
+    // 2. m3 own cache (populated by `fetch_sovereign_assets.py`).
+    if let Some(h) = home_dir() {
+        out.push(h.join(".cache").join("m3").join("models"));
+        out.push(h.join(".m3-memory").join("_assets").join("embedder"));
+    }
+
+    // 3. Plain ~/models — many people drop GGUFs here.
+    if let Some(h) = home_dir() {
+        out.push(h.join("models"));
+    }
+
+    // 4. Windows-specific: LM Studio default model path.
+    #[cfg(windows)]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            out.push(PathBuf::from(profile).join(".lmstudio").join("models"));
+        }
+    }
+
+    out
+}
+
+/// Recursively search `dir` (up to 4 levels deep) for a file whose name
+/// case-insensitively contains "bge-m3" or "bge_m3" and ends in `.gguf`.
+/// Returns the first match in directory-iteration order; None if no match
+/// or if `dir` doesn't exist.
+fn find_bge_m3_gguf_in(dir: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, depth: usize, max_depth: usize) -> Option<PathBuf> {
+        if depth > max_depth {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ftype = entry.file_type().ok()?;
+            if ftype.is_dir() {
+                if let Some(p) = walk(&path, depth + 1, max_depth) {
+                    return Some(p);
+                }
+            } else if ftype.is_file() {
+                let name = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if name.ends_with(".gguf")
+                    && (name.contains("bge-m3") || name.contains("bge_m3"))
+                {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+    if !dir.is_dir() {
+        return None;
+    }
+    walk(dir, 0, 4)
+}
+
+#[cfg(windows)]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+#[cfg(not(windows))]
+fn home_dir() -> Option<PathBuf> {
+    home()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_returns_none_when_no_dirs_contain_gguf() {
+        // Smoke: if discovery is called with no candidates having a BGE-M3
+        // GGUF, it returns None (doesn't panic, doesn't error).
+        // We can't easily mock home_dir without conditional compilation, so
+        // we just verify the helper handles non-existent dirs gracefully.
+        let p = find_bge_m3_gguf_in(Path::new("/this/path/should/not/exist"));
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn find_bge_m3_gguf_in_tmpdir() {
+        // Walks a fresh tmpdir with a planted GGUF.
+        let tmp = tempfile::tempdir().expect("create tmpdir");
+        let inner = tmp.path().join("subdir");
+        std::fs::create_dir(&inner).unwrap();
+        let target = inner.join("bge-m3-GGUF-Q4_K_M.gguf");
+        std::fs::write(&target, b"fake").unwrap();
+        let found = find_bge_m3_gguf_in(tmp.path()).expect("should find planted GGUF");
+        assert_eq!(found, target);
+    }
+
+    #[test]
+    fn find_bge_m3_gguf_ignores_unrelated_files() {
+        let tmp = tempfile::tempdir().expect("create tmpdir");
+        std::fs::write(tmp.path().join("llama-3-8b.gguf"), b"fake").unwrap();
+        std::fs::write(tmp.path().join("bge-m3-readme.txt"), b"fake").unwrap();
+        let found = find_bge_m3_gguf_in(tmp.path());
+        assert!(found.is_none(), "should not match unrelated files: {found:?}");
+    }
+
+    #[test]
+    fn candidate_dirs_includes_lmstudio() {
+        let dirs = discovery_candidate_dirs();
+        assert!(!dirs.is_empty(), "should always produce some candidates");
+        let has_lmstudio = dirs.iter().any(|d| {
+            d.to_string_lossy().contains(".lmstudio")
+        });
+        assert!(has_lmstudio, "candidates should include .lmstudio paths: {dirs:?}");
+    }
 }

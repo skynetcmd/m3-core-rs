@@ -7,11 +7,12 @@
 
 use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple, PyString};
 
 pub use m3_dispatcher;
 pub use m3_embed_llamacpp;
 pub use m3_error;
+pub use m3_fts;
 pub use m3_graph;
 pub use m3_hash;
 pub use m3_ner_ort;
@@ -461,8 +462,13 @@ fn redaction_config_from_dict(config: &Bound<'_, PyDict>) -> PyResult<m3_redact:
 /// The compiled `Redactor` is cached per-thread keyed by config — a repeated
 /// call with the same config skips regex recompilation entirely.
 #[pyfunction]
-fn scrub(content: &str, config: &Bound<'_, PyDict>) -> PyResult<(String, usize, Vec<String>)> {
+fn scrub<'py>(
+    py: Python<'py>,
+    content: Bound<'py, PyString>,
+    config: &Bound<'_, PyDict>,
+) -> PyResult<(Bound<'py, PyAny>, usize, Vec<String>)> {
     let cfg = redaction_config_from_dict(config)?;
+    let content_str = content.to_str()?;
     let result = REDACTOR_CACHE.with(|cache| {
         let mut slot = cache.borrow_mut();
         let needs_rebuild = match slot.as_ref() {
@@ -472,12 +478,17 @@ fn scrub(content: &str, config: &Bound<'_, PyDict>) -> PyResult<(String, usize, 
         if needs_rebuild {
             *slot = Some((cfg.clone(), m3_redact::Redactor::new(&cfg)));
         }
-        slot.as_ref().unwrap().1.apply(content)
+        slot.as_ref().unwrap().1.apply(content_str)
     });
     REDACTION_COMPILE_ERRORS.with(|e| {
         *e.borrow_mut() = result.compile_errors.clone();
     });
-    Ok((result.content, result.match_count, result.groups_fired))
+    let returned_content = if result.match_count == 0 {
+        content.into_any()
+    } else {
+        PyString::new(py, &result.content).into_any()
+    };
+    Ok((returned_content, result.match_count, result.groups_fired))
 }
 
 /// custom_regex compilation errors from the most recent `scrub()` call on
@@ -878,6 +889,28 @@ fn estimate_tokens(text: &str) -> usize {
     m3_dispatcher::estimate_tokens(text)
 }
 
+// ---------------------------------------------------------------------------
+// m3-fts — FTS5 query sanitization / lexical tokenization
+// ---------------------------------------------------------------------------
+
+/// Strip FTS5 operators (OR/AND/NOT/NEAR + bracket/wildcard punctuation) from
+/// user input and trim. Byte-exact port of `_sanitize_fts` in fts.py.
+/// `max_len` counts code points (matches Python `len()` on `str`).
+#[pyfunction]
+#[pyo3(signature = (query, max_len = 500))]
+fn sanitize_fts(query: &str, max_len: usize) -> String {
+    m3_fts::sanitize_fts(query, max_len)
+}
+
+/// Compile a raw user query into an FTS5 MATCH string, returning `(query, ok)`.
+/// Byte-exact port of `_compile_fts_query` in fts.py: exact-phrase passthrough,
+/// the searchable-punctuation transform mirroring the mi_fts_insert trigger, and
+/// mode-dependent OR-join / wildcard branching.
+#[pyfunction]
+fn compile_fts_query(query: &str, mode: &str) -> (String, bool) {
+    m3_fts::compile_fts_query(query, mode)
+}
+
 /// Typed dispatcher configuration. Construction precedence is
 /// kwarg > `M3_*` env var > crate default (plan §9.7). The `Dispatcher` itself
 /// is async/generic and not bound — this class demonstrates the §9.6 config
@@ -971,6 +1004,52 @@ fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("M3_HASH_PROVIDER", config::hash_provider())?;
     Ok(d.into())
 }
+
+/// Zero-allocation, high-frequency structured log formatter.
+/// Parity with Python StructuredLogger.format().
+#[pyfunction]
+#[pyo3(signature = (event, *args, **kwargs))]
+fn format_log(
+    event: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<String> {
+    let mut out = String::with_capacity(128 + args.len() * 16 + kwargs.map_or(0, |d| d.len()) * 24);
+    out.push_str(event);
+
+    for arg in args.iter() {
+        // Parity with Python `if a is None or a == "": continue`. Note this is
+        // the OBJECT equalling "" (an empty str arg), NOT its stringification
+        // being empty — an object whose __str__ returns "" is still appended
+        // (as ""), exactly as Python's `parts.append(str(a))` would.
+        if arg.is_none() || arg.eq(PyString::new(arg.py(), ""))? {
+            continue;
+        }
+        let py_str = arg.str()?;
+        let s = py_str.to_str()?;
+        out.push_str(" | ");
+        out.push_str(s);
+    }
+
+    if let Some(kwargs) = kwargs {
+        for (k, v) in kwargs.iter() {
+            if v.is_none() {
+                continue;
+            }
+            let k_str = k.str()?;
+            let key = k_str.to_str()?;
+            let v_str = v.str()?;
+            let val = v_str.to_str()?;
+            out.push_str(" | ");
+            out.push_str(key);
+            out.push_str("=");
+            out.push_str(val);
+        }
+    }
+
+    Ok(out)
+}
+
 
 // ---------------------------------------------------------------------------
 // m3-embed-llamacpp — embedded (in-process) llama.cpp backend
@@ -1116,6 +1195,7 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(sha256_hex_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(hash_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(format_log, m)?)?;
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch_packed, m)?)?;
@@ -1141,6 +1221,8 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ep_priority, m)?)?;
     m.add_function(wrap_pyfunction!(decode_spans, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(sanitize_fts, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_fts_query, m)?)?;
     m.add_function(wrap_pyfunction!(env_config_summary, m)?)?;
     m.add_function(wrap_pyfunction!(embed_backend_label, m)?)?;
 

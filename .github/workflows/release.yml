@@ -1,0 +1,180 @@
+# Release workflow — build the m3-core-rs backend wheel matrix and publish.
+#
+# m3-core-rs ships one Rust source but is published as several differently
+# named PyPI packages, one per (OS, backend) pair, all installing the same
+# `m3_core_rs` import module. The m3 setup wizard detects (os, backend) and
+# installs the matching package. See crates/m3-core-py/build_wheel.py — the
+# single source of truth for the (os, backend) -> package-name + features
+# mapping; this workflow calls it so the two can never drift.
+#
+#   windows: cpu, cuda, vulkan      linux: cpu, cuda, vulkan      macos: metal
+#
+# GitHub-hosted runners have no GPU, but that's fine: we BUILD the backends
+# (nvcc compiles CUDA kernels; glslc compiles Vulkan shaders) — we never run
+# them in CI. Building needs the toolkits, not a device.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — no API tokens stored. Each
+# of the 7 PyPI projects must have this repo + workflow registered as a
+# trusted publisher first (https://docs.pypi.org/trusted-publishers/). Until
+# that's set up, run with workflow_dispatch + publish=false to only build and
+# upload wheels as workflow artifacts.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"            # e.g. v2026.05.30
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (requires trusted publishers configured)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os_tok }}-${{ matrix.backend }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Windows ──────────────────────────────────────────────────────
+          - { runner: windows-latest, os_tok: windows, backend: cpu }
+          - { runner: windows-latest, os_tok: windows, backend: cuda }
+          - { runner: windows-latest, os_tok: windows, backend: vulkan }
+          # ── Linux (manylinux via maturin container handled per-step) ──────
+          - { runner: ubuntu-latest, os_tok: linux, backend: cpu }
+          - { runner: ubuntu-latest, os_tok: linux, backend: cuda }
+          - { runner: ubuntu-latest, os_tok: linux, backend: vulkan }
+          # ── macOS Apple Silicon (Metal) ──────────────────────────────────
+          - { runner: macos-14, os_tok: macos, backend: metal }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os_tok }}-${{ matrix.backend }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install maturin
+        run: pip install "maturin>=1.7,<2.0"
+
+      # ── Backend toolchains ───────────────────────────────────────────────
+      - name: Install CUDA toolkit (cuda backend)
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "13.2.0"
+          # build-only: we need nvcc + cublas headers/libs, not a driver.
+          method: network
+
+      - name: Install Vulkan SDK (vulkan backend)
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.341.0
+          cache: true
+
+      # llama.cpp's GPU builds use the Ninja generator + a C/C++ compiler and
+      # bindgen (libclang). On Windows the VS generator hits a CMake-4.x +
+      # MSBuild ExternalProject batch-label bug ("VCEnd") building
+      # vulkan-shaders-gen — Ninja avoids it. Force Ninja on every GPU build.
+      - name: Set up Ninja + LLVM (GPU builds)
+        if: matrix.backend != 'cpu'
+        uses: aminya/setup-cpp@v1
+        with:
+          ninja: true
+          llvm: true
+
+      - name: Force Ninja generator (GPU builds)
+        if: matrix.backend != 'cpu'
+        shell: bash
+        run: echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+
+      # Linux GPU builds additionally need the Vulkan loader headers / OpenMP
+      # bits that the SDK action doesn't place system-wide.
+      - name: Linux build deps
+        if: matrix.os_tok == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
+
+      # ── Build the backend wheel via the canonical script ─────────────────
+      - name: Build wheel
+        shell: bash
+        run: |
+          python crates/m3-core-py/build_wheel.py \
+            --backend "${{ matrix.backend }}" \
+            --os "${{ matrix.os_tok }}" \
+            --out "dist"
+
+      - name: Smoke-test the wheel (CPU only — runners have no GPU device)
+        if: matrix.backend == 'cpu'
+        shell: bash
+        run: |
+          pip install dist/*.whl
+          python -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK:', m.embed_backend_label())"
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os_tok }}-${{ matrix.backend }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # One publish job per distinct PyPI project. Trusted Publishing maps a
+  # GitHub (repo, workflow, environment) to a single PyPI project, so each
+  # package publishes from its own environment. They all pull from the same
+  # build artifacts.
+  publish:
+    name: publish ${{ matrix.os_tok }}-${{ matrix.backend }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { os_tok: windows, backend: cpu }
+          - { os_tok: windows, backend: cuda }
+          - { os_tok: windows, backend: vulkan }
+          - { os_tok: linux, backend: cpu }
+          - { os_tok: linux, backend: cuda }
+          - { os_tok: linux, backend: vulkan }
+          - { os_tok: macos, backend: metal }
+    environment:
+      name: pypi-${{ matrix.os_tok }}-${{ matrix.backend }}
+      url: https://pypi.org/p/m3-core-rs-${{ matrix.os_tok }}-${{ matrix.backend }}
+    permissions:
+      id-token: write     # OIDC token for PyPI Trusted Publishing
+    steps:
+      - name: Download this package's wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.os_tok }}-${{ matrix.backend }}
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # No password/token: Trusted Publishing via the id-token above.
+          # Set skip-existing so a re-run of an already-published version is
+          # a no-op rather than a hard failure.
+          skip-existing: true

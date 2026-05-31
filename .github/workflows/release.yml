@@ -170,6 +170,11 @@ jobs:
       # off-CI on a device — see WHEEL_BUILD_GUIDE.md). The CPU wheel is the
       # plain vector-ops build (no llama.cpp / no EmbeddedEmbedder by design),
       # so the smoke test must NOT assert EmbeddedEmbedder.
+      # Run each per-version wheel on its matching interpreter. setup-python
+      # exposes the non-default versions differently per OS: on Linux/macOS as
+      # `pythonX.Y` on PATH, but on Windows there is no `python3.11.exe` — the
+      # `py -X.Y` launcher is the reliable per-version selector. Pick the right
+      # invocation by RUNNER_OS so the loop works on every runner.
       - name: Smoke-test CPU wheels
         if: matrix.backend == 'cpu'
         shell: bash
@@ -179,8 +184,13 @@ jobs:
             if [ -z "$whl" ]; then
               echo "::error::no wheel matching cp${v/./} in dist/"; exit 1
             fi
-            "python$v" -m pip install --force-reinstall "$whl"
-            "python$v" -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              py="py -$v"
+            else
+              py="python$v"
+            fi
+            $py -m pip install --force-reinstall "$whl"
+            $py -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
           done
 
       - name: Upload wheel artifact

@@ -129,6 +129,11 @@ jobs:
       # option for target ...-msvc"), so the llama.cpp build fails. Point
       # cc-rs at `clang-cl` — LLVM's MSVC-compatible driver that accepts the
       # MSVC flag spellings — for Windows GPU builds only.
+      # Also force /EHsc: clang-cl defaults to exceptions DISABLED, but
+      # llama.cpp's common/jinja/value.h uses `throw`, which fails with
+      # "cannot use 'throw' with exceptions disabled". MSVC's cl.exe enables
+      # the EH model by default; clang-cl does not, so we add it explicitly to
+      # both the cc-rs compile (CXXFLAGS/CFLAGS) and llama.cpp's CMake build.
       - name: Use clang-cl on Windows GPU builds
         if: runner.os == 'Windows' && matrix.backend != 'cpu'
         shell: bash
@@ -138,6 +143,24 @@ jobs:
             echo "CXX=clang-cl"
             echo "CMAKE_C_COMPILER=clang-cl"
             echo "CMAKE_CXX_COMPILER=clang-cl"
+            echo "CFLAGS=/EHsc"
+            echo "CXXFLAGS=/EHsc"
+            echo "CMAKE_C_FLAGS=/EHsc"
+            echo "CMAKE_CXX_FLAGS=/EHsc"
+          } >> "$GITHUB_ENV"
+
+      # Linux CUDA: nvcc-compiled .cu.o objects default to non-PIC, but they
+      # link into a cdylib (the PyO3 extension), so rust-lld fails with
+      # "relocation R_X86_64_PC32 cannot be used against symbol 'stderr';
+      # recompile with -fPIC". Tell nvcc to pass -fPIC to the host compiler and
+      # turn on position-independent code for llama.cpp's CMake build.
+      - name: Force PIC for Linux CUDA build
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        shell: bash
+        run: |
+          {
+            echo "CMAKE_CUDA_FLAGS=-Xcompiler -fPIC"
+            echo "CMAKE_POSITION_INDEPENDENT_CODE=ON"
           } >> "$GITHUB_ENV"
 
       # Linux GPU builds additionally need the Vulkan loader headers / OpenMP

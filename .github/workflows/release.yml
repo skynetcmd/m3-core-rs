@@ -56,10 +56,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      # Install ALL supported CPython versions so one build job emits a wheel
+      # per (Python, this-job's-backend). m3-memory declares
+      # requires-python >= 3.11, so we cover 3.11–3.14; pip then auto-selects
+      # the matching wheel by the cpXY tag. Without the full set, only the
+      # last interpreter's wheel ships and 3.11–3.13 users fall back to a
+      # slow source build.
+      - name: Set up Python (3.11–3.14)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: |
+            3.11
+            3.12
+            3.13
+            3.14
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -117,20 +127,33 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
 
       # ── Build the backend wheel via the canonical script ─────────────────
-      - name: Build wheel
+      # One wheel per (CPython 3.11–3.14, this job's backend). build_wheel.py
+      # rewrites [project].name to m3-core-rs-<os>-<backend> and forwards the
+      # interpreter list to maturin (everything after the literal `--`).
+      # setup-python puts every requested version on PATH as pythonX.Y.
+      - name: Build wheels (all Python versions)
         shell: bash
         run: |
           python crates/m3-core-py/build_wheel.py \
             --backend "${{ matrix.backend }}" \
             --os "${{ matrix.os_tok }}" \
-            --out "dist"
+            --out "dist" \
+            -- --interpreter python3.11 python3.12 python3.13 python3.14
 
-      - name: Smoke-test the wheel (CPU only — runners have no GPU device)
+      # Import-smoke each CPU wheel on its own interpreter (runners have no GPU,
+      # so only CPU wheels are runtime-tested; GPU wheels are import-verified
+      # off-CI on a device — see WHEEL_BUILD_GUIDE.md). The CPU wheel is the
+      # plain vector-ops build (no llama.cpp / no EmbeddedEmbedder by design),
+      # so the smoke test must NOT assert EmbeddedEmbedder.
+      - name: Smoke-test CPU wheels
         if: matrix.backend == 'cpu'
         shell: bash
         run: |
-          pip install dist/*.whl
-          python -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK:', m.embed_backend_label())"
+          for v in 3.11 3.12 3.13 3.14; do
+            whl=$(ls dist/*-cp${v/./}-*.whl)
+            "python$v" -m pip install --force-reinstall "$whl"
+            "python$v" -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
+          done
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

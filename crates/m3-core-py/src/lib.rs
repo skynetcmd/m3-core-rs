@@ -900,14 +900,15 @@ fn format_log(
     out.push_str(event);
 
     for arg in args.iter() {
-        if arg.is_none() {
+        // Parity with Python `if a is None or a == "": continue`. Note this is
+        // the OBJECT equalling "" (an empty str arg), NOT its stringification
+        // being empty — an object whose __str__ returns "" is still appended
+        // (as ""), exactly as Python's `parts.append(str(a))` would.
+        if arg.is_none() || arg.eq(PyString::new(arg.py(), ""))? {
             continue;
         }
         let py_str = arg.str()?;
         let s = py_str.to_str()?;
-        if s.is_empty() {
-            continue;
-        }
         out.push_str(" | ");
         out.push_str(s);
     }

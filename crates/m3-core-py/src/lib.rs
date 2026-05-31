@@ -12,6 +12,7 @@ use pyo3::types::{PyDict, PyTuple, PyString};
 pub use m3_dispatcher;
 pub use m3_embed_llamacpp;
 pub use m3_error;
+pub use m3_fts;
 pub use m3_graph;
 pub use m3_hash;
 pub use m3_ner_ort;
@@ -888,6 +889,28 @@ fn estimate_tokens(text: &str) -> usize {
     m3_dispatcher::estimate_tokens(text)
 }
 
+// ---------------------------------------------------------------------------
+// m3-fts — FTS5 query sanitization / lexical tokenization
+// ---------------------------------------------------------------------------
+
+/// Strip FTS5 operators (OR/AND/NOT/NEAR + bracket/wildcard punctuation) from
+/// user input and trim. Byte-exact port of `_sanitize_fts` in fts.py.
+/// `max_len` counts code points (matches Python `len()` on `str`).
+#[pyfunction]
+#[pyo3(signature = (query, max_len = 500))]
+fn sanitize_fts(query: &str, max_len: usize) -> String {
+    m3_fts::sanitize_fts(query, max_len)
+}
+
+/// Compile a raw user query into an FTS5 MATCH string, returning `(query, ok)`.
+/// Byte-exact port of `_compile_fts_query` in fts.py: exact-phrase passthrough,
+/// the searchable-punctuation transform mirroring the mi_fts_insert trigger, and
+/// mode-dependent OR-join / wildcard branching.
+#[pyfunction]
+fn compile_fts_query(query: &str, mode: &str) -> (String, bool) {
+    m3_fts::compile_fts_query(query, mode)
+}
+
 /// Typed dispatcher configuration. Construction precedence is
 /// kwarg > `M3_*` env var > crate default (plan §9.7). The `Dispatcher` itself
 /// is async/generic and not bound — this class demonstrates the §9.6 config
@@ -1197,6 +1220,8 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ep_priority, m)?)?;
     m.add_function(wrap_pyfunction!(decode_spans, m)?)?;
     m.add_function(wrap_pyfunction!(estimate_tokens, m)?)?;
+    m.add_function(wrap_pyfunction!(sanitize_fts, m)?)?;
+    m.add_function(wrap_pyfunction!(compile_fts_query, m)?)?;
     m.add_function(wrap_pyfunction!(env_config_summary, m)?)?;
     m.add_function(wrap_pyfunction!(embed_backend_label, m)?)?;
 

@@ -12,6 +12,7 @@ members = [
     "crates/m3-rank",
     "crates/m3-route",
     "crates/m3-graph",
+    "crates/m3-fts",
     "crates/m3-core-py",
 ]
 
@@ -33,6 +34,7 @@ m3-redact = { path = "crates/m3-redact" }
 m3-rank = { path = "crates/m3-rank" }
 m3-route = { path = "crates/m3-route" }
 m3-graph = { path = "crates/m3-graph" }
+m3-fts = { path = "crates/m3-fts" }
 
 [profile.release]
 lto = "thin"

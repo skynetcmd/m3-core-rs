@@ -14,3 +14,11 @@ crates/*/dist/
 # Wheels — built locally, redistributed via CI/release process, not via git.
 *.whl
 
+# Compiled PyO3 extension — platform/Python-specific build artifact dropped by
+# `maturin develop` into the source package dir. Like wheels, it is produced
+# from source by CI/release, never tracked (would drift from the .rs source and
+# is wrong for every other platform/ABI).
+crates/m3-core-py/python/m3_core_rs/*.pyd
+crates/m3-core-py/python/m3_core_rs/*.so
+crates/m3-core-py/python/m3_core_rs/*.dylib
+

@@ -91,7 +91,9 @@ jobs:
       # ── Backend toolchains ───────────────────────────────────────────────
       - name: Install CUDA toolkit (cuda backend)
         if: matrix.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.19
+        # CUDA 13.2.0 links were only added in the action's v0.2.32; v0.2.19
+        # didn't know the version and failed with "Version not available".
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: "13.2.0"
           # build-only: we need nvcc + cublas headers/libs, not a driver.
@@ -120,6 +122,24 @@ jobs:
         shell: bash
         run: echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
 
+      # On Windows, cc-rs targets the MSVC ABI (x86_64-pc-windows-msvc) and
+      # emits MSVC-style flags (/std:c++17, and it should NOT pass -fPIC). But
+      # setup-cpp's `llvm: true` sets CC/CXX to plain `clang++` (GNU driver),
+      # which rejects /std:c++17 ("no such file") and -fPIC ("unsupported
+      # option for target ...-msvc"), so the llama.cpp build fails. Point
+      # cc-rs at `clang-cl` — LLVM's MSVC-compatible driver that accepts the
+      # MSVC flag spellings — for Windows GPU builds only.
+      - name: Use clang-cl on Windows GPU builds
+        if: runner.os == 'Windows' && matrix.backend != 'cpu'
+        shell: bash
+        run: |
+          {
+            echo "CC=clang-cl"
+            echo "CXX=clang-cl"
+            echo "CMAKE_C_COMPILER=clang-cl"
+            echo "CMAKE_CXX_COMPILER=clang-cl"
+          } >> "$GITHUB_ENV"
+
       # Linux GPU builds additionally need the Vulkan loader headers / OpenMP
       # bits that the SDK action doesn't place system-wide.
       - name: Linux build deps
@@ -131,13 +151,18 @@ jobs:
       # rewrites [project].name to m3-core-rs-<os>-<backend> and forwards the
       # interpreter list to maturin (everything after the literal `--`).
       # setup-python puts every requested version on PATH as pythonX.Y.
+      #
+      # NOTE: build_wheel.py runs maturin with cwd=crates/m3-core-py, so a
+      # relative --out would land under the crate dir. Pass an ABSOLUTE path
+      # ($GITHUB_WORKSPACE/dist) so wheels land in the repo-root dist/ that the
+      # smoke-test, upload, and publish steps all read.
       - name: Build wheels (all Python versions)
         shell: bash
         run: |
           python crates/m3-core-py/build_wheel.py \
             --backend "${{ matrix.backend }}" \
             --os "${{ matrix.os_tok }}" \
-            --out "dist" \
+            --out "$GITHUB_WORKSPACE/dist" \
             -- --interpreter python3.11 python3.12 python3.13 python3.14
 
       # Import-smoke each CPU wheel on its own interpreter (runners have no GPU,
@@ -150,7 +175,10 @@ jobs:
         shell: bash
         run: |
           for v in 3.11 3.12 3.13 3.14; do
-            whl=$(ls dist/*-cp${v/./}-*.whl)
+            whl=$(ls "$GITHUB_WORKSPACE"/dist/*-cp${v/./}-*.whl)
+            if [ -z "$whl" ]; then
+              echo "::error::no wheel matching cp${v/./} in dist/"; exit 1
+            fi
             "python$v" -m pip install --force-reinstall "$whl"
             "python$v" -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
           done

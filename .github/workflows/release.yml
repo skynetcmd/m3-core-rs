@@ -99,12 +99,26 @@ jobs:
           # build-only: we need nvcc + cublas headers/libs, not a driver.
           method: network
 
-      - name: Install Vulkan SDK (vulkan backend)
-        if: matrix.backend == 'vulkan'
+      # Linux: the prebuilt-SDK action works and linux-vulkan is green — keep it.
+      - name: Install Vulkan SDK (Linux vulkan backend)
+        if: matrix.backend == 'vulkan' && runner.os == 'Linux'
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.4.341.0
           cache: true
+
+      # Windows: the prebuilt-SDK action's layout left CMake's find_package(Vulkan)
+      # unable to locate Vulkan_LIBRARY/Vulkan_INCLUDE_DIR. Use setup-vulkan-sdk
+      # (the maintainer's recommended action for compile/link), which builds
+      # Vulkan-Headers + Vulkan-Loader from Khronos source and sets VULKAN_SDK so
+      # find_package(Vulkan) resolves — exactly what ggml-vulkan needs.
+      - name: Set up Vulkan SDK (Windows vulkan backend)
+        if: matrix.backend == 'vulkan' && runner.os == 'Windows'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.341.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
 
       # llama.cpp's GPU builds use the Ninja generator + a C/C++ compiler and
       # bindgen (libclang). On Windows the VS generator hits a CMake-4.x +

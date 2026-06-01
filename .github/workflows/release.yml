@@ -151,6 +151,21 @@ jobs:
         if: runner.os == 'Windows' && matrix.backend != 'cpu'
         uses: ilammy/msvc-dev-cmd@v1
 
+      # The build step runs under Git-Bash (shell: bash), whose usr\bin holds a
+      # Unix `link` that shadows MSVC's link.exe. rustc then links with
+      # "C:\Program Files\Git\usr\bin\link.exe" and fails on the first build
+      # script ("extra operand ...rcgu.o"). msvc-dev-cmd put the real link.exe
+      # on PATH, but Git's usr\bin precedes it. Drop ONLY \Git\usr\bin from PATH
+      # so MSVC's link.exe wins; \Git\bin (bash/git core) is kept intact.
+      - name: Remove Git usr\bin from PATH (Windows GPU builds)
+        if: runner.os == 'Windows' && matrix.backend != 'cpu'
+        shell: pwsh
+        run: |
+          $kept = ($env:PATH -split ';') | Where-Object {
+            $_ -and ($_ -notmatch [regex]::Escape('\Git\usr\bin'))
+          }
+          "PATH=$($kept -join ';')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       # Linux CUDA: nvcc-compiled .cu.o objects default to non-PIC, but they
       # link into a cdylib (the PyO3 extension), so rust-lld fails with
       # "relocation R_X86_64_PC32 cannot be used against symbol 'stderr';

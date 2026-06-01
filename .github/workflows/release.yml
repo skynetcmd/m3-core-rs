@@ -122,39 +122,34 @@ jobs:
         shell: bash
         run: echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
 
-      # On Windows, cc-rs targets the MSVC ABI (x86_64-pc-windows-msvc) and
-      # emits MSVC-style flags (/std:c++17, and it should NOT pass -fPIC). But
-      # setup-cpp's `llvm: true` sets CC/CXX to plain `clang++` (GNU driver),
-      # which rejects /std:c++17 ("no such file") and -fPIC ("unsupported
-      # option for target ...-msvc"), so the llama.cpp build fails. Point
-      # cc-rs at `clang-cl` — LLVM's MSVC-compatible driver that accepts the
-      # MSVC flag spellings — for Windows GPU builds only.
-      # Also force /EHsc: clang-cl defaults to exceptions DISABLED, but
-      # llama.cpp's common/jinja/value.h uses `throw`, which fails with
-      # "cannot use 'throw' with exceptions disabled". MSVC's cl.exe enables
-      # the EH model by default; clang-cl does not, so we add it explicitly to
-      # both the cc-rs compile (CXXFLAGS/CFLAGS) and llama.cpp's CMake build.
+      # Windows GPU builds use MSVC cl.exe — the proven path (see PUBLISHING.md:
+      # "CMAKE_GENERATOR=Ninja inside a vcvars64 environment"). The VCEnd
+      # ExternalProject bug is dodged by the Ninja GENERATOR (above), NOT by
+      # changing the compiler. An earlier clang-cl detour caused a cascade of
+      # flag-mismatch / Git-Bash path-mangling failures (/EHsc -> "C:/Program
+      # Files/Git/EHsc"), so we use cl.exe, which cc-rs/CMake pick by default
+      # on an MSVC target and which enables C++ exceptions by default.
       #
-      # MSYS2_ARG_CONV_EXCL is critical: under the Git-Bash used by `shell:
-      # bash`, MSYS rewrites any argument that looks like a POSIX path, so a
-      # bare `/EHsc` becomes `C:/Program Files/Git/EHsc` by the time cc-rs
-      # spawns clang-cl — breaking the compile. Excluding the `/EH*` and `/std`
-      # prefixes from path conversion keeps the MSVC-style flags intact.
-      - name: Use clang-cl on Windows GPU builds
+      # setup-cpp's `llvm: true` (needed for libclang.dll → bindgen) also points
+      # CC/CXX at clang. Clear those so cc-rs falls back to cl.exe, but keep
+      # LIBCLANG_PATH so bindgen still finds libclang.
+      - name: Use MSVC cl.exe on Windows GPU builds
         if: runner.os == 'Windows' && matrix.backend != 'cpu'
         shell: bash
         run: |
           {
-            echo "CC=clang-cl"
-            echo "CXX=clang-cl"
-            echo "CMAKE_C_COMPILER=clang-cl"
-            echo "CMAKE_CXX_COMPILER=clang-cl"
-            echo "CFLAGS=/EHsc"
-            echo "CXXFLAGS=/EHsc"
-            echo "CMAKE_C_FLAGS=/EHsc"
-            echo "CMAKE_CXX_FLAGS=/EHsc"
-            echo "MSYS2_ARG_CONV_EXCL=/EH;/std;/Fo"
+            echo "CC=cl"
+            echo "CXX=cl"
+            echo "CMAKE_C_COMPILER=cl"
+            echo "CMAKE_CXX_COMPILER=cl"
           } >> "$GITHUB_ENV"
+
+      # Activate the MSVC toolchain (vcvars64): puts cl.exe + the Windows SDK on
+      # PATH for the Ninja build. Locally this is the "Developer Command Prompt";
+      # on the runner ilammy/msvc-dev-cmd is the equivalent.
+      - name: Set up MSVC dev environment (Windows GPU builds)
+        if: runner.os == 'Windows' && matrix.backend != 'cpu'
+        uses: ilammy/msvc-dev-cmd@v1
 
       # Linux CUDA: nvcc-compiled .cu.o objects default to non-PIC, but they
       # link into a cdylib (the PyO3 extension), so rust-lld fails with

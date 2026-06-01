@@ -151,20 +151,22 @@ jobs:
         if: runner.os == 'Windows' && matrix.backend != 'cpu'
         uses: ilammy/msvc-dev-cmd@v1
 
-      # The build step runs under Git-Bash (shell: bash), whose usr\bin holds a
-      # Unix `link` that shadows MSVC's link.exe. rustc then links with
-      # "C:\Program Files\Git\usr\bin\link.exe" and fails on the first build
-      # script ("extra operand ...rcgu.o"). msvc-dev-cmd put the real link.exe
-      # on PATH, but Git's usr\bin precedes it. Drop ONLY \Git\usr\bin from PATH
-      # so MSVC's link.exe wins; \Git\bin (bash/git core) is kept intact.
-      - name: Remove Git usr\bin from PATH (Windows GPU builds)
+      # The build step runs under Git-Bash (shell: bash), which re-adds its
+      # /usr/bin to PATH on every shell start — and /usr/bin holds a Unix `link`
+      # that shadows MSVC's link.exe. Stripping PATH in a prior step is futile
+      # (bash puts it back), so rustc links with Git's link.exe and dies on the
+      # first build script ("/usr/bin/link: extra operand ...rcgu.o"). Instead,
+      # pin cargo's MSVC linker to the ABSOLUTE path of the real link.exe — an
+      # absolute linker path bypasses PATH resolution entirely. Resolve it here
+      # in pwsh (where msvc-dev-cmd's PATH is correct) and export it.
+      - name: Pin MSVC linker for Rust (Windows GPU builds)
         if: runner.os == 'Windows' && matrix.backend != 'cpu'
         shell: pwsh
         run: |
-          $kept = ($env:PATH -split ';') | Where-Object {
-            $_ -and ($_ -notmatch [regex]::Escape('\Git\usr\bin'))
-          }
-          "PATH=$($kept -join ';')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $link = (Get-Command link.exe -All | Where-Object { $_.Source -notmatch '\\Git\\' } | Select-Object -First 1).Source
+          if (-not $link) { Write-Error "MSVC link.exe not found on PATH"; exit 1 }
+          Write-Host "Pinning MSVC linker: $link"
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$link" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # Linux CUDA: nvcc-compiled .cu.o objects default to non-PIC, but they
       # link into a cdylib (the PyO3 extension), so rust-lld fails with

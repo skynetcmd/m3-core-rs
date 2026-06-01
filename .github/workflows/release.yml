@@ -107,18 +107,42 @@ jobs:
           version: 1.4.341.0
           cache: true
 
-      # Windows: the prebuilt-SDK action's layout left CMake's find_package(Vulkan)
-      # unable to locate Vulkan_LIBRARY/Vulkan_INCLUDE_DIR. Use setup-vulkan-sdk
-      # (the maintainer's recommended action for compile/link), which builds
-      # Vulkan-Headers + Vulkan-Loader from Khronos source and sets VULKAN_SDK so
-      # find_package(Vulkan) resolves — exactly what ggml-vulkan needs.
-      - name: Set up Vulkan SDK (Windows vulkan backend)
+      # Windows: use the FULL prebuilt SDK (install-vulkan-sdk) — unlike
+      # setup-vulkan-sdk it ships glslc, which find_package(Vulkan) requires for
+      # llama.cpp's vulkan-shaders-gen ("missing: glslc"). Its layout previously
+      # defeated find_package(Vulkan); the next step pins the discovery hints.
+      - name: Install Vulkan SDK (Windows vulkan backend)
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        uses: humbletim/install-vulkan-sdk@v1.2
         with:
-          vulkan-query-version: 1.4.341.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader
-          vulkan-use-cache: true
+          version: 1.4.341.0
+          cache: true
+
+      # Pin Vulkan discovery hints from the installed SDK so find_package(Vulkan)
+      # resolves the loader lib, headers, AND glslc. Probe the real on-disk
+      # layout (the prebuilt SDK nests differently than CMake's defaults), print
+      # it for diagnostics, then export Vulkan_ROOT + the explicit cache vars and
+      # add the SDK bin dir (glslc.exe) to PATH.
+      - name: Pin Vulkan SDK discovery (Windows vulkan backend)
+        if: matrix.backend == 'vulkan' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $sdk = $env:VULKAN_SDK
+          Write-Host "VULKAN_SDK=$sdk"
+          Write-Host "=== SDK tree (depth 2) ==="
+          Get-ChildItem -Path $sdk -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+          $glslc = Get-ChildItem -Path $sdk -Recurse -Filter glslc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          $vklib = Get-ChildItem -Path $sdk -Recurse -Filter vulkan-1.lib -ErrorAction SilentlyContinue | Select-Object -First 1
+          $vkhdr = Get-ChildItem -Path $sdk -Recurse -Filter vulkan.h -ErrorAction SilentlyContinue | Select-Object -First 1
+          Write-Host "glslc=$($glslc.FullName)  vulkan-1.lib=$($vklib.FullName)  vulkan.h=$($vkhdr.FullName)"
+          $cmakeArgs = "-DVulkan_GLSLC_EXECUTABLE=$($glslc.FullName) -DVulkan_LIBRARY=$($vklib.FullName) -DVulkan_INCLUDE_DIR=$($vkhdr.Directory.Parent.FullName)"
+          @(
+            "Vulkan_ROOT=$sdk"
+            "CMAKE_PREFIX_PATH=$sdk"
+            "CMAKE_ARGS=$cmakeArgs"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$($glslc.Directory.FullName)" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
       # llama.cpp's GPU builds use the Ninja generator + a C/C++ compiler and
       # bindgen (libclang). On Windows the VS generator hits a CMake-4.x +

@@ -149,11 +149,14 @@ jobs:
           Write-Host "vulkan.h=$($vkhdr.FullName)"
           if (-not ($glslc -and $vklib -and $vkhdr)) { Write-Error "missing a Vulkan component"; exit 1 }
           $root = Join-Path $ws 'vulkan-merged'
-          New-Item -ItemType Directory -Force -Path "$root\Bin","$root\Lib","$root\Include\vulkan" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$root\Bin","$root\Lib","$root\Include" | Out-Null
           Copy-Item $glslc.FullName "$root\Bin\" -Force
           Copy-Item $vklib.FullName "$root\Lib\" -Force
-          # headers live in <inc>/vulkan/*.h — copy the whole vulkan/ dir
-          Copy-Item (Join-Path $vkhdr.Directory.FullName '*') "$root\Include\vulkan\" -Recurse -Force
+          # Copy the WHOLE include root, not just vulkan/ — vulkan_core.h pulls in
+          # sibling dirs like vk_video/ (vulkan_video_codec_*.h). $vkhdr is
+          # <inc>/vulkan/vulkan.h, so its parent's parent is the include root.
+          $incRoot = $vkhdr.Directory.Parent.FullName
+          Copy-Item (Join-Path $incRoot '*') "$root\Include\" -Recurse -Force
           Write-Host "=== merged SDK tree ==="
           Get-ChildItem $root -Recurse | Select-Object -ExpandProperty FullName
           @(

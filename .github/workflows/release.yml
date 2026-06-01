@@ -134,6 +134,12 @@ jobs:
       # "cannot use 'throw' with exceptions disabled". MSVC's cl.exe enables
       # the EH model by default; clang-cl does not, so we add it explicitly to
       # both the cc-rs compile (CXXFLAGS/CFLAGS) and llama.cpp's CMake build.
+      #
+      # MSYS2_ARG_CONV_EXCL is critical: under the Git-Bash used by `shell:
+      # bash`, MSYS rewrites any argument that looks like a POSIX path, so a
+      # bare `/EHsc` becomes `C:/Program Files/Git/EHsc` by the time cc-rs
+      # spawns clang-cl — breaking the compile. Excluding the `/EH*` and `/std`
+      # prefixes from path conversion keeps the MSVC-style flags intact.
       - name: Use clang-cl on Windows GPU builds
         if: runner.os == 'Windows' && matrix.backend != 'cpu'
         shell: bash
@@ -147,6 +153,7 @@ jobs:
             echo "CXXFLAGS=/EHsc"
             echo "CMAKE_C_FLAGS=/EHsc"
             echo "CMAKE_CXX_FLAGS=/EHsc"
+            echo "MSYS2_ARG_CONV_EXCL=/EH;/std;/Fo"
           } >> "$GITHUB_ENV"
 
       # Linux CUDA: nvcc-compiled .cu.o objects default to non-PIC, but they
@@ -179,14 +186,25 @@ jobs:
       # relative --out would land under the crate dir. Pass an ABSOLUTE path
       # ($GITHUB_WORKSPACE/dist) so wheels land in the repo-root dist/ that the
       # smoke-test, upload, and publish steps all read.
+      # CUDA wheels link against the NVIDIA driver's libcuda.so.1, which is
+      # NOT present on CI (no GPU) and must NOT be bundled — it's supplied by
+      # the user's installed driver at runtime. auditwheel's default repair
+      # therefore fails with "required library libcuda.so.1 could not be
+      # located". Skip auditwheel for CUDA so the wheel keeps its external
+      # CUDA dependency. (auditwheel only runs on Linux; the flag is a no-op
+      # elsewhere.) CPU/Vulkan/Metal wheels are still repaired normally.
       - name: Build wheels (all Python versions)
         shell: bash
         run: |
+          extra=""
+          if [ "${{ matrix.backend }}" = "cuda" ]; then
+            extra="--auditwheel skip"
+          fi
           python crates/m3-core-py/build_wheel.py \
             --backend "${{ matrix.backend }}" \
             --os "${{ matrix.os_tok }}" \
             --out "$GITHUB_WORKSPACE/dist" \
-            -- --interpreter python3.11 python3.12 python3.13 python3.14
+            -- --interpreter python3.11 python3.12 python3.13 python3.14 $extra
 
       # Import-smoke each CPU wheel on its own interpreter (runners have no GPU,
       # so only CPU wheels are runtime-tested; GPU wheels are import-verified

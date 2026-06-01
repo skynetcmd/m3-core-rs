@@ -260,11 +260,13 @@ jobs:
       # smoke-test, upload, and publish steps all read.
       # CUDA wheels link against the NVIDIA driver's libcuda.so.1, which is
       # NOT present on CI (no GPU) and must NOT be bundled — it's supplied by
-      # the user's installed driver at runtime. auditwheel's default repair
-      # therefore fails with "required library libcuda.so.1 could not be
-      # located". Skip auditwheel for CUDA so the wheel keeps its external
-      # CUDA dependency. (auditwheel only runs on Linux; the flag is a no-op
-      # elsewhere.) CPU/Vulkan/Metal wheels are still repaired normally.
+      # the user's installed driver at runtime. auditwheel's DEFAULT repair
+      # fails ("required library libcuda.so.1 could not be located"), so we
+      # skip it during the maturin build; the next step re-tags the Linux CUDA
+      # wheel to manylinux while EXCLUDING libcuda.so.1 (PyPI rejects the plain
+      # linux_x86_64 tag that --auditwheel skip leaves). On Windows there is no
+      # auditwheel, so skip is the correct final state there.
+      # CPU/Vulkan/Metal wheels are repaired by maturin normally.
       - name: Build wheels (all Python versions)
         shell: bash
         run: |
@@ -277,6 +279,23 @@ jobs:
             --os "${{ matrix.os_tok }}" \
             --out "$GITHUB_WORKSPACE/dist" \
             -- --interpreter python3.11 python3.12 python3.13 python3.14 $extra
+
+      # Linux CUDA only: maturin left the wheels tagged linux_x86_64 (auditwheel
+      # was skipped). PyPI rejects that tag. Re-tag to manylinux with auditwheel,
+      # excluding libcuda.so.1 (the driver stub — stays an external runtime dep;
+      # the .so links no other external CUDA libs, cuBLAS/cudart are static).
+      # The repaired wheel replaces the linux_x86_64 one in dist/.
+      - name: Repair Linux CUDA wheels to manylinux (exclude libcuda)
+        if: runner.os == 'Linux' && matrix.backend == 'cuda'
+        shell: bash
+        run: |
+          python -m pip install --upgrade auditwheel
+          for whl in "$GITHUB_WORKSPACE"/dist/*-linux_x86_64.whl; do
+            python -m auditwheel repair --exclude libcuda.so.1 \
+              -w "$GITHUB_WORKSPACE/dist" "$whl"
+            rm -f "$whl"   # drop the unacceptable linux_x86_64 wheel
+          done
+          ls -la "$GITHUB_WORKSPACE"/dist/*.whl
 
       # Import-smoke each CPU wheel on its own interpreter (runners have no GPU,
       # so only CPU wheels are runtime-tested; GPU wheels are import-verified

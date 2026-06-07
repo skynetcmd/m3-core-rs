@@ -64,43 +64,43 @@ Notes that bite if forgotten:
   (cargo/uv under `~`), they are only on `PATH` in a **login** shell — run
   remote builds with `ssh <host> 'bash -lc "..."'`, not a bare `ssh <host> cmd`.
 
-### Per-platform build commands
+### Per-platform build command
 
-Each platform has a thin wrapper script that resolves the four interpreters and
-calls `build_wheel.py` once per backend. All wrappers funnel through the same
-`build_wheel.py` single-source-of-truth mapping.
+One cross-platform driver, `crates/m3-core-py/build_local.py`, handles all
+three OSes. It detects the host OS, resolves the four CPython interpreters via
+`uv` (preferring clean uv-managed installs and refusing project virtualenvs),
+applies the per-OS build rules, then calls `build_wheel.py` once per backend
+and smoke-tests each result. Run it from anywhere in the repo:
 
-**Windows** — `build_windows_wheels.sh <cpu|vulkan|cuda>`:
 ```bash
-# resolves the four uv-managed CPython 3.11–3.14, runs one maturin build per backend.
-bash build_windows_wheels.sh cpu
-bash build_windows_wheels.sh vulkan   # needs Vulkan SDK
-bash build_windows_wheels.sh cuda     # needs CUDA toolkit + nvcc (run inside vcvars64)
-# → ci-wheels/local-<ver>/windows-<backend>/*.whl  (tag: win_amd64)
+# from crates/m3-core-py/  (use a LOGIN shell on Linux so uv/maturin are on PATH)
+python build_local.py cpu                  # one backend
+python build_local.py cpu vulkan cuda      # several
+python build_local.py all                  # every backend valid for this OS
+python build_local.py vulkan --no-smoke-test
+python build_local.py cpu --pythons 3.12 3.13   # subset of interpreters
 ```
 
-**Linux** — `build_linux_wheels.sh <cpu|vulkan|cuda>`:
-```bash
-# on the Linux build host (login shell so cargo/maturin/uv are on PATH):
-cd ~/m3-core-rs && ./build_linux_wheels.sh cpu
-cd ~/m3-core-rs && ./build_linux_wheels.sh vulkan
-```
-- **CPU uses `maturin --zig`** for a portable `manylinux2014` tag (no Docker).
-  One-time setup: `pipx inject maturin ziglang` **plus** a `zig` binary shim at
-  `~/.local/bin/zig` that execs `python -m ziglang "$@"` (maturin needs a `zig`
-  executable on PATH, not just the module).
-- **GPU backends build NATIVE (no `--zig`).** Under `--zig`, llama-cpp-sys's
-  cmake step can't find the system Vulkan/CUDA library in zig's isolated
-  sysroot (`Could NOT find Vulkan (missing: Vulkan_LIBRARY)`). The wrapper
-  applies `--zig` only for `cpu`; vulkan/cuda omit it and link the host's
-  libs (tags `manylinux_2_38` etc., matching the host glibc). Also
-  `rustup component add rustfmt` (llama-cpp-sys bindgen wants it).
+Output lands in `ci-wheels/local-<ver>/<os>-<backend>/*.whl` with a sibling
+`build-<os>-<backend>.log`. Tags: `win_amd64` (Windows), `macosx_11_0_arm64`
+(macOS), `manylinux*` (Linux).
 
-**macOS** — `build_wheel.py` directly (or the mac wrapper):
-```bash
-# from crates/m3-core-py/, on the Mac
-python build_wheel.py --backend metal -- --interpreter python3.11 python3.12 python3.13 python3.14
-# → m3_core_rs_macos_metal-<ver>-cpXY-cpXY-macosx_11_0_arm64.whl
+**Per-OS rules the driver encodes for you:**
+
+- **Linux CPU uses `maturin --zig`** for a portable `manylinux2014` tag (no
+  Docker). One-time host setup: `pipx inject maturin ziglang` **plus** a `zig`
+  binary shim at `~/.local/bin/zig` that execs `python -m ziglang "$@"`
+  (maturin needs a `zig` executable on PATH, not just the module).
+- **Linux GPU backends build NATIVE (no `--zig`).** Under `--zig`,
+  llama-cpp-sys's cmake step can't find the system Vulkan/CUDA library in zig's
+  isolated sysroot (`Could NOT find Vulkan (missing: Vulkan_LIBRARY)`).
+  `build_local.py` applies `--zig` only for Linux CPU; everything else links
+  the host libs natively (tags like `manylinux_2_38`, matching the host glibc).
+  Linux GPU builds also need `rustup component add rustfmt` (llama-cpp-sys
+  bindgen wants it).
+- **Windows GPU** needs `CMAKE_GENERATOR=Ninja` inside a `vcvars64` shell with
+  `glslc` on PATH (see the GPU-build note above); run `build_local.py cuda` /
+  `vulkan` from a Developer Command Prompt.
 ```
 
 ### Smoke test before upload

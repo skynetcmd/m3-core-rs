@@ -286,20 +286,38 @@ pub fn mmr_rerank(
     let mut remaining: Vec<usize> = (0..n).collect();
 
     while selected.len() < take {
-        let mut best_idx = 0usize;
-        let mut best_score = f32::NEG_INFINITY;
-        for (pos, &cand) in remaining.iter().enumerate() {
-            let max_div = selected
-                .iter()
-                .map(|&s| cosine_unchecked(candidates[cand], candidates[s]))
-                .fold(0.0f32, f32::max);
-            let score = lambda * query_sim[cand] - (1.0 - lambda) * max_div;
-            if score > best_score {
-                best_score = score;
-                best_idx = pos;
+        let best_pos = if remaining.len() < 128 {
+            let mut best_idx = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            for (pos, &cand) in remaining.iter().enumerate() {
+                let max_div = selected
+                    .iter()
+                    .map(|&s| cosine_unchecked(candidates[cand], candidates[s]))
+                    .fold(0.0f32, f32::max);
+                let score = lambda * query_sim[cand] - (1.0 - lambda) * max_div;
+                if score > best_score {
+                    best_score = score;
+                    best_idx = pos;
+                }
             }
-        }
-        selected.push(remaining.swap_remove(best_idx));
+            best_idx
+        } else {
+            remaining
+                .par_iter()
+                .enumerate()
+                .map(|(pos, &cand)| {
+                    let max_div = selected
+                        .iter()
+                        .map(|&s| cosine_unchecked(candidates[cand], candidates[s]))
+                        .fold(0.0f32, f32::max);
+                    let score = lambda * query_sim[cand] - (1.0 - lambda) * max_div;
+                    (pos, score)
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(pos, _)| pos)
+                .unwrap()
+        };
+        selected.push(remaining.swap_remove(best_pos));
     }
     Ok(selected)
 }
@@ -345,19 +363,37 @@ pub fn mmr_rerank_scored(
     }
 
     while selected.len() < take {
-        let mut best_pos = 0usize;
-        let mut best_score = f32::NEG_INFINITY;
-        for (pos, &cand) in remaining.iter().enumerate() {
-            let max_sim = selected
-                .iter()
-                .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
-                .fold(0.0f32, f32::max);
-            let score = lambda * relevance[cand] - (1.0 - lambda) * max_sim;
-            if score > best_score {
-                best_score = score;
-                best_pos = pos;
+        let best_pos = if remaining.len() < 128 {
+            let mut best_pos = 0usize;
+            let mut best_score = f32::NEG_INFINITY;
+            for (pos, &cand) in remaining.iter().enumerate() {
+                let max_sim = selected
+                    .iter()
+                    .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
+                    .fold(0.0f32, f32::max);
+                let score = lambda * relevance[cand] - (1.0 - lambda) * max_sim;
+                if score > best_score {
+                    best_score = score;
+                    best_pos = pos;
+                }
             }
-        }
+            best_pos
+        } else {
+            remaining
+                .par_iter()
+                .enumerate()
+                .map(|(pos, &cand)| {
+                    let max_sim = selected
+                        .iter()
+                        .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
+                        .fold(0.0f32, f32::max);
+                    let score = lambda * relevance[cand] - (1.0 - lambda) * max_sim;
+                    (pos, score)
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(pos, _)| pos)
+                .unwrap()
+        };
         selected.push(remaining.remove(best_pos));
     }
     Ok(selected)

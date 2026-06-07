@@ -14,12 +14,23 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// `\b(OR|AND|NOT|NEAR)\b|[*()\[\]{}]` — FTS5 operator words (whole-word) and
-/// the bracket/wildcard punctuation that would otherwise reach the FTS5 parser
-/// as syntax. Matched the same way as the Python `_FTS_OPERATORS` regex so a
-/// hostile query like `AND OR NOT *(foo)` is neutralized identically.
+/// `\b(OR|AND|NOT|NEAR)\b` — FTS5 operator WORDS (whole-word). Matched the same
+/// way as the Python `_FTS_OPERATORS` regex so `AND OR NOT` is neutralized
+/// identically. Punctuation is handled separately by `FTS_NON_TERM` below.
 static FTS_OPERATORS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b(OR|AND|NOT|NEAR)\b|[*()\[\]{}]").unwrap());
+    LazyLock::new(|| Regex::new(r"\b(OR|AND|NOT|NEAR)\b").unwrap());
+
+/// `[^\w\s]` — every character that is neither a word char nor whitespace. In a
+/// bare FTS5 MATCH term almost all punctuation is either a syntax error (`/ ! .
+/// , ; @ = < > ~ | # $ % & ( ) [ ] *`) or silently changes the parse (`-` →
+/// column-negation, `:` → column qualifier, `{`/`^`). This is an ALLOWLIST: a
+/// blocklist that enumerated "bad" chars repeatedly missed cases and shipped a
+/// content-dependent crash (`gpt-4o` → `no such column: 4o`). Replacing with a
+/// space (not deleting) matches the default tokenizer, which splits indexed
+/// content on these same characters — so `gpt-4o` → `gpt 4o` still hits the row.
+/// `\w` is Unicode-aware in both Rust `regex` and Python `re.UNICODE`, so
+/// `café` / `日本語` survive identically. Mirrors Python `_FTS_NON_TERM`.
+static FTS_NON_TERM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\w\s]").unwrap());
 
 /// The 8 punctuation characters the `mi_fts_insert` trigger replaces with a
 /// space (after lowercasing) before storing into `content_searchable` /
@@ -30,10 +41,10 @@ const SEARCHABLE_PUNCT: [char; 8] = ['?', '!', ':', '.', ',', ';', '/', '"'];
 // quote, handled separately below so the array stays a clean 8-element list.
 const SEARCHABLE_QUOTE: char = '\'';
 
-/// Strip FTS5 operators from user input to prevent query injection / parse
-/// errors. Mirrors `_sanitize_fts`: truncate to `max_len` chars first, replace
-/// every operator match with a single space, then trim leading/trailing
-/// whitespace.
+/// Neutralize FTS5 query syntax in user input to prevent injection / parse
+/// errors. Mirrors `_sanitize_fts`: truncate to `max_len` chars first, then two
+/// passes — operator WORDS to a space, then every non-word/non-space character
+/// to a space — and trim. The result is safe to drop into a bare FTS5 MATCH.
 ///
 /// `max_len` counts Unicode scalar values (Python `len()` on `str` counts code
 /// points), not bytes, so multibyte input truncates at the same boundary.
@@ -43,7 +54,8 @@ pub fn sanitize_fts(query: &str, max_len: usize) -> String {
     } else {
         query.to_string()
     };
-    FTS_OPERATORS.replace_all(&truncated, " ").trim().to_string()
+    let words_stripped = FTS_OPERATORS.replace_all(&truncated, " ");
+    FTS_NON_TERM.replace_all(&words_stripped, " ").trim().to_string()
 }
 
 /// Apply the same lowercase + depunctuate transform as the FTS triggers.
@@ -108,6 +120,10 @@ pub fn compile_fts_query(query: &str, mode: &str) -> (String, bool) {
         } else {
             chars[1..chars.len() - 1].iter().collect()
         };
+        // Escape interior double-quotes by doubling (FTS5's escape rule), or an
+        // input like `"alpha"beta"` re-wraps to an unterminated string and
+        // FTS5 MATCH raises. Mirrors fts.py `query[1:-1].replace('"', '""')`.
+        let inner = inner.replace('"', "\"\"");
         return (format!("\"{inner}\""), true);
     }
 
@@ -150,7 +166,46 @@ mod tests {
         assert_eq!(sanitize_fts("hello world", 500), "hello world");
         // Operators are whole-word: "ANDROID" must survive.
         assert_eq!(sanitize_fts("ANDROID phones", 500), "ANDROID phones");
-        assert_eq!(sanitize_fts("NEAR/3 quux", 500), "/3 quux");
+        // `/` is now stripped too (it raises "syntax error near /" in MATCH);
+        // NEAR removed, `/` -> space, collapse+trim leaves "3 quux".
+        assert_eq!(sanitize_fts("NEAR/3 quux", 500), "3 quux");
+    }
+
+    #[test]
+    fn sanitize_neutralizes_match_breaking_operator_chars() {
+        // Regression: these all crashed a bare FTS5 MATCH before the allowlist
+        // pass. `-` -> column-negation, `:` -> column qualifier, `/`!.;@ etc ->
+        // syntax error. Underscore is a word char and must survive.
+        assert_eq!(sanitize_fts("gpt-4o", 500), "gpt 4o");
+        assert_eq!(sanitize_fts("claude-code", 500), "claude code");
+        assert_eq!(sanitize_fts("model_id:claude", 500), "model_id claude");
+        assert_eq!(sanitize_fts("100-200MB", 500), "100 200MB");
+        assert_eq!(sanitize_fts("a.b:c;d/e?f", 500), "a b c d e f");
+        assert_eq!(sanitize_fts("-leading", 500), "leading");
+        // Unicode word chars survive (parity with Python re.UNICODE \w).
+        assert_eq!(sanitize_fts("café", 500), "café");
+        assert_eq!(sanitize_fts("日本語", 500), "日本語");
+    }
+
+    #[test]
+    fn sanitize_parity_with_python_reference() {
+        // Expected values captured from the live Python `_sanitize_fts` so the
+        // byte-exact-port contract (DESIGN §3/§11) is verified, not assumed.
+        let cases: &[(&str, &str)] = &[
+            ("gpt-4o", "gpt 4o"),
+            ("a.b:c;d/e?f", "a b c d e f"),
+            ("café", "café"),
+            ("日本語", "日本語"),
+            ("réseau électrique", "réseau électrique"),
+            ("emoji 🎉 test", "emoji   test"),
+            ("MCP-tool", "MCP tool"),
+            ("under_score", "under_score"),
+            ("AND OR NOT *(foo)", "foo"),
+            ("NEAR/3 quux", "3 quux"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(sanitize_fts(raw, 500), *expected, "input {raw:?}");
+        }
     }
 
     #[test]
@@ -175,6 +230,13 @@ mod tests {
         // treated as an exact phrase and `'"'[1:-1]` -> "" -> ('""', True).
         assert_eq!(compile_fts_query("\"", "fts5"), ("\"\"".into(), true));
         assert_eq!(compile_fts_query("'", "hybrid"), ("\"\"".into(), true));
+        // Interior quote is doubled (FTS5 escape) so the phrase stays a valid,
+        // terminated string instead of crashing MATCH. `"alpha"beta"` ->
+        // inner `alpha"beta` -> doubled `alpha""beta` -> `"alpha""beta"`.
+        assert_eq!(
+            compile_fts_query("\"alpha\"beta\"", "fts5"),
+            ("\"alpha\"\"beta\"".into(), true),
+        );
     }
 
     #[test]

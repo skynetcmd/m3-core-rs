@@ -159,9 +159,38 @@ def build_one(
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir.parent / f"build-{os_tok}-{backend}.log"
 
+    env = os.environ.copy()
     extra: list[str] = []
     if use_zig:
         extra.append("--zig")
+
+    # Linux CUDA needs several things the generic path doesn't (see PUBLISHING.md
+    # "Linux CUDA build recipe"):
+    #   * nvcc's .cu.o objects are non-PIC but link into a cdylib, so force PIC;
+    #   * `libcuda.so.1` is the driver stub that must NOT be bundled, so skip the
+    #     auditwheel repair that would try to vendor it;
+    #   * the CUDA runtime is statically linked, so the wheel is huge (~475 MB)
+    #     unless we (a) trim the GPU-arch fatbin and (b) strip symbols. We cap the
+    #     arch list to the GPUs we support; llama-cpp-sys forwards any CMAKE_* env
+    #     var to the llama.cpp cmake build, so CMAKE_CUDA_ARCHITECTURES reaches it.
+    #     CARGO_PROFILE_RELEASE_STRIP makes rustc strip the final cdylib.
+    if os_tok == "linux" and backend == "cuda":
+        env.setdefault("CMAKE_CUDA_FLAGS", "-Xcompiler -fPIC")
+        env.setdefault("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
+        # We ship a STATIC CUDA wheel: cuBLAS/cudart are linked into the .so so
+        # the wheel is self-contained and Just Works for users without a system
+        # CUDA runtime install. It is large (~470-580 MB) — too big for PyPI's
+        # 100 MiB limit, so Linux CUDA is distributed via GitHub Release assets
+        # (no size cap), not PyPI. (A dynamic-link build to shrink it was tried
+        # 2026-06-08 and rejected: it only got to 464 MB because LLAMA_BUILD_
+        # SHARED_LIBS doesn't flip cuBLAS off static, and it would burden users
+        # with a CUDA-runtime prerequisite. Static is the better tradeoff.)
+        # strip symbols is a free ~20-40% win with no downside.
+        env.setdefault("CARGO_PROFILE_RELEASE_STRIP", "symbols")
+        # libcuda.so.1 is the driver stub and must NOT be bundled; we vendor no
+        # CUDA libs, so skip the auditwheel repair entirely.
+        extra += ["--auditwheel", "skip"]
+
     extra += ["--interpreter", *interps]
 
     cmd = [
@@ -181,13 +210,17 @@ def build_one(
         log.write(f"=== {os_tok} {backend} build for m3-core-rs {version} ===\n")
         log.write(f"interpreters: {' '.join(interps)}\n")
         log.write(f"zig: {use_zig}\n")
+        if os_tok == "linux" and backend == "cuda":
+            log.write(f"CMAKE_CUDA_FLAGS: {env.get('CMAKE_CUDA_FLAGS')}\n")
+            log.write("link: STATIC cuBLAS/cudart (self-contained; GitHub Release, not PyPI)\n")
+            log.write(f"strip: {env.get('CARGO_PROFILE_RELEASE_STRIP')}\n")
+            log.write("auditwheel: skip\n")
         log.write(f"out: {out_dir}\n")
         log.write(f"start: {_utcnow()}\n")
         log.flush()
         print(f"[build_local] {os_tok}/{backend}: building ({len(interps)} interpreters, "
               f"zig={use_zig}) -> {out_dir}")
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT,
-                              env=os.environ.copy())
+        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
         log.write(f"end: {_utcnow()}\n")
         log.write(f"maturin exit: {proc.returncode}\n")
         wheels = sorted(out_dir.glob("*.whl"))
@@ -196,8 +229,10 @@ def build_one(
             log.write(f"{w.stat().st_size:>12,}  {w.name}\n")
 
     if proc.returncode == 0:
-        print(f"[build_local] {os_tok}/{backend}: OK - {len(wheels)} wheel(s). "
-              f"log: {log_path}")
+        sizes = [w.stat().st_size for w in wheels]
+        avg_mb = (sum(sizes) / len(sizes) / 1048576) if sizes else 0
+        print(f"[build_local] {os_tok}/{backend}: OK - {len(wheels)} wheel(s), "
+              f"~{avg_mb:.0f} MB each. log: {log_path}")
     else:
         print(f"[build_local] {os_tok}/{backend}: FAILED (exit {proc.returncode}). "
               f"see {log_path}", file=sys.stderr)

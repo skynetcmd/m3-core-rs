@@ -106,6 +106,53 @@ pub fn cosine_batch_packed(query: &[f32], blobs: &[&[u8]], dim: usize) -> Result
         .collect())
 }
 
+/// Max-pooled multi-anchor cosine over packed candidate blobs.
+///
+/// For each candidate blob, returns `max_j cosine(anchors[j], candidate)` — the
+/// "max-similarity" rerank signal: scoring a candidate by its closeness to the
+/// BEST-matching anchor (rather than to a single averaged/centroid anchor) preserves
+/// sharp topical matches that a centroid washes out. Pushes the whole
+/// N-candidates × M-anchors matrix op into Rust so the Python caller never assembles
+/// it (avoids a per-anchor FFI loop). Data-parallel over candidates (rayon); each
+/// candidate scans all anchors with the SIMD kernel.
+///
+/// `anchors` is a slice of M anchor vectors, each length `dim`. `blobs` are the
+/// candidate embeddings as raw little-endian f32 bytes (`dim * 4` each). A blob of
+/// the wrong byte length scores 0.0 (matches `cosine_batch_packed`'s ragged branch).
+/// An empty anchor list yields all -1.0 (no signal — caller treats as "unscored",
+/// mirroring the pure-Python `max(... for a in anchors)` over an empty set being
+/// guarded upstream). Errors if any anchor's length != dim.
+pub fn cosine_batch_maxpool_packed(
+    anchors: &[&[f32]],
+    blobs: &[&[u8]],
+    dim: usize,
+) -> Result<Vec<f32>> {
+    for a in anchors {
+        if a.len() != dim {
+            return Err(M3Error::VectorDimMismatch { expected: dim, got: a.len() });
+        }
+    }
+    let expected_bytes = dim * 4;
+    Ok(blobs
+        .par_iter()
+        .map(|b| {
+            if b.len() != expected_bytes {
+                return 0.0;
+            }
+            let v = match bytemuck::try_cast_slice::<u8, f32>(b) {
+                Ok(v) => v,
+                Err(_) => return 0.0,
+            };
+            // max cosine over all anchors; -1.0 when there are no anchors (cosine is
+            // in [-1, 1], so -1.0 is the correct identity for an empty max).
+            anchors
+                .iter()
+                .map(|a| cosine_unchecked(a, v))
+                .fold(-1.0_f32, f32::max)
+        })
+        .collect())
+}
+
 /// Vectorized per-row hybrid score combining cosine, BM25, length penalty,
 /// title-overlap, and importance — the body of the per-row Python loop in
 /// `memory_search_scored_impl`, fully data-parallel.
@@ -473,6 +520,64 @@ mod tests {
         let q: &[f32] = &[1.0, 0.0, 0.0];
         let blobs: Vec<&[u8]> = vec![];
         assert!(cosine_batch_packed(q, &blobs, 4).is_err());
+    }
+
+    #[test]
+    fn cosine_batch_maxpool_takes_best_anchor() {
+        // a0 aligns with v1, a1 aligns with v0 -> each candidate's score is the MAX,
+        // i.e. 1.0 for both, and the off-anchor cosine must NOT win.
+        let a0: &[f32] = &[0.0, 1.0, 0.0, 0.0];
+        let a1: &[f32] = &[1.0, 0.0, 0.0, 0.0];
+        let v0: &[f32] = &[1.0, 0.0, 0.0, 0.0];
+        let v1: &[f32] = &[0.0, 1.0, 0.0, 0.0];
+        let v2: &[f32] = &[0.5, 0.5, 0.0, 0.0]; // cos to a0 == cos to a1 == ~0.707
+        let anchors: Vec<&[f32]> = vec![a0, a1];
+        let b0 = f32_as_blob(v0).to_vec();
+        let b1 = f32_as_blob(v1).to_vec();
+        let b2 = f32_as_blob(v2).to_vec();
+        let blobs: Vec<&[u8]> = vec![&b0, &b1, &b2];
+        let got = cosine_batch_maxpool_packed(&anchors, &blobs, 4).unwrap();
+        // reference: max over anchors of cosine_unchecked
+        for (k, v) in [v0, v1, v2].iter().enumerate() {
+            let want = anchors
+                .iter()
+                .map(|a| cosine_unchecked(a, v))
+                .fold(-1.0_f32, f32::max);
+            assert!((got[k] - want).abs() < 1e-6, "row {k}: got={}, want={want}", got[k]);
+        }
+        assert!((got[0] - 1.0).abs() < 1e-6); // v0 best-matches a1
+        assert!((got[1] - 1.0).abs() < 1e-6); // v1 best-matches a0
+    }
+
+    #[test]
+    fn cosine_batch_maxpool_empty_anchors_is_neg_one() {
+        let v0: &[f32] = &[1.0, 0.0];
+        let b0 = f32_as_blob(v0).to_vec();
+        let anchors: Vec<&[f32]> = vec![];
+        let blobs: Vec<&[u8]> = vec![&b0];
+        let got = cosine_batch_maxpool_packed(&anchors, &blobs, 2).unwrap();
+        assert_eq!(got, vec![-1.0]); // no anchors -> no signal
+    }
+
+    #[test]
+    fn cosine_batch_maxpool_ragged_candidate_zero_fills() {
+        let a0: &[f32] = &[1.0, 0.0];
+        let v0: &[f32] = &[1.0, 0.0];
+        let anchors: Vec<&[f32]> = vec![a0];
+        let b_good = f32_as_blob(v0).to_vec();
+        let b_short: Vec<u8> = vec![0u8; 7]; // not multiple of 4*2
+        let blobs: Vec<&[u8]> = vec![&b_good, &b_short];
+        let got = cosine_batch_maxpool_packed(&anchors, &blobs, 2).unwrap();
+        assert!((got[0] - 1.0).abs() < 1e-6);
+        assert_eq!(got[1], 0.0); // bad candidate -> 0.0, same as cosine_batch_packed
+    }
+
+    #[test]
+    fn cosine_batch_maxpool_anchor_dim_mismatch_errors() {
+        let a0: &[f32] = &[1.0, 0.0, 0.0]; // dim 3, but we pass dim=2
+        let anchors: Vec<&[f32]> = vec![a0];
+        let blobs: Vec<&[u8]> = vec![];
+        assert!(cosine_batch_maxpool_packed(&anchors, &blobs, 2).is_err());
     }
 
     #[test]

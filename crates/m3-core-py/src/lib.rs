@@ -151,6 +151,58 @@ fn cosine_batch_packed_flat(
     })
 }
 
+/// Max-pooled multi-anchor cosine over packed candidate blobs — the "max-similarity"
+/// rerank: for each candidate, `max_j cosine(anchor_j, candidate)`. Pushes the whole
+/// N-candidate × M-anchor matrix op into Rust so the Python caller never runs a
+/// per-anchor FFI loop. Rayon-parallel over candidates; GIL released.
+///
+/// Both buffers are flat little-endian f32 bytes (same contract as
+/// `cosine_batch_packed_flat`): `anchors` = `m * dim * 4` bytes (M anchor rows),
+/// `blobs` = `n * dim * 4` bytes (N candidate rows). **Pass `bytes`** (zero-copy
+/// borrow). Errors with `ValueError` if either length isn't a multiple of `dim*4`.
+/// A candidate of the wrong length scores 0.0; with zero anchors every score is -1.0.
+#[pyfunction]
+fn cosine_batch_maxpool_packed(
+    py: Python<'_>,
+    anchors: &[u8],
+    blobs: &[u8],
+    dim: usize,
+) -> PyResult<Vec<f32>> {
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
+    if row_bytes == 0 {
+        return Err(PyValueError::new_err("dim must be > 0"));
+    }
+    if !anchors.len().is_multiple_of(row_bytes) {
+        return Err(PyValueError::new_err(format!(
+            "anchors length {} is not a multiple of dim*4 = {}",
+            anchors.len(),
+            row_bytes,
+        )));
+    }
+    if !blobs.len().is_multiple_of(row_bytes) {
+        return Err(PyValueError::new_err(format!(
+            "blobs length {} is not a multiple of dim*4 = {}",
+            blobs.len(),
+            row_bytes,
+        )));
+    }
+    py.detach(|| {
+        // Cast each anchor's bytes to &[f32]; a bad cast (alignment) -> error, surfaced.
+        let anchor_vecs: std::result::Result<Vec<&[f32]>, _> = anchors
+            .chunks_exact(row_bytes)
+            .map(bytemuck::try_cast_slice::<u8, f32>)
+            .collect();
+        let anchor_vecs = match anchor_vecs {
+            Ok(v) => v,
+            Err(e) => return Err(PyValueError::new_err(format!("anchor cast failed: {e}"))),
+        };
+        let cand_refs: Vec<&[u8]> = blobs.chunks_exact(row_bytes).collect();
+        map_err(m3_vector::cosine_batch_maxpool_packed(&anchor_vecs, &cand_refs, dim))
+    })
+}
+
 /// Vectorized hybrid scoring — body of the per-row Python scoring loop in
 /// `memory_search_scored_impl`, fully rayon-parallel. Releases the GIL.
 ///
@@ -1200,6 +1252,7 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch_packed, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch_packed_flat, m)?)?;
+    m.add_function(wrap_pyfunction!(cosine_batch_maxpool_packed, m)?)?;
     m.add_function(wrap_pyfunction!(hybrid_score_batch, m)?)?;
     m.add_function(wrap_pyfunction!(recency_bonus_ranks, m)?)?;
     m.add_function(wrap_pyfunction!(mmr_rerank, m)?)?;

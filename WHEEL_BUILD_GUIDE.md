@@ -313,6 +313,60 @@ targets the GPU only.
 - **Determinism.** Embeddings are deterministic across Python versions and
   CPU/GPU — the same text yields identical vectors. A mismatch means a broken
   build.
+- **Windows: Git Bash's `link.exe` shadows MSVC's linker.** If you launch the
+  build from (or with PATH inherited from) Git Bash / MSYS, Rust may invoke
+  `C:\Program Files\Git\usr\bin\link.exe` (GNU coreutils `link`) instead of
+  MSVC `link.exe`. The failure is unmistakable:
+  ```
+  error: linking with `link.exe` failed: exit code: 1
+    = note: "C:\\Program Files\\Git\\usr\\bin\\link.exe" ...
+    = note: /usr/bin/link: extra operand '...build_script_build...rcgu.o'
+            Try '/usr/bin/link --help' for more information.
+  ```
+  It is **not** the `vulkan-shaders-gen` / `VCEnd` CMake bug — it fails far
+  earlier, while linking pyo3 build scripts. Fix: after `vcvars64`, prepend the
+  MSVC tools bin dir so its `link.exe` wins:
+  ```
+  PATH = <VS>\VC\Tools\MSVC\<ver>\bin\Hostx64\x64 ; <ninja dir> ; %PATH%
+  ```
+  Confirm with `where link` — MSVC's path must print first. `vcvars64` alone is
+  not enough when a Git-Bash PATH is inherited into the cmd session.
+
+### Worked example — local Windows + CUDA build (verified 2026-06-22)
+
+Built `m3_core_rs_windows_cuda-3.6.6-cp314` locally end-to-end. Recipe that
+worked (PowerShell driving one `cmd.exe` session so the `vcvars64` env persists
+into the build):
+
+```powershell
+$vcvars   = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+$ninjaDir = '<python user scripts dir with ninja.exe>'   # pip install ninja puts it here
+$linkDir  = '<VS>\VC\Tools\MSVC\<ver>\bin\Hostx64\x64'    # MSVC link.exe — must beat Git's
+$cmd = "call `"$vcvars`" && set `"PATH=$linkDir;$ninjaDir;%PATH%`" && set CMAKE_GENERATOR=Ninja " +
+       "&& where link && python crates\m3-core-py\build_wheel.py --backend cuda --os windows --release " +
+       "--out dist\m3-core-rs-windows-cuda -- --interpreter python3.14 & echo BUILD_EXIT=%ERRORLEVEL%"
+cmd.exe /c $cmd
+```
+
+Notes that save time on a re-run:
+- **`ninja` via `pip install ninja`** lands at the Python *user* Scripts dir
+  (`...\AppData\Roaming\Python\PythonXY\Scripts\ninja.exe`), **not** on PATH and
+  **not** under `site-packages\ninja\data\bin`. `python -c "import ninja; print(ninja.BIN_DIR)"`
+  prints the real dir.
+- **`build_wheel.py --out` is relative to the script's own cwd**, so the wheel
+  lands at `crates/m3-core-py/dist/m3-core-rs-windows-cuda/…whl`, not repo-root
+  `dist/`. Don't hunt for it at the path you passed.
+- **CUDA wheel size ≈ 122 MB** here (links CUDA llama.cpp). A few-KB or 22-byte
+  result is a stub — rebuild.
+- After a failed link, clean stale pyo3 build dirs before retrying:
+  `target\release\build\pyo3-*` (a half-linked `.o` makes cargo think it's fresh).
+- **Verify after install**, don't assume: `oxidation_probe` must report
+  **8/8 native paths present (current)**, `embed_backend_label()` == the backend
+  you built (`cuda`), and `EmbeddedEmbedder` present for GPU backends. A CPU
+  build legitimately has neither — see §1.
+- A `--force-reinstall --no-deps` install of the freshly built CUDA wheel over a
+  prior one preserves the GPU embedder; it does **not** silently downgrade to a
+  CPU/embed-server path.
 
 ---
 

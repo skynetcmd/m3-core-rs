@@ -75,10 +75,10 @@ rm -rf /tmp/m3mac
 Healthy result: `EmbeddedEmbedder True`, `backend_label metal`, `8/8 funcs True`,
 `dim 1024`, `L2 ~1.0`.
 
-## 4. Get the 4 wheels onto the upload box (SkyPC) and attach to the release
+## 4. Get the 4 wheels onto the upload box and attach to the release
 
-The `gh` auth for `skynetcmd/m3-core-rs` lives on SkyPC. From the Mac, copy the
-wheels there (adjust host/path), or run `gh` on the Mac if it's authed:
+Use whichever box holds the `gh` auth for `skynetcmd/m3-core-rs`. From the Mac,
+copy the wheels there (adjust host/path), or run `gh` on the Mac if it's authed:
 
 ```bash
 # from the Mac → the upload box (example; use your own scp alias/path):

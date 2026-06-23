@@ -383,3 +383,21 @@ Notes that save time on a re-run:
   an Apple-Silicon Mac.
 - **Trusted publishers**: 3 registered (Windows). Rotate per §5a after first publish.
 - **`release.yml`**: fixed this session to build all of 3.11–3.14 (was 3.14-only).
+
+### Update 2026-06-22 — Windows 3.6.6 local builds (cp314)
+
+All three Windows backends rebuilt locally via `build_wheel.py` at crate
+**3.6.6** with canonical `m3-core-rs-windows-<backend>` names (not the old
+`+backend` local tags), cp314, and verified in isolated venvs:
+
+| Backend | Wheel size | `oxidation_probe` | `embed_backend_label()` | `EmbeddedEmbedder` |
+|---|---|---|---|---|
+| CPU | ~0.97 MB | 8/8 functions | `none` | ❌ (correct — §1) |
+| CUDA | ~122 MB | 8/8 (current) | `cuda` | ✅ |
+| Vulkan | ~20 MB | 8/8 functions | `vulkan` | ✅ |
+
+The CUDA wheel is installed in the working env (fixed a stale 3/8 wheel — see
+§7); CPU and Vulkan were verified in throwaway venvs only. Still cp314-only —
+re-run with `--interpreter python3.11 python3.12 python3.13 python3.14` (via `uv`,
+§2) for the full matrix before publishing. macOS Metal and Linux CUDA still
+pending per above.

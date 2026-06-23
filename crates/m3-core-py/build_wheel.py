@@ -42,18 +42,25 @@ _HERE = Path(__file__).resolve().parent
 _PYPROJECT = _HERE / "pyproject.toml"
 
 # The canonical build matrix. Key: (os, backend). Value: maturin Cargo
-# features to activate (empty for the plain CPU build — the default crate
-# build links no llama.cpp GPU backend). The package name is derived as
+# features to activate. The package name is derived as
 # `m3-core-rs-<os>-<backend>` for every entry; keeping the name implicit
 # guarantees it matches what the wizard computes from the same two tokens.
+#
+# CPU uses `embedded` (CPU-only llama.cpp, no GPU backend) so EVERY build —
+# including CPU — ships an in-process BGE-M3 `EmbeddedEmbedder`. m3-memory
+# requires a default in-process bge-m3 embedder on all builds; a CPU wheel
+# with no embedder forced reliance on the embed-server (tier 2), which is not
+# guaranteed present on an offline host. `embedded` cmake-builds llama.cpp, so
+# CPU builds now need a C/C++ compiler + cmake (was toolchain-free before).
+# CPU wheel grows ~1 MB -> ~2.4 MB; still far below the GPU wheels (20-122 MB).
 #
 # macOS is Metal-only: Apple Silicon always has a Metal GPU, so a CPU-only
 # mac package would be pointless and is intentionally absent.
 _MATRIX: dict[tuple[str, str], list[str]] = {
-    ("windows", "cpu"): [],
+    ("windows", "cpu"): ["embedded"],
     ("windows", "cuda"): ["embedded-cuda"],
     ("windows", "vulkan"): ["embedded-vulkan"],
-    ("linux", "cpu"): [],
+    ("linux", "cpu"): ["embedded"],
     ("linux", "cuda"): ["embedded-cuda"],
     ("linux", "vulkan"): ["embedded-vulkan"],
     ("macos", "metal"): ["embedded-metal"],

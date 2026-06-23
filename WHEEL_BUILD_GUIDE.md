@@ -24,22 +24,30 @@ version** rides in the wheel filename's `cpXY` compatibility tag.
 
 | OS | Backend | PyPI project | Cargo features | `EmbeddedEmbedder`? |
 |----|---------|--------------|----------------|----------------------|
-| Linux | CPU | `m3-core-rs-linux-cpu` | *(none)* | ❌ no — plain vector ops |
+| Linux | CPU | `m3-core-rs-linux-cpu` | `embedded` | ✅ yes (CPU llama.cpp) |
 | Linux | CUDA | `m3-core-rs-linux-cuda` | `embedded-cuda` | ✅ yes (NVIDIA) |
 | Linux | Vulkan | `m3-core-rs-linux-vulkan` | `embedded-vulkan` | ✅ yes (any Vulkan GPU) |
-| Windows | CPU | `m3-core-rs-windows-cpu` | *(none)* | ❌ no |
+| Windows | CPU | `m3-core-rs-windows-cpu` | `embedded` | ✅ yes (CPU llama.cpp) |
 | Windows | CUDA | `m3-core-rs-windows-cuda` | `embedded-cuda` | ✅ yes |
 | Windows | Vulkan | `m3-core-rs-windows-vulkan` | `embedded-vulkan` | ✅ yes |
 | macOS (Apple Silicon) | Metal | `m3-core-rs-macos-metal` | `embedded-metal` | ✅ yes |
 
 ### Two things that trip people up
 
-1. **CPU = no `EmbeddedEmbedder`, by design.** The plain CPU build links *no*
-   llama.cpp (`default = []` in `crates/m3-core-py/Cargo.toml`), so it has no
-   in-process embedder. CPU hosts embed via the embed-server path; only the GPU
-   backends (`embedded-*`) compile llama.cpp in. `m3_memory/rust_core_install.py`
-   mirrors this exactly: `_BACKEND_FEATURES["cpu"] = []`. **A CPU wheel that has
-   `EmbeddedEmbedder` was built wrong** (with `--features embedded`).
+1. **Every backend — including CPU — ships an in-process `EmbeddedEmbedder`.**
+   CPU uses the plain `embedded` feature (CPU-only llama.cpp, no GPU backend);
+   the GPU backends use `embedded-cuda`/`-vulkan`/`-metal`. This is a deliberate
+   policy: **m3-memory must always have a default in-process BGE-M3 embedder on
+   every build** — an embedder-less CPU wheel forced reliance on the embed-server
+   (tier 2), which is not guaranteed running on an offline host, leaving a gap
+   where embedding could return nothing. `m3_memory/rust_core_install.py` mirrors
+   this: `_BACKEND_FEATURES["cpu"] = ["embedded"]`. **A CPU wheel *without*
+   `EmbeddedEmbedder` is now built wrong** (it was built with `default = []` /
+   no `--features embedded`). Trade-off: CPU builds now cmake-compile llama.cpp,
+   so they need a C/C++ compiler + cmake (no longer toolchain-free), and the CPU
+   wheel grows from ~1 MB to ~2.4 MB — still far below the GPU wheels (20–122 MB).
+   Verified 2026-06-22: a `--features embedded` Windows CPU wheel loads BGE-M3
+   in-process (dim 1024, L2-norm 1.0, `embed_backend_label()` == `cpu`).
 
 2. **Python versions are NOT separate projects, tags, or publishers.** One
    project + version holds 4 wheels (`...-cp311-...`, `-cp312-`, `-cp313-`,
@@ -108,7 +116,8 @@ CPU and the GPU backends differ only in toolchain. Build host: any x86_64 Linux
 box (a Debian 13 container works well — see §6).
 
 ```bash
-# CPU — plain vector ops, no GPU toolchain needed. Broad manylinux compat.
+# CPU — CPU-only llama.cpp embedder, no GPU toolchain (needs cmake + a C/C++
+# compiler to build llama.cpp). Broad manylinux compat.
 python crates/m3-core-py/build_wheel.py --backend cpu --os linux \
     --out dist/m3-core-rs-linux-cpu \
     -- --interpreter python3.11 python3.12 python3.13 python3.14
@@ -200,9 +209,11 @@ PY
 #   load_tensors: offloaded N/N layers to GPU
 ```
 
-Expected for a healthy GPU wheel: `EmbeddedEmbedder` present, `embedding_dim`
-== model dim (BGE-M3 = **1024**), L2 norm ≈ 1.0, `backend_label` == the backend.
-For a **CPU** wheel: no `EmbeddedEmbedder`, `backend_label` == `none`/`cpu`.
+Expected for a healthy wheel (GPU **and** CPU): `EmbeddedEmbedder` present,
+`embedding_dim` == model dim (BGE-M3 = **1024**), L2 norm ≈ 1.0. `backend_label`
+== the backend for GPU wheels, and `cpu` for the CPU wheel. A wheel **without**
+`EmbeddedEmbedder` is broken regardless of backend (CPU included — it now builds
+`--features embedded`).
 
 The BGE-M3 Q4_K_M GGUF (~418 MB) is an LM Studio asset; if you use LM Studio it
 lives under `~/.lmstudio/models/.../bge-m3-GGUF-Q4_K_M.gguf`.
@@ -362,11 +373,26 @@ Notes that save time on a re-run:
   `target\release\build\pyo3-*` (a half-linked `.o` makes cargo think it's fresh).
 - **Verify after install**, don't assume: `oxidation_probe` must report
   **8/8 native paths present (current)**, `embed_backend_label()` == the backend
-  you built (`cuda`), and `EmbeddedEmbedder` present for GPU backends. A CPU
-  build legitimately has neither — see §1.
+  you built (`cuda`/`vulkan`/`metal`, or `cpu` for the CPU wheel), and
+  `EmbeddedEmbedder` present for **every** backend including CPU (see §1 — CPU now
+  builds `--features embedded`).
 - A `--force-reinstall --no-deps` install of the freshly built CUDA wheel over a
   prior one preserves the GPU embedder; it does **not** silently downgrade to a
   CPU/embed-server path.
+- **`CMAKE_GENERATOR` trailing space.** Setting it in cmd as
+  `set CMAKE_GENERATOR=Ninja && ...` captures the space *before* `&&` into the
+  value, so cmake gets `"Ninja "` and fails its exact-match lookup:
+  `CMake Error: Could not create named generator Ninja`. Always quote:
+  `set "CMAKE_GENERATOR=Ninja"`. (The GPU builds tolerated the stray space; the
+  CPU `embedded` llama.cpp build did not — so this surfaced only when building CPU.)
+- **Windows SDK `rc.exe` / `mt.exe` must be on PATH** for the CPU `embedded`
+  build. CMake's `CMakeTestCCompiler` try-compile links a manifest, and without
+  the SDK bin it fails with `--mt=CMAKE_MT-NOTFOUND` and
+  `RC Pass 1: command "rc ..." failed: no such file or directory` →
+  "The C compiler is not able to compile a simple test program." Fix: prepend
+  `C:\Program Files (x86)\Windows Kits\10\bin\<sdk-ver>\x64` (holds `rc.exe`,
+  `mt.exe`) to PATH alongside the MSVC link dir. `vcvars64` usually adds it, but
+  a Git-Bash-inherited PATH can bury it.
 
 ---
 
@@ -392,12 +418,22 @@ All three Windows backends rebuilt locally via `build_wheel.py` at crate
 
 | Backend | Wheel size | `oxidation_probe` | `embed_backend_label()` | `EmbeddedEmbedder` |
 |---|---|---|---|---|
-| CPU | ~0.97 MB | 8/8 functions | `none` | ❌ (correct — §1) |
+| CPU (`embedded`) | ~2.4 MB | 8/8 functions | `cpu` | ✅ in-process BGE-M3 (dim 1024, L2 1.0) |
 | CUDA | ~122 MB | 8/8 (current) | `cuda` | ✅ |
 | Vulkan | ~20 MB | 8/8 functions | `vulkan` | ✅ |
 
 The CUDA wheel is installed in the working env (fixed a stale 3/8 wheel — see
-§7); CPU and Vulkan were verified in throwaway venvs only. Still cp314-only —
-re-run with `--interpreter python3.11 python3.12 python3.13 python3.14` (via `uv`,
-§2) for the full matrix before publishing. macOS Metal and Linux CUDA still
-pending per above.
+§7); CPU-embedded and Vulkan were verified in throwaway venvs only. Still
+cp314-only — re-run with `--interpreter python3.11 python3.12 python3.13
+python3.14` (via `uv`, §2) for the full matrix before publishing. macOS Metal and
+Linux CUDA still pending per above.
+
+**Policy change (this build):** the CPU backend now compiles with `--features
+embedded` so it ships an in-process BGE-M3 embedder like the GPU wheels — m3
+requires a default in-process embedder on *every* build (see §1). The earlier
+~0.97 MB embedder-less CPU wheel is superseded. CI/build implication: CPU builds
+now need cmake + a C/C++ compiler (previously toolchain-free). The first CPU build
+also hit two gotchas now in §7: `CMAKE_GENERATOR=Ninja` must be set **without a
+trailing space** (`set "CMAKE_GENERATOR=Ninja"`, not `set CMAKE_GENERATOR=Ninja &&`),
+and the Windows SDK `bin\<ver>\x64` (rc.exe / mt.exe) must be on PATH for CMake's
+compiler test.

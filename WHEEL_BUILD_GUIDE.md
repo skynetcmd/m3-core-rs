@@ -6,6 +6,10 @@ How to build, verify, and publish the `m3-core-rs` Python wheels across
 publisher side) and [`crates/m3-core-py/build_wheel.py`](crates/m3-core-py/build_wheel.py)
 (the single source of truth for the package-name + feature mapping).
 
+> This is the **public, generic** how-to. The maintainers keep a private ops
+> playbook (concrete build-host names/access, per-release status, and prior
+> decisions) outside this repo; the two cross-reference each other.
+
 > **TL;DR**: `m3-core-rs` is one Rust source tree published as **7 differently
 > named PyPI projects** — one per `(OS, backend)` — each containing **one wheel
 > per supported CPython** (3.11–3.14). All install the same `m3_core_rs` import

@@ -138,6 +138,13 @@ Verified 2026-06-22 (Windows, crate 3.6.6): built all three backends × cp311–
 (12 wheels) this way — within each backend only the first Python version paid the
 llama.cpp compile; the remaining three were quick binding relinks.
 
+**`build_local.py` already encodes both rules** — it resolves the interpreters
+once, then loops backends on the outer level calling `build_wheel.py` once per
+backend with all interpreters. Prefer `python crates/m3-core-py/build_local.py all`
+over hand-rolled loops; it is the same optimization in one command (and adds
+uv-based interpreter discovery that rejects the project `.venv`, plus the Linux
+zig/native split — see §3a).
+
 > **Why per-version wheels at all?** PyO3 here uses
 > `features = ["extension-module"]` *without* `abi3`, so each wheel links a
 > specific CPython ABI (the `cpXY` tag) and is **not** cross-version. If the crate
@@ -158,9 +165,33 @@ llama.cpp compile; the remaining three were quick binding relinks.
 CPU and the GPU backends differ only in toolchain. Build host: any x86_64 Linux
 box (a Debian 13 container works well — see §6).
 
+**Preferred: one command for the whole matrix.** `build_local.py` applies the
+"Optimal build order & caching" rules above automatically — interpreters resolved
+once, backends looped on the outer level (so llama.cpp compiles once per backend,
+not once per (backend, version)):
+
 ```bash
-# CPU — CPU-only llama.cpp embedder, no GPU toolchain (needs cmake + a C/C++
-# compiler to build llama.cpp). Broad manylinux compat.
+# Builds every backend valid on this host (linux: cpu, vulkan, cuda) × the
+# default cp311–314, in the cache-optimal order, smoke-testing each.
+python crates/m3-core-py/build_local.py all
+# Or a subset / specific Pythons:
+python crates/m3-core-py/build_local.py cpu vulkan --pythons 3.11 3.12
+```
+
+`build_local.py` handles two Linux-specific details for you:
+- **CPU uses maturin `--zig`** for a portable, low-glibc-floor manylinux tag.
+- **GPU backends (vulkan/cuda) build NATIVE** — under `--zig`, llama-cpp-sys's
+  cmake can't find the host Vulkan/CUDA libs in zig's isolated sysroot
+  (`Could NOT find Vulkan (missing: Vulkan_LIBRARY)`), so they must link host
+  libs natively. (zig is never used on Windows/macOS.)
+
+**Explicit fallback** — the raw per-backend calls `build_local.py` wraps. Keep the
+backend-outer order; pass all interpreters in one call per backend (§ Optimal
+build order):
+
+```bash
+# CPU — CPU-only llama.cpp embedder, no GPU toolchain beyond cmake + a C/C++
+# compiler. Broad manylinux compat (add maturin's --zig for the lowest glibc floor).
 python crates/m3-core-py/build_wheel.py --backend cpu --os linux \
     --out dist/m3-core-rs-linux-cpu \
     -- --interpreter python3.11 python3.12 python3.13 python3.14
@@ -181,10 +212,20 @@ Notes:
 - **glibc floor matters**: build on an *old enough* glibc for your target
   audience. Debian 13 (glibc 2.41) yields `manylinux_2_3x`. For maximum reach,
   build CPU wheels in the official `quay.io/pypa/manylinux_2_28` container.
+- **CPU now ships an in-process embedder too** (`--features embedded`), so the
+  Linux CPU build also cmake-compiles llama.cpp — the caching rules apply equally
+  to all three Linux backends.
 
 ### 3b. Windows
 
 Build host: a Windows machine with Visual Studio Build Tools.
+
+**Preferred:** `python crates\m3-core-py\build_local.py all` — same cache-optimal
+driver as Linux (one llama.cpp compile per backend). Windows uses native builds
+for every backend (no zig). It must run inside a `vcvars64` environment with the
+MSVC linker ahead of Git's `link.exe` and `CMAKE_GENERATOR=Ninja` — see the
+Windows gotchas in §7. The explicit per-backend `build_wheel.py` calls below are
+the fallback:
 
 ```powershell
 # CPU

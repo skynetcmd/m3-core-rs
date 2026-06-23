@@ -199,7 +199,18 @@ def build_one(
     #     var to the llama.cpp cmake build, so CMAKE_CUDA_ARCHITECTURES reaches it.
     #     CARGO_PROFILE_RELEASE_STRIP makes rustc strip the final cdylib.
     if os_tok == "linux" and backend == "cuda":
-        env.setdefault("CMAKE_CUDA_FLAGS", "-Xcompiler -fPIC")
+        # nvcc compiles llama.cpp's ggml-cuda/*.cu kernels and embeds their
+        # absolute source paths in DWARF — and -ffile-prefix-map in CFLAGS/
+        # CXXFLAGS does NOT reach nvcc, so without this the CUDA .so leaks
+        # $HOME (the builder's username) ~190x via paths like
+        # /home/<user>/.cargo/registry/.../ggml-cuda/argsort.cu. Forward the
+        # same remaps to nvcc's host compiler via -Xcompiler so the .cu paths
+        # are scrubbed too. -fPIC is required (nvcc .cu.o links into a cdylib).
+        cuda_xcompiler = " ".join(
+            f"-Xcompiler -ffile-prefix-map={src}={dst}"
+            for src, dst in ((cargo_home, "/cargo"), (str(_REPO_ROOT), "/m3-core-rs"), (home, "/home"))
+        )
+        env.setdefault("CMAKE_CUDA_FLAGS", f"-Xcompiler -fPIC {cuda_xcompiler}")
         env.setdefault("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         # We ship a STATIC CUDA wheel: cuBLAS/cudart are linked into the .so so
         # the wheel is self-contained and Just Works for users without a system

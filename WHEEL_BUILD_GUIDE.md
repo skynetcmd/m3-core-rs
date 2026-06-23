@@ -102,6 +102,49 @@ python crates/m3-core-py/build_wheel.py \
 
 Everything after `--` is forwarded verbatim to `maturin build`.
 
+### Optimal build order & caching (build the whole matrix fast)
+
+You ship `backends × {3.11, 3.12, 3.13, 3.14}` wheels. The expensive artifact in
+every build is the **cmake/C++ compile of llama.cpp + ggml** (and the GPU shader
+toolchains). The key fact that makes the matrix cheap:
+
+> **llama.cpp is Python-version-independent.** It's a pure C/C++ library that
+> does not link Python. Only the thin PyO3 binding (`m3-core-py`'s `cdylib`)
+> links a specific CPython ABI. So across Python versions of the *same* backend,
+> llama.cpp is compiled **once** and reused; only the small binding relinks.
+
+Two rules fall out of this:
+
+1. **One `build_wheel.py` call per backend, with all four interpreters at once.**
+   Pass `--interpreter <py311> <py312> <py313> <py314>` in a single invocation.
+   maturin builds the Rust/C artifacts once and fans out the per-interpreter
+   binding — far better cache reuse than four separate calls.
+
+2. **Loop backends on the OUTER level, Python versions on the inner.** cargo keys
+   its `target/` cache on the *feature set*, not the interpreter. CPU=`embedded`,
+   Vulkan=`embedded-vulkan`, CUDA=`embedded-cuda` are different features, so each
+   backend switch forces exactly one llama.cpp rebuild — unavoidable, but you pay
+   it **once per backend (3×)**, not once per (backend, version) (12×). Sweeping
+   versions inside a fixed backend keeps llama.cpp cached. **Never** loop
+   backends inside a Python-version loop — that is the 12× pessimal order.
+
+```
+for backend in cpu vulkan cuda:          # OUTER: each switch = 1 llama.cpp rebuild
+    build_wheel.py --backend $backend ... -- --interpreter py311 py312 py313 py314
+                                         # INNER: 4 fast binding relinks, llama.cpp cached
+```
+
+Verified 2026-06-22 (Windows, crate 3.6.6): built all three backends × cp311–314
+(12 wheels) this way — within each backend only the first Python version paid the
+llama.cpp compile; the remaining three were quick binding relinks.
+
+> **Why per-version wheels at all?** PyO3 here uses
+> `features = ["extension-module"]` *without* `abi3`, so each wheel links a
+> specific CPython ABI (the `cpXY` tag) and is **not** cross-version. If the crate
+> ever adopted the stable ABI (`abi3-py311`), one wheel would cover 3.11+ — at a
+> small perf/feature cost — and this matrix would collapse to one wheel per
+> (os, backend). It does not today, so build all four.
+
 ### Common prerequisites (all platforms, all backends)
 
 - **Rust ≥ 1.94** (`rustup`), **maturin ≥ 1.7,<2** (`pipx install maturin`)
@@ -410,23 +453,25 @@ Notes that save time on a re-run:
 - **Trusted publishers**: 3 registered (Windows). Rotate per §5a after first publish.
 - **`release.yml`**: fixed this session to build all of 3.11–3.14 (was 3.14-only).
 
-### Update 2026-06-22 — Windows 3.6.6 local builds (cp314)
+### Update 2026-06-22 — Windows 3.6.6 full matrix (cp311–314)
 
-All three Windows backends rebuilt locally via `build_wheel.py` at crate
-**3.6.6** with canonical `m3-core-rs-windows-<backend>` names (not the old
-`+backend` local tags), cp314, and verified in isolated venvs:
+All three Windows backends built locally via `build_wheel.py` at crate **3.6.6**
+with canonical `m3-core-rs-windows-<backend>` names, for the **full Python matrix
+cp311 / cp312 / cp313 / cp314** — **12 wheels** total. Built in the cache-optimal
+order (one call per backend, all four interpreters; see "Optimal build order"
+above), so each backend paid the llama.cpp compile once.
 
-| Backend | Wheel size | `oxidation_probe` | `embed_backend_label()` | `EmbeddedEmbedder` |
-|---|---|---|---|---|
-| CPU (`embedded`) | ~2.4 MB | 8/8 functions | `cpu` | ✅ in-process BGE-M3 (dim 1024, L2 1.0) |
-| CUDA | ~122 MB | 8/8 (current) | `cuda` | ✅ |
-| Vulkan | ~20 MB | 8/8 functions | `vulkan` | ✅ |
+| Backend | Wheel size | `oxidation_probe` | `embed_backend_label()` | `EmbeddedEmbedder` | Pythons |
+|---|---|---|---|---|---|
+| CPU (`embedded`) | ~2.4 MB | 8/8 functions | `cpu` | ✅ in-process BGE-M3 (dim 1024, L2 1.0) | cp311–314 |
+| CUDA | ~122 MB | 8/8 (current) | `cuda` | ✅ | cp311–314 |
+| Vulkan | ~20 MB | 8/8 functions | `vulkan` | ✅ | cp311–314 |
 
-The CUDA wheel is installed in the working env (fixed a stale 3/8 wheel — see
-§7); CPU-embedded and Vulkan were verified in throwaway venvs only. Still
-cp314-only — re-run with `--interpreter python3.11 python3.12 python3.13
-python3.14` (via `uv`, §2) for the full matrix before publishing. macOS Metal and
-Linux CUDA still pending per above.
+Verified in isolated venvs: the cp314 CUDA wheel is installed in the working env
+(fixed a stale 3/8 wheel — see §7); the cp312 CPU wheel was loaded in a clean 3.12
+venv and embedded BGE-M3 in-process (dim 1024, L2 1.0, `backend_label`=`cpu`).
+Wheels are `.gitignore`d — not committed; attach to a Release or publish via CI.
+macOS Metal and Linux (all backends) still pending per above.
 
 **Policy change (this build):** the CPU backend now compiles with `--features
 embedded` so it ships an in-process BGE-M3 embedder like the GPU wheels — m3

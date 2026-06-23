@@ -162,8 +162,10 @@ zig/native split — see §3a).
 
 ### 3a. Linux
 
-CPU and the GPU backends differ only in toolchain. Build host: any x86_64 Linux
-box (a Debian 13 container works well — see §6).
+CPU and the GPU backends differ only in toolchain. Build host: a provisioned
+Debian 13 LXC build container (all three backends; see §6 for the login-shell SSH
+and CUDA `--no-smoke-test` rules). Any equivalently-toolchained x86_64 Linux box
+also works.
 
 **Preferred: one command for the whole matrix.** `build_local.py` applies the
 "Optimal build order & caching" rules above automatically — interpreters resolved
@@ -366,9 +368,30 @@ Install from a Release asset URL:
 
 | Platform | Host | Notes |
 |----------|------|-------|
-| Linux x86_64 | any x86_64 Linux box | Debian 13, rustup, Python 3.11–3.14. An iGPU/dGPU passed through for Vulkan verify (see below). |
-| Windows | a Windows build box | VS Build Tools, CUDA, Vulkan SDK. |
-| macOS (Metal) | an Apple-Silicon Mac | Metal build leg to be verified on a device. |
+| Linux x86_64 | A provisioned Debian 13 LXC build container | rustc 1.95, maturin 1.13.3, uv, CUDA 13.2 toolkit, Vulkan dev stack + AMD/RADV iGPU. Builds **all three** Linux backends. **Not** the bare Proxmox hypervisor. |
+| Windows | A Windows build box | VS Build Tools, CUDA, Vulkan SDK. |
+| macOS (Metal) | An Apple-Silicon Mac | Metal build leg to be verified on a device. |
+
+### Linux build box (provisioned Debian 13 LXC)
+
+Two operational rules that bite if missed when building inside an LXC over SSH:
+
+- **Always use a LOGIN shell.** rust / maturin / uv / nvcc are typically only on
+  `PATH` in a login shell. Run `ssh <host> 'bash -lc "..."'` — a non-login
+  `ssh <host> <cmd>` reports command-not-found. (Fallback if SSH breaks: reach the
+  container from the Proxmox host with `pct exec <ctid> -- su - <user> -c "..."`.)
+- **GPU verify split depends on the box's GPU.** A build box with an **AMD/RADV
+  iGPU and no NVIDIA** can build *and* smoke-test CPU + Vulkan, but **CUDA is
+  build-only** there (nvcc cross-compiles without a GPU) — build with
+  `--no-smoke-test` and import-verify on an NVIDIA box. Budget ~27 min for a
+  from-scratch Linux CUDA build on a 4-core box.
+
+Build the Linux matrix over SSH:
+
+```bash
+ssh <host> 'bash -lc "cd ~/m3-core-rs/crates/m3-core-py && python3 build_local.py cpu vulkan"'
+ssh <host> 'bash -lc "cd ~/m3-core-rs/crates/m3-core-py && python3 build_local.py cuda --no-smoke-test"'
+```
 
 ### Linux Vulkan GPU verification (one-time host setup)
 

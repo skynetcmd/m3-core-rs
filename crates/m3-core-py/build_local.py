@@ -160,6 +160,30 @@ def build_one(
     log_path = out_dir.parent / f"build-{os_tok}-{backend}.log"
 
     env = os.environ.copy()
+    # Strip build-host paths from debuginfo / panic strings so published wheels
+    # don't leak the builder's $HOME, cargo registry path, or repo location. The
+    # three remappings cover: the cargo registry (crate sources rustc embeds in
+    # panic-location strings), $CARGO_HOME, and the repo root itself.
+    home = os.path.expanduser("~")
+    cargo_home = os.environ.get("CARGO_HOME", os.path.join(home, ".cargo"))
+    rust_remaps = [
+        f"--remap-path-prefix={cargo_home}=/cargo",
+        f"--remap-path-prefix={str(_REPO_ROOT)}=/m3-core-rs",
+        f"--remap-path-prefix={home}=/home",
+    ]
+    existing_rustflags = env.get("RUSTFLAGS", "").strip()
+    env["RUSTFLAGS"] = (existing_rustflags + " " + " ".join(rust_remaps)).strip()
+    # llama-cpp-sys compiles its C/C++ sources via cmake; rustc's
+    # --remap-path-prefix doesn't reach those. Pass the equivalent
+    # -ffile-prefix-map to clang/gcc through CFLAGS / CXXFLAGS so __FILE__
+    # macros and DWARF debug info are scrubbed there too.
+    cc_remaps = " ".join([
+        f"-ffile-prefix-map={cargo_home}=/cargo",
+        f"-ffile-prefix-map={str(_REPO_ROOT)}=/m3-core-rs",
+        f"-ffile-prefix-map={home}=/home",
+    ])
+    for var in ("CFLAGS", "CXXFLAGS"):
+        env[var] = (env.get(var, "").strip() + " " + cc_remaps).strip()
     extra: list[str] = []
     if use_zig:
         extra.append("--zig")

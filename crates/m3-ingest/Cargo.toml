@@ -1,0 +1,14 @@
+[package]
+name = "m3-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Filesystem-watcher hot path: parallel directory walk + batch content hashing."
+
+[dependencies]
+m3-error = { workspace = true }
+m3-hash = { workspace = true }
+rayon = "1"
+log = "0.4"

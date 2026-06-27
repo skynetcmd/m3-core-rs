@@ -852,6 +852,74 @@ impl PyGovernor {
 }
 
 // ---------------------------------------------------------------------------
+// m3-ingest
+// ---------------------------------------------------------------------------
+
+/// Recursively sweep `root`, returning one dict per entry with keys
+/// `path`, `size`, `mtime`, `is_dir`. Directories whose basename is in
+/// `dir_ignores` are pruned (their subtrees are skipped). `max_depth` is
+/// measured from `root` (`0` = direct children only); pass a negative value
+/// for unbounded. Symlinked directories are descended only when
+/// `follow_symlinks` is true. Individual unreadable entries are skipped.
+///
+/// This is the mechanical, syscall-bound half of the Python walker; the
+/// caller still applies its gitignore/glob/binary-sniff/size filters to the
+/// returned list.
+#[pyfunction]
+#[pyo3(signature = (root, dir_ignores, max_depth=-1, follow_symlinks=false))]
+fn fs_walk(
+    py: Python<'_>,
+    root: &str,
+    dir_ignores: Vec<String>,
+    max_depth: i64,
+    follow_symlinks: bool,
+) -> PyResult<Py<pyo3::types::PyList>> {
+    let md = if max_depth < 0 {
+        None
+    } else {
+        Some(max_depth as usize)
+    };
+    let entries = m3_ingest::walk_entries(root, &dir_ignores, md, follow_symlinks);
+    let list = pyo3::types::PyList::empty(py);
+    for e in entries {
+        let d = PyDict::new(py);
+        d.set_item("path", e.path)?;
+        d.set_item("size", e.size)?;
+        d.set_item("mtime", e.mtime)?;
+        d.set_item("is_dir", e.is_dir)?;
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
+/// Batch-hash file contents in parallel. Returns one dict per input path (in
+/// input order) with keys `path`, `sha256` (hex string or `None` on failure),
+/// and `error` (message string or `None`). Byte-identical to the Python
+/// `file_content_sha256` for readable files.
+#[pyfunction]
+fn hash_files(py: Python<'_>, paths: Vec<String>) -> PyResult<Py<pyo3::types::PyList>> {
+    // Release the GIL for the parallel I/O + hashing, then marshal results.
+    let results = py.detach(|| m3_ingest::hash_files(&paths));
+    let list = pyo3::types::PyList::empty(py);
+    for (path, res) in results {
+        let d = PyDict::new(py);
+        d.set_item("path", path)?;
+        match res {
+            Ok(hex) => {
+                d.set_item("sha256", hex)?;
+                d.set_item("error", py.None())?;
+            }
+            Err(msg) => {
+                d.set_item("sha256", py.None())?;
+                d.set_item("error", msg)?;
+            }
+        }
+        list.append(d)?;
+    }
+    Ok(list.into())
+}
+
+// ---------------------------------------------------------------------------
 // m3-ner-ort
 // ---------------------------------------------------------------------------
 
@@ -1317,6 +1385,8 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile_fts_query, m)?)?;
     m.add_function(wrap_pyfunction!(env_config_summary, m)?)?;
     m.add_function(wrap_pyfunction!(embed_backend_label, m)?)?;
+    m.add_function(wrap_pyfunction!(fs_walk, m)?)?;
+    m.add_function(wrap_pyfunction!(hash_files, m)?)?;
 
     m.add_class::<PyRankRow>()?;
     m.add_class::<PyRouteSignals>()?;

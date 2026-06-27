@@ -414,6 +414,36 @@ RADV iGPU:
 The **XDNA NPU is not usable** — llama.cpp has no NPU backend; `embedded-vulkan`
 targets the GPU only.
 
+### Building all three OSes in parallel
+
+The three OS build hosts are fully independent machines with separate source
+checkouts and no shared state, so the whole 28-wheel matrix can be built
+**concurrently** — one host per OS — instead of serially. Wall-clock drops from
+the *sum* of the three OS builds to the *slowest single* one (almost always the
+Linux CUDA leg).
+
+Pattern (one worker per OS, each end-to-end):
+
+1. **Deliver source** to each host at the exact release commit (see the mtime
+   caveat in §7 — prefer `git fetch` + `git reset --hard` over `git archive` so
+   the CUDA cache stays warm).
+2. **Delete the previous build's wheels** for that OS first
+   (`ci-wheels/local-<ver>/<os>-*`), so a partial/stale wheel can't masquerade
+   as fresh output.
+3. **Build** that OS's backends via `build_local.py` (Windows/Linux: `cpu vulkan
+   cuda`; macOS: `metal`). GPU/long builds run detached; poll the log + the
+   `ci-wheels` dir for completion rather than blocking.
+4. **Verify** per OS: import-test where the host can load the wheel (matching
+   GPU + interpreter), symbol-scan the compiled extension otherwise (§7).
+5. **Collect** all wheels to one box only *after* every OS reports success.
+
+No two workers contend: each writes only its own OS's wheels (distinct package
+names), and the final collect step is single-writer. A failure on one host is
+isolated — fix and re-run that OS; the other two OSes' wheels still stand. If a
+host is unreachable (e.g. a laptop asleep), build the reachable OSes now and run
+the missing one as a follow-up wave; the GitHub release draft can be topped up
+when it returns.
+
 ---
 
 ## 7. Gotchas (learned the hard way)
@@ -435,13 +465,27 @@ targets the GPU only.
 - **Determinism.** Embeddings are deterministic across Python versions and
   CPU/GPU — the same text yields identical vectors. A mismatch means a broken
   build.
-- **A pure-Rust change rebuilds GPU wheels in ~1-2 min, not from scratch.** If a
-  release only adds/changes Rust crates that do **not** touch `llama-cpp-sys`
-  (e.g. new pure-logic crates + PyO3 bindings), cargo reuses the cached
-  llama.cpp/ggml compile and only relinks the small Rust cdylib. A CUDA wheel
-  that takes ~27 min from scratch can finish in ~1-2 min. This is expected — do
-  not force a from-scratch rebuild unless you changed a `CMAKE_*`/`LLAMA_*` flag
-  or the GPU backend itself.
+- **A pure-Rust change rebuilds GPU wheels in ~1-2 min, not from scratch —
+  *only if the build directory's file mtimes are preserved*.** If a release only
+  adds/changes Rust crates that do **not** touch `llama-cpp-sys` (e.g. new
+  pure-logic crates + PyO3 bindings), cargo reuses the cached llama.cpp/ggml
+  compile and only relinks the small Rust cdylib (~1-2 min instead of ~27).
+  **CAVEAT (learned the hard way):** cargo's freshness check is **mtime-based**,
+  so *how you deliver the source to a remote build host matters*:
+  - **Local git checkout** (e.g. Windows on the dev box) — mtimes intact, cache
+    warm, fast relink. ✅
+  - **`git fetch` + `git reset --hard <commit>`** on the box — git only rewrites
+    files that actually changed, so the unchanged llama.cpp vendored sources keep
+    their mtimes → cache warm. ✅ **Prefer this for remote delivery.**
+  - **`git archive <commit> | ssh tar -x`** — tar **resets every file's mtime to
+    extract time**, which invalidates cargo's `llama-cpp-sys` fingerprint and
+    forces a **full from-scratch CUDA kernel recompile (~12-27 min)** even though
+    llama.cpp content is unchanged. ❌ CPU + Vulkan are unaffected (no kernel
+    compile); only the CUDA backend pays this. If you must use `git archive`,
+    either accept the CUDA rebuild, or `touch -r` the vendored llama.cpp files
+    back to their pre-extract mtime, or delete only
+    `target/release/.fingerprint/m3-core-py-*` (not the whole `llama-cpp-sys`
+    build dir) so cargo relinks the cdylib without recompiling kernels.
 - **Verify a wheel's exported symbols WITHOUT importing it** when the build box
   lacks the matching GPU (Linux CUDA on an AMD box) or interpreter (a cp313
   wheel on a cp314 host). A wheel is a zip; the compiled extension is a `.so`

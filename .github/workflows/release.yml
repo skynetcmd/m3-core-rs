@@ -30,22 +30,33 @@ on:
   push:
     tags:
       - "v*"            # e.g. v2026.05.30
-  # checkov:skip=CKV_GHA_7: the `publish` input is a constrained boolean
-  # (default false) read only by an `if: ... == true` equality gate on the
-  # publish step — it never flows into a build command/shell, so it cannot
-  # influence build output. Same rationale as m3-memory's publish.yml.
+  # checkov:skip=CKV_GHA_7: the `publish` input is a constrained `choice`
+  # (enumerated "true"/"false", default "false") consumed only by an equality
+  # gate on the publish step (`inputs.publish == 'true'`) — it never flows into
+  # a build command/shell, so it cannot influence build output. CKV_GHA_7 wants
+  # workflow_dispatch inputs empty regardless of type, so this is suppressed
+  # with the documented rationale (same intent as m3-memory's publish.yml).
   workflow_dispatch:
     inputs:
+      # Constrained choice (not free text / boolean) so the value can only ever
+      # be one of the listed literals. Consumed by an equality gate, not a build
+      # command.
       publish:
         description: "Publish to PyPI (requires trusted publishers configured)"
-        type: boolean
-        default: false
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
 
 permissions:
   contents: read
 
 jobs:
   build:
+    # checkov:skip=CKV_GHA_4: false positive — the rule's "netcat with IP"
+    # regex matches the Vulkan SDK version string `1.4.341.0` (it reads the
+    # dotted version as an IP). No netcat is used anywhere in this workflow.
     name: ${{ matrix.os_tok }}-${{ matrix.backend }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -348,7 +359,7 @@ jobs:
   publish:
     name: publish ${{ matrix.os_tok }}-${{ matrix.backend }}
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:

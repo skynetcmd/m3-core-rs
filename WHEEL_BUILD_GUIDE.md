@@ -435,6 +435,29 @@ targets the GPU only.
 - **Determinism.** Embeddings are deterministic across Python versions and
   CPU/GPU — the same text yields identical vectors. A mismatch means a broken
   build.
+- **A pure-Rust change rebuilds GPU wheels in ~1-2 min, not from scratch.** If a
+  release only adds/changes Rust crates that do **not** touch `llama-cpp-sys`
+  (e.g. new pure-logic crates + PyO3 bindings), cargo reuses the cached
+  llama.cpp/ggml compile and only relinks the small Rust cdylib. A CUDA wheel
+  that takes ~27 min from scratch can finish in ~1-2 min. This is expected — do
+  not force a from-scratch rebuild unless you changed a `CMAKE_*`/`LLAMA_*` flag
+  or the GPU backend itself.
+- **Verify a wheel's exported symbols WITHOUT importing it** when the build box
+  lacks the matching GPU (Linux CUDA on an AMD box) or interpreter (a cp313
+  wheel on a cp314 host). A wheel is a zip; the compiled extension is a `.so`
+  (Linux) or `.pyd` (Windows). Extract it with `zipfile` and scan the bytes for
+  the expected symbol names — no `strings` needed (Windows has none):
+  ```python
+  import re, sys, zipfile
+  with zipfile.ZipFile(sys.argv[1]) as z:
+      ext = next(n for n in z.namelist() if n.endswith((".so", ".pyd")))
+      blob = z.read(ext)
+  text = b" ".join(re.findall(rb"[\x20-\x7e]{4,}", blob)).decode("ascii", "ignore")
+  for sym in ("Governor", "fs_walk", "hash_files"):   # the release's new symbols
+      print(sym, sym in text)
+  ```
+  Import-test (`embed_backend_label()` + a real call) on a box that CAN load the
+  wheel; symbol-scan elsewhere. Both together cover the matrix.
 - **Windows: Git Bash's `link.exe` shadows MSVC's linker.** If you launch the
   build from (or with PATH inherited from) Git Bash / MSYS, Rust may invoke
   `C:\Program Files\Git\usr\bin\link.exe` (GNU coreutils `link`) instead of

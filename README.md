@@ -17,7 +17,12 @@ independently-useful crates plus a PyO3 binding crate (`m3-core-py`) consumed by
 | `m3-rank` | 3d | Hybrid FTS5 + vector rank-fusion merge |
 | `m3-route` | 3d | Multi-signal query route decider |
 | `m3-graph` | 4 | In-memory graph index + traversal |
+| `m3-fts` | 4 | FTS5 query sanitizer + lexical tokenizer |
+| `m3-governor` | 4 | Adaptive background-workload pacing logic (pure decision function) |
+| `m3-ingest` | 4 | Filesystem-walker hot path: parallel directory walk + batch content hashing |
 | `m3-core-py` | — | PyO3 bindings; the only crate Python sees |
+
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for per-operation speed measurements.
 
 ## Reusability
 

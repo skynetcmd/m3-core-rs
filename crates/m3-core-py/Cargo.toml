@@ -23,6 +23,7 @@ m3-rank = { workspace = true }
 m3-route = { workspace = true }
 m3-graph = { workspace = true }
 m3-fts = { workspace = true }
+m3-governor = { workspace = true }
 pyo3 = { version = "0.28", features = ["extension-module"] }
 bytemuck = "1"
 log = "0.4"

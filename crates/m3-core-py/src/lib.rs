@@ -813,6 +813,45 @@ impl PyRetryPolicy {
 }
 
 // ---------------------------------------------------------------------------
+// m3-governor
+// ---------------------------------------------------------------------------
+
+/// Adaptive background-workload governor. Constructs with the user-selectable
+/// thresholds and decides a pacing dict identical in shape to the Python
+/// `get_governor_pacing` return — a drop-in replacement behind the
+/// `M3_CORE_RS_DISABLE` fallback gate.
+#[pyclass(name = "Governor")]
+struct PyGovernor {
+    inner: m3_governor::GovernorConfig,
+}
+
+#[pymethods]
+impl PyGovernor {
+    #[new]
+    fn new(initial_limit: i64, limit_threshold: i64) -> Self {
+        PyGovernor {
+            inner: m3_governor::GovernorConfig::new(initial_limit, limit_threshold),
+        }
+    }
+
+    /// Decide pacing for the given host `load` (0–100, max across CPU/RAM/GPU)
+    /// and `elapsed` seconds since the last user interaction. Returns a dict
+    /// with keys matching the Python truth table: always `background` and
+    /// `interactive_delay`; `background_delay` is present only in the modes
+    /// where Python includes it (omitted in critical/HALTED-on-load mode).
+    fn decide(&self, py: Python<'_>, load: f64, elapsed: f64) -> PyResult<Py<PyDict>> {
+        let p = self.inner.decide(load, elapsed);
+        let d = PyDict::new(py);
+        d.set_item("background", p.mode.as_str())?;
+        if let Some(bg) = p.background_delay {
+            d.set_item("background_delay", bg)?;
+        }
+        d.set_item("interactive_delay", p.interactive_delay)?;
+        Ok(d.into())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // m3-ner-ort
 // ---------------------------------------------------------------------------
 
@@ -1285,6 +1324,7 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGraphIndex>()?;
     m.add_class::<PyCircuitBreaker>()?;
     m.add_class::<PyRetryPolicy>()?;
+    m.add_class::<PyGovernor>()?;
     m.add_class::<PySpan>()?;
     #[cfg(feature = "onnx")]
     m.add_class::<PyOrtNer>()?;

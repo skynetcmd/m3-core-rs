@@ -18,7 +18,7 @@ production Python paths. This document covers the **Milestone-4 additions**:
 | | |
 |---|---|
 | Date | 2026-06-27 |
-| Crate version | m3-core-rs 3.6.22 (Windows CUDA wheel, cp314) |
+| Crate version | m3-core-rs 3.6.27 (Windows CUDA wheel, cp314) |
 | Python | 3.14.3 |
 | Platform | Windows 11 (10.0.26200), AMD64, NVIDIA RTX 5080 |
 | Timing | `time.perf_counter`; warm cache; median of repeated runs |

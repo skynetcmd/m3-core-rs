@@ -31,3 +31,6 @@ crates/m3-core-py/python/m3_core_rs/*.pyd
 crates/m3-core-py/python/m3_core_rs/*.so
 crates/m3-core-py/python/m3_core_rs/*.dylib
 
+
+# Per-machine local Claude Code settings — user-specific paths/permissions, never tracked.
+.claude/settings.local.json

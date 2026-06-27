@@ -1,0 +1,13 @@
+# Semgrep ignore for m3-core-rs.
+#
+# The m3-redact crate is a secret-detection/scrubbing library; its source,
+# tests, and benchmarks legitimately embed synthetic secret-shaped fixture
+# strings (fake GitHub PATs, GCP keys, JWTs) as INPUT to the scrubber. Semgrep's
+# secrets rules flag these as hard-coded credentials on every scan — they are
+# not real secrets. Suppress the whole crate to stop the recurring
+# false-positive set (was 1 Critical + several High in the release scan).
+crates/m3-redact/
+
+# Scanner self-output and build artifacts.
+ci-wheels/
+target/

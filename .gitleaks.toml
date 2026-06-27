@@ -1,0 +1,32 @@
+# Gitleaks configuration for m3-core-rs.
+#
+# Extends the default ruleset. Adds an allowlist for the `m3-redact` crate,
+# whose entire purpose is detecting and scrubbing secrets — so its source,
+# tests, and benchmarks legitimately contain secret-shaped fixture strings
+# (synthetic GitHub PATs, GCP keys, JWTs) used as INPUT to the scrubber.
+# Without this, gitleaks reports them as real leaks on every scan (this was a
+# recurring 1-Critical + several-High false-positive set in the release scan).
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "m3-redact crate fixtures — synthetic secret-shaped strings used to test the redaction scrubber, never real credentials"
+
+# The redaction crate's source, tests, and benches embed realistic-looking
+# tokens (e.g. `ghp_aaaa...`, GCP keys, jwt.io demo JWTs) so the scrubber can
+# be verified to redact them. Allowlist the whole crate path.
+paths = [
+    '''crates/m3-redact/src/.*\.rs''',
+    '''crates/m3-redact/tests/.*\.rs''',
+    '''crates/m3-redact/benches/.*\.rs''',
+]
+
+# Scanner self-output: scan reports / SARIFs contain the secrets they reported,
+# creating a recursive finding loop on re-scan.
+[[allowlists]]
+description = "Scanner self-output"
+paths = [
+    '''ci-wheels/.*''',
+    '''scan-reports/.*''',
+]

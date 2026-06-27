@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed: m3-core-rs ships binary wheels, so pinning exact
+# dependency versions is required for reproducible builds AND for supply-chain
+# scanning (cargo-audit reads Cargo.lock against the RustSec advisory DB).
 *.pdb
 __pycache__/
 

@@ -18,6 +18,11 @@
 # trusted publisher first (https://docs.pypi.org/trusted-publishers/). Until
 # that's set up, run with workflow_dispatch + publish=false to only build and
 # upload wheels as workflow artifacts.
+#
+# checkov:skip=CKV_GHA_7: the `publish` workflow_dispatch input is a constrained
+# boolean (default false) consumed only by an `if: ... == true` equality gate on
+# the publish step — it never flows into a build command or shell, so it cannot
+# influence the build output. Same rationale as m3-memory's publish.yml.
 
 name: release
 
@@ -25,6 +30,10 @@ on:
   push:
     tags:
       - "v*"            # e.g. v2026.05.30
+  # checkov:skip=CKV_GHA_7: the `publish` input is a constrained boolean
+  # (default false) read only by an `if: ... == true` equality gate on the
+  # publish step — it never flows into a build command/shell, so it cannot
+  # influence build output. Same rationale as m3-memory's publish.yml.
   workflow_dispatch:
     inputs:
       publish:

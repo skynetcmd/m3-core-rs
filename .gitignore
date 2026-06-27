@@ -14,6 +14,15 @@ crates/*/dist/
 # Wheels — built locally, redistributed via CI/release process, not via git.
 *.whl
 
+# Local build/staging scratch — these hold host-specific paths (usernames,
+# build-box names), build logs, and the wheel-staging tree. Per CLAUDE.md they
+# must never reach public origin. Ignore the whole dirs, not just *.whl, so
+# build logs / SHA256SUMS / output captures can't be accidentally committed.
+ci-wheels/
+.scratch/
+*.out
+CORE_README.md
+
 # Compiled PyO3 extension — platform/Python-specific build artifact dropped by
 # `maturin develop` into the source package dir. Like wheels, it is produced
 # from source by CI/release, never tracked (would drift from the .rs source and

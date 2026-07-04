@@ -26,11 +26,19 @@ import zipfile
 from pathlib import Path
 
 # Minimum plausible server-binary size per backend token found in the wheel
-# name. A cuda/vulkan server links a GPU llama.cpp and is far larger than the
-# ~5-9 MB CPU server; a value below the floor means the wrong backend was
+# name. cuda/vulkan STATICALLY link a GPU llama.cpp and are far larger than the
+# ~8 MB CPU server, so a value below the floor means the wrong backend was
 # bundled. Floors are deliberately loose (well under observed sizes: cpu ~8 MB,
 # vulkan ~68 MB, cuda ~145 MB) to catch a mismatch, not to pin exact sizes.
-_MIN_BIN_MB = {"cpu": 2, "vulkan": 30, "cuda": 60, "metal": 10}
+#
+# METAL IS DIFFERENT: on macOS the GPU backend is Apple's Metal.framework,
+# linked DYNAMICALLY (a system framework), so nothing GPU is baked into the
+# binary — a correct metal server is ~8 MB, same order as CPU. So a size floor
+# CANNOT distinguish a real metal build from a CPU one for macOS; metal gets a
+# CPU-like floor here and the real proof is framework linkage (`otool -L` shows
+# Metal/MetalKit/Accelerate — verified by hand on the 3.7.4 8.2 MB binary). A
+# too-high metal floor false-failed correct wheels, which is why it is 2, not 10.
+_MIN_BIN_MB = {"cpu": 2, "vulkan": 30, "cuda": 60, "metal": 2}
 
 
 def _backend_of(wheel_name: str) -> str | None:

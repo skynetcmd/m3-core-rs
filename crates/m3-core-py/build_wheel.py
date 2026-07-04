@@ -34,12 +34,20 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _PYPROJECT = _HERE / "pyproject.toml"
+_WORKSPACE = _HERE.parent.parent  # crates/m3-core-py -> repo root
+# maturin copies python-source (`python/`) into the wheel, so a file staged at
+# python/m3_core_rs/<x> lands at m3_core_rs/<x> in the installed wheel — exactly
+# where m3-memory's embedder_admin._server_binary() looks first. This is where
+# we drop the m3-embed-server binary so it ships INSIDE the wheel.
+_PY_PKG_DIR = _HERE / "python" / "m3_core_rs"
+_EMBED_SERVER_BIN = "m3-embed-server"
 
 # The canonical build matrix. Key: (os, backend). Value: maturin Cargo
 # features to activate. The package name is derived as
@@ -115,6 +123,53 @@ def _patched_name(name: str):
         _PYPROJECT.write_text(original, encoding="utf-8")
 
 
+@contextlib.contextmanager
+def _staged_embed_server(features: list[str], release: bool):
+    """Build the m3-embed-server binary with the SAME backend as this wheel and
+    stage it under python/m3_core_rs/ so maturin bundles it into the wheel.
+
+    m3-embed-server is the shared-embedder baseline: every m3 process defers to
+    it on :8082 (one model in host RAM instead of N). It is a separate Cargo
+    [[bin]] crate, and `maturin build` packages only the Python extension
+    (cdylib), NOT bin targets — so historically the binary was silently dropped
+    from the wheel and the runtime fell back to the slower path. Building it here
+    with the matching feature (a cuda wheel ships a cuda server) and dropping it
+    into the python-source dir makes it ship in-wheel, where
+    embedder_admin._server_binary() already looks.
+
+    Cleans up the staged copy afterward so the source tree is never left dirty.
+    """
+    exe = _EMBED_SERVER_BIN + (".exe" if sys.platform.startswith("win") else "")
+    cmd = ["cargo", "build", "-p", "m3-embed-server"]
+    if release:
+        cmd.append("--release")
+    if features:
+        # The server crate mirrors m3-core-py's feature names (embedded,
+        # embedded-cuda/-vulkan/-metal), so the SAME feature list applies.
+        cmd += ["--features", ",".join(features)]
+    print(f"[build_wheel] building embed server: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=_WORKSPACE, env=os.environ.copy())
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"error: `cargo build -p m3-embed-server` failed (exit {proc.returncode}). "
+            "The shared-embedder binary is a baseline artifact — the wheel must not "
+            "ship without it. Fix the build rather than publishing a binary-less wheel."
+        )
+    profile = "release" if release else "debug"
+    built = _WORKSPACE / "target" / profile / exe
+    if not built.is_file():
+        raise SystemExit(f"error: expected embed-server binary not found at {built}")
+    _PY_PKG_DIR.mkdir(parents=True, exist_ok=True)
+    staged = _PY_PKG_DIR / exe
+    shutil.copy2(built, staged)
+    print(f"[build_wheel] staged {exe} -> {staged.relative_to(_HERE)}")
+    try:
+        yield
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            staged.unlink()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -145,7 +200,15 @@ def main(argv: list[str] | None = None) -> int:
     name = package_name(os_tok, args.backend)
     out_dir = args.out or str(_HERE.parent.parent / "dist" / name)
 
-    cmd = ["maturin", "build", "--out", out_dir]
+    # Invoke maturin via the `maturin` shim when it's on PATH, else fall back to
+    # `python -m maturin` (same interpreter). A venv that installed maturin as a
+    # dependency but doesn't have the Scripts/ shim on PATH would otherwise fail
+    # with a bare-command FileNotFoundError.
+    maturin_argv = (
+        ["maturin"] if shutil.which("maturin")
+        else [sys.executable, "-m", "maturin"]
+    )
+    cmd = [*maturin_argv, "build", "--out", out_dir]
     if args.release:
         cmd.append("--release")
     if features:
@@ -156,7 +219,10 @@ def main(argv: list[str] | None = None) -> int:
           f"features={features or '(none)'}")
     print(f"[build_wheel] {' '.join(cmd)}")
 
-    with _patched_name(name):
+    # Build + stage the shared-embedder binary FIRST (fails loud if it can't
+    # build), then build the wheel with the binary present in python-source so
+    # maturin bundles it. Both happen under the patched package name.
+    with _patched_name(name), _staged_embed_server(features, args.release):
         proc = subprocess.run(cmd, cwd=_HERE, env=os.environ.copy())
     return proc.returncode
 

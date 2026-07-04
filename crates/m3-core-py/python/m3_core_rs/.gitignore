@@ -1,0 +1,8 @@
+# Build-time artifacts staged into the package dir by build_wheel.py / maturin.
+# These are generated per-build (backend-specific) and must never be committed —
+# a stale committed binary would ship the wrong backend in a wheel.
+m3-embed-server
+m3-embed-server.exe
+*.pyd
+*.pdb
+__pycache__/

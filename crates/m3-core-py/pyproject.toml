@@ -18,3 +18,12 @@ features = ["pyo3/extension-module"]
 # feature build because Python ignores `PATH` for extension DLL resolution
 # since 3.8. See the docstring in that __init__.py.
 python-source = "python"
+# Bundle the shared-embedder binary that build_wheel.py stages into the package
+# dir at build time. It is NOT git-tracked (generated per-build with the wheel's
+# backend), so it must be listed explicitly or maturin would omit it — the exact
+# regression that silently shipped binary-less wheels. Path is relative to
+# python-source. See build_wheel.py::_staged_embed_server.
+include = [
+  { path = "m3_core_rs/m3-embed-server", format = "wheel" },
+  { path = "m3_core_rs/m3-embed-server.exe", format = "wheel" },
+]

@@ -20,6 +20,7 @@ independently-useful crates plus a PyO3 binding crate (`m3-core-py`) consumed by
 | `m3-fts` | 4 | FTS5 query sanitizer + lexical tokenizer |
 | `m3-governor` | 4 | Adaptive background-workload pacing logic (pure decision function) |
 | `m3-ingest` | 4 | Filesystem-walker hot path: parallel directory walk + batch content hashing |
+| `m3-embed-server` | 3b | OpenAI-compatible HTTP embedding server (the shared-embedder baseline; one server, many thin clients on :8082) |
 | `m3-core-py` | — | PyO3 bindings; the only crate Python sees |
 
 See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for per-operation speed measurements.
@@ -37,4 +38,38 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-`m3-core-py` builds as a Python wheel via `maturin`.
+`m3-core-py` builds as a Python wheel via `maturin`. See
+[`docs/PUBLISHING.md`](docs/PUBLISHING.md) for the per-machine release workflow
+and [`docs/BUILD_WHEELS.md`](docs/BUILD_WHEELS.md) for building your own.
+
+### Wheel matrix
+
+m3-core-rs publishes **7 packages** (one per OS × backend) across **CPython
+3.11–3.14** → a full release is **28 wheels**. Every wheel bundles **both**
+native artifacts: the in-process `EmbeddedEmbedder` (`m3_core_rs.*.{pyd,so}`)
+**and** the `m3-embed-server` shared-server binary
+(`m3_core_rs/m3-embed-server[.exe]`) — see `crates/m3-core-py/build_wheel.py`.
+`crates/m3-core-py/verify_wheels.py` asserts both are present, backend-matched,
+and RECORD-correct.
+
+The bundled `m3-embed-server` size tracks the backend, because GPU backends
+statically link a GPU-accelerated llama.cpp while **Metal links Apple's system
+framework dynamically** (so a Metal server is CPU-sized):
+
+| OS | cpu | vulkan | cuda | metal |
+|---|---|---|---|---|
+| **Windows** (`win_amd64`) | 7.6 MiB | 65.7 MiB | 138.4 MiB | — |
+| **Linux** (`manylinux`) | 8.3 MiB | 49.4 MiB | 621.5 MiB | — |
+| **macOS** (`macosx_11_0_arm64`, Apple Silicon) | — | — | — | 7.8 MiB |
+
+Sizes are the embedded `m3-embed-server` binary (MiB = 1024², as reported by
+`verify_wheels.py`), measured for the 3.7.4 release — all 28 wheels verified.
+macOS is Metal-only by design (Apple Silicon always has a Metal GPU).
+
+> **Linux-CUDA is large (~622 MiB binary → ~660 MB wheel).** The Linux CUDA build
+> statically embeds SASS+PTX kernels for every supported compute capability
+> (sm_75 → sm_121a); the `.text` section alone is ~122 MB (the binary is already
+> stripped — this is real kernel code, not debug symbols). It is ~4.5× the
+> Windows-CUDA binary and exceeds PyPI's default 100 MB per-file limit — publishing
+> requires a limit increase, or a size reduction (trim the compute-capability list,
+> or split PTX-only vs SASS builds).

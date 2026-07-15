@@ -22,18 +22,42 @@ Each (os, backend) ships across the supported CPython matrix: **3.11, 3.12,
 3.13, 3.14** (cp311–cp314). A full release is therefore 7 packages × 4
 interpreters = 28 wheels.
 
-## Two release workflows
+## Distribution policy: PyPI for wheels that fit, GitHub Release for all of them
 
-There are two ways these wheels get built and shipped. **The current,
-preferred workflow is local per-machine builds** (next section). The older
-all-in-CI flow is retained below as legacy reference — it was the original
-one-off mechanism and parts of it (the cross-platform `build_wheel.py`
-mapping, the GPU build gotchas) are still used by the local flow.
+Both destinations are used, split by size — they are not alternatives:
 
-| Workflow | Builds on | Distribution | Status |
-|----------|-----------|--------------|--------|
-| **Local per-machine** | one box per OS (Windows / Linux / macOS) | GitHub Release assets via `gh release upload` | **Current** |
-| CI `release.yml` | GitHub-hosted runners | PyPI Trusted Publishing | Legacy / one-off |
+- **PyPI** carries every wheel **that fits under PyPI's 100 MB per-file limit**
+  — CPU, Vulkan, and Metal (all ≤ ~65 MB). These resolve via
+  `pip install m3-core-rs-<os>-<backend>` and are how the `m3 setup` wizard
+  installs on most hosts.
+- **The GitHub Release** carries **every** wheel — a complete set including the
+  CUDA builds, which are far over PyPI's limit (Linux CUDA is ~600 MB–1 GB
+  depending on version; see below). It is the guaranteed source of truth for
+  the whole matrix, and the only home for CUDA today.
+
+The wizard resolves **PyPI first, then the GitHub Release**, so a host always
+finds its wheel regardless of which destination holds it. CUDA is not a
+second-class backend — it's the fastest one and ships complete; it lives on the
+Release only because a self-contained ~1 GB wheel can't go on PyPI. (A PyPI
+file-size-limit increase has been requested upstream; until it lands, CUDA
+stays on the Release. The CI workflow re-attempts the PyPI upload every release,
+so it starts publishing automatically if the limit rises.)
+
+## Two build workflows
+
+Distribution is by size (above); *building* has two paths.
+
+| Workflow | Builds on | Publishes to | When |
+|----------|-----------|--------------|------|
+| **Local per-machine** | one box per OS (Windows / Linux / macOS) | GitHub Release via `gh release upload` | routine releases; GPU wheels verified on real hardware |
+| CI `release.yml` | GitHub-hosted runners | PyPI (wheels that fit) **and** GitHub Release (all wheels) | Linux CUDA (no local NVIDIA box); the automated tag-push path |
+
+The local flow is preferred for hand-controlled waves and hardware-verified GPU
+wheels. The CI flow builds all seven on native runners and, on a `v*` tag,
+attempts PyPI for each (CUDA fails non-fatally on size) **and** attaches the
+complete set to the Release — so a single tag push produces both destinations.
+The two share `build_wheel.py` (the name/feature mapping) and the GPU build
+gotchas below.
 
 ## Current workflow — build locally on each platform's box
 
@@ -58,7 +82,7 @@ Notes that bite if forgotten:
 
 - **Linux CUDA needs an NVIDIA GPU + CUDA toolkit.** If your Linux build host
   has no NVIDIA GPU (e.g. an AMD/integrated-GPU box), **build Linux CUDA via CI
-  instead** (see legacy section) — that box can still build and verify Vulkan
+  instead** (see the CI workflow section) — that box can still build and verify Vulkan
   on its own GPU.
 - **Login shell on the Linux box:** if rust/maturin/uv were installed per-user
   (cargo/uv under `~`), they are only on `PATH` in a **login** shell — run
@@ -148,17 +172,27 @@ MSBuild ExternalProject batch-label bug (`VCEnd`) while building
 environment, with `glslc` on PATH) to avoid it. The CI workflow does this
 automatically for every GPU build.
 
-## Legacy / one-off: CI `.github/workflows/release.yml`
+## CI `.github/workflows/release.yml` — the automated tag-push path
 
-> This is the **original** publishing mechanism — an all-in-CI build of every
-> wheel, published straight to PyPI via Trusted Publishing. The local
-> per-machine workflow above has superseded it for routine releases. CI is
-> still the path for **Linux CUDA** (the local Linux box has no NVIDIA GPU),
-> and remains a valid fallback for any backend.
+> The all-in-CI build: every wheel built on native runners on a `v*` tag push.
+> The local per-machine workflow above is preferred for hand-controlled waves
+> and hardware-verified GPU wheels, but CI is the path for **Linux CUDA** (the
+> local Linux box has no NVIDIA GPU) and a valid fallback for any backend.
 
 Triggered on a `v*` tag push (or `workflow_dispatch` with `publish=false` to
-build-only). It builds all seven wheels on native runners and publishes each
-to its PyPI project.
+build-only). It builds all seven wheels on native runners, then in two jobs:
+
+- **`publish`** — attempts to upload each package to its PyPI project. The CPU /
+  Vulkan / Metal wheels publish normally. The CUDA publish step is
+  `continue-on-error` (with `fail-fast: false` on the matrix), so PyPI rejecting
+  an over-limit CUDA wheel is a *skipped* job, not a failed run — and if PyPI's
+  limit ever rises (a limit increase has been requested upstream), CUDA will
+  start publishing automatically with no workflow change.
+- **`publish-github-release`** — downloads **all** built wheels and attaches them
+  to the tag's GitHub Release, so the Release is always the complete set
+  regardless of what PyPI accepted.
+
+So one tag push populates both destinations per the size policy above.
 
 GitHub-hosted runners have **no GPU** — that is fine. CI *builds* the backends
 (nvcc compiles CUDA kernels, glslc compiles Vulkan shaders); it never runs
@@ -181,14 +215,13 @@ with `publish=false` and pull the `linux-cuda` artifact. The known-good config:
   CUDA runtime is statically linked into the extension `.so` (tag
   `manylinux_2_39`).
 
-## PyPI Trusted Publishing — one-time human setup (legacy CI path)
+## PyPI Trusted Publishing — one-time human setup (CI PyPI path)
 
-Applies only to the CI `release.yml` PyPI-publish path above; the local
-workflow attaches wheels to a GitHub Release instead and does not touch PyPI.
-Publishing via CI uses [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+Applies to the CI `release.yml` PyPI-publish job; the local build workflow
+attaches wheels to a GitHub Release instead and does not touch PyPI. Publishing
+via CI uses [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
 (OIDC) — no API tokens are stored in the repo. Before the workflow can publish,
-**each of the seven PyPI projects** must register this repo + workflow as a
-trusted publisher:
+**each PyPI project** must register this repo + workflow as a trusted publisher:
 
 For every package `m3-core-rs-<os>-<backend>`:
 
@@ -200,8 +233,24 @@ For every package `m3-core-rs-<os>-<backend>`:
    - **Environment:** `pypi-<os>-<backend>` (e.g. `pypi-windows-cuda`) —
      must match the `environment.name` in the publish job's matrix.
 
-Until all seven are registered, run the workflow with `publish=false` and grab
-the wheels from the run's artifacts.
+> **Setup is a two-pass process because PyPI caps *pending* publishers at 3.**
+> A pending publisher (registered before the project's first upload) occupies
+> one of three slots; once it actually publishes once, it becomes a real project
+> and frees its slot. So register the first 3, publish them, then register the
+> next batch. A publisher binds `(repo, workflow, environment) → one fixed
+> package name` and can't be re-pointed at another backend.
+>
+> **Current registration state (as of the last setup pass):** the 3 Windows
+> publishers (`pypi-windows-{cpu,cuda,vulkan}`) are registered; `linux-{cpu,cuda,
+> vulkan}` and `macos-metal` are **not yet** — they're waiting on the Windows 3
+> to publish and free the pending slots. Note the CUDA projects still won't
+> accept an over-limit wheel even once registered — that's expected; CUDA lives
+> on the Release (see the distribution policy).
+
+Until the projects you need are registered, run the workflow with
+`publish=false` and grab the wheels from the run's artifacts (the
+`publish-github-release` job still attaches the complete set to the Release on a
+real tag push).
 
 ## Version / tag alignment
 

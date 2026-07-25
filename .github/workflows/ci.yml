@@ -1,0 +1,85 @@
+name: m3-core-rs CI
+
+# Why this exists: release.yml is triggered ONLY by a `v*` tag push, so until
+# now nothing ran cargo check / clippy / test on ordinary commits. A compile
+# error on a platform the author did not build on — trivially easy in this
+# repo, which is dense with `#[cfg(unix)]` / `#[cfg(windows)]` arms — was not
+# discovered until a release was already tagged and its wheel jobs failed.
+# That is the worst possible time to find it: the tag exists, the release is
+# half-published, and the fix needs a new tag.
+#
+# This runs the cheap checks on every push/PR, on all three OSes, so a
+# platform-gated mistake fails in minutes on the commit that caused it.
+# Deliberately does NOT build wheels (that is release.yml's job, and the CUDA
+# wheels are ~1 GB) — `cargo check` on the default feature set catches the
+# class of bug this is for.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+
+    - name: Install the Rust toolchain
+      run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
+
+    - name: Cache cargo registry + target
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.0.2
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-
+
+    # The whole workspace, default features. This is the gate that catches a
+    # cfg-gated arm that only compiles on the author's platform.
+    - name: cargo check (workspace)
+      run: cargo check --workspace --all-targets
+
+    # m3-embed-server's real behaviour lives behind the `embedded` feature —
+    # including the platform-split shutdown_signal — so the default-feature
+    # check above does not compile it. Check it explicitly.
+    - name: cargo check (m3-embed-server, embedded feature)
+      run: cargo check -p m3-embed-server --features embedded --all-targets
+
+    - name: cargo test (workspace)
+      run: cargo test --workspace
+
+    - name: cargo test (m3-embed-server, embedded feature)
+      run: cargo test -p m3-embed-server --features embedded
+
+    # NOT `-D warnings` (yet). The workspace carries 14 pre-existing clippy
+    # warnings (items-after-test-module, no-effect operations, ...). Turning
+    # them into errors would make this gate red on its first run, and a CI job
+    # that is red on arrival gets ignored or switched off — which would cost
+    # the cross-platform coverage this workflow exists to provide.
+    #
+    # So: report the backlog, do not block on it. The `check` and `test` steps
+    # above ARE hard gates, and they are what catch the platform-gated compile
+    # errors this file was added for. Tighten to `-D warnings` in a separate
+    # change that also clears the 14, so the flip is a one-line no-op.
+    - name: cargo clippy (advisory — existing warnings do not fail the build)
+      continue-on-error: true
+      run: cargo clippy --workspace --all-targets

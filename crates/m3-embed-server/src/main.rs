@@ -86,7 +86,8 @@ fn print_help() {
            m3-embed-server [SUBCOMMAND]\n\
          \n\
          SUBCOMMANDS:\n  \
-           (none)        run in foreground (dev mode); Ctrl-C / SIGTERM to stop\n  \
+           (none)        run in foreground (dev mode); Ctrl-C to stop \
+(also SIGTERM on Unix, console close/shutdown on Windows)\n  \
            install       {install_line}\n  \
            uninstall     stop and remove the OS service\n  \
            start         start the installed service\n  \
@@ -142,10 +143,41 @@ async fn shutdown_signal() {
     }
 }
 
+/// Windows foreground mode. There is no SIGTERM on Windows, so the equivalent
+/// stop signals are the console control events: CTRL_CLOSE (window closed),
+/// CTRL_SHUTDOWN (system shutting down) and CTRL_LOGOFF. Waiting on ctrl-c
+/// ALONE — as this did — meant every stop that was not a literal Ctrl-C keypress
+/// hard-killed the process mid-request instead of draining, despite the usage
+/// text promising "Ctrl-C / SIGTERM to stop".
+///
+/// The installed SERVICE path is unaffected: it drains via the SCM
+/// `ServiceControl::Stop`/`Shutdown` handler in service.rs. This is the
+/// foreground/dev path only.
 #[cfg(all(feature = "embedded", not(unix)))]
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    log::info!("ctrl-c received, draining...");
+    use tokio::signal::windows;
+
+    // Each listener is independent; if one cannot be installed we still honor
+    // the others rather than losing graceful shutdown entirely.
+    let mut close = windows::ctrl_close().ok();
+    let mut shutdown = windows::ctrl_shutdown().ok();
+    let mut logoff = windows::ctrl_logoff().ok();
+
+    // Helper: a future that never resolves, standing in for a listener we could
+    // not install, so `select!` still compiles with a uniform shape.
+    async fn never() {
+        std::future::pending::<()>().await
+    }
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => log::info!("ctrl-c received, draining..."),
+        _ = async { match close.as_mut() { Some(s) => { s.recv().await; }, None => never().await } } =>
+            log::info!("console close received, draining..."),
+        _ = async { match shutdown.as_mut() { Some(s) => { s.recv().await; }, None => never().await } } =>
+            log::info!("system shutdown received, draining..."),
+        _ = async { match logoff.as_mut() { Some(s) => { s.recv().await; }, None => never().await } } =>
+            log::info!("logoff received, draining..."),
+    }
 }
 
 // ---------------------------------------------------------------------------

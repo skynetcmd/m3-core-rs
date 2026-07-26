@@ -271,13 +271,28 @@ def build_one(
     # --remap-path-prefix doesn't reach those. Pass the equivalent
     # -ffile-prefix-map to clang/gcc through CFLAGS / CXXFLAGS so __FILE__
     # macros and DWARF debug info are scrubbed there too.
-    cc_remaps = " ".join([
-        f"-ffile-prefix-map={cargo_home}=/cargo",
-        f"-ffile-prefix-map={str(_REPO_ROOT)}=/m3-core-rs",
-        f"-ffile-prefix-map={home}=/home",
-    ])
-    for var in ("CFLAGS", "CXXFLAGS"):
-        env[var] = (env.get(var, "").strip() + " " + cc_remaps).strip()
+    #
+    # POSIX TOOLCHAINS ONLY. MSVC's cl.exe does not understand
+    # -ffile-prefix-map: it emits "Command line warning D9002: ignoring unknown
+    # option" and carries on — harmless for the top-level build, but llama.cpp's
+    # Vulkan backend spawns vulkan-shaders-gen as a NESTED cmake ExternalProject
+    # whose compiler-detection TryCompile inherits CFLAGS and then dies with
+    # "fatal error C1083: Cannot open compiler generated file: '': Invalid
+    # argument". That killed every Windows Vulkan build through this driver
+    # while the same build ran green from a hand-rolled invocation that did not
+    # set CFLAGS (diagnosed 2026-07-26).
+    #
+    # Nothing is lost by skipping it on Windows: the flag was already being
+    # ignored there, so the path-scrubbing it provides never applied to MSVC
+    # objects in the first place. (PDBs are not shipped in the wheel.)
+    if os.name != "nt":
+        cc_remaps = " ".join([
+            f"-ffile-prefix-map={cargo_home}=/cargo",
+            f"-ffile-prefix-map={str(_REPO_ROOT)}=/m3-core-rs",
+            f"-ffile-prefix-map={home}=/home",
+        ])
+        for var in ("CFLAGS", "CXXFLAGS"):
+            env[var] = (env.get(var, "").strip() + " " + cc_remaps).strip()
     extra: list[str] = []
     if use_zig:
         extra.append("--zig")
@@ -316,6 +331,54 @@ def build_one(
                   "Build Tools with the C++ workload.")
 
         env.setdefault("CMAKE_GENERATOR", "Ninja")
+
+        # llama.cpp's Vulkan backend builds vulkan-shaders-gen as a NESTED cmake
+        # ExternalProject. Its compiler-detection TryCompile lands ~208
+        # characters below the repo root:
+        #   target/release/build/llama-cpp-sys-2-<hash>/out/build/ggml/src/
+        #   ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build/
+        #   CMakeFiles/CMakeScratch/TryCompile-<rand>/CMakeFiles/cmTC_<rand>.dir
+        # cmake refuses to place an object file when that exceeds
+        # CMAKE_OBJECT_PATH_MAX (default 250) and the compiler test then fails
+        # with "fatal error C1083: Cannot open compiler generated file: '':
+        # Invalid argument" — which names neither cmake nor path length, so it
+        # reads like a broken toolchain. cmake DOES say so, but only in a
+        # warning ~15 lines above the error.
+        #
+        # Raising CMAKE_OBJECT_PATH_MAX does NOT work and was tried: the value
+        # reaches the PARENT cmake (visible as -DCMAKE_OBJECT_PATH_MAX=1000 on
+        # its command line) but ExternalProject_Add forwards only the explicit
+        # CMAKE_ARGS list that ggml-vulkan/CMakeLists.txt builds, and that list
+        # does not include it — so the nested build still uses the 250 default.
+        # Patching upstream llama.cpp in a vendored registry checkout is not an
+        # option, so shorten the path instead of raising the ceiling.
+        #
+        # CARGO_TARGET_DIR is the only lever that moves the whole tree: the
+        # ~208-char suffix below it is fixed by llama.cpp's layout.
+        #     C:\Users\<user>\.m3-dev\m3-core-rs\target  (40) -> 241, 9 spare
+        #     C:\m3t                                     (6) -> 207, 43 spare
+        # Only set when the default would be too tight, so a repo already at a
+        # short path keeps its normal target/ dir and its warm cache.
+        # 204 is measured from cmake's OWN diagnostic: it printed the failing
+        # dir as 244 chars against a 40-char target prefix. And the 250 cap
+        # covers the dir PLUS the object filename (~12 more, e.g.
+        # 9b49cb7c.obj), so the effective ceiling on the directory is ~238, not
+        # 250 — a build can be "under 250" and still fail, which is exactly
+        # what happened here at 244. Relocate with 30 chars of margin so a
+        # build that squeaks under today does not break on the next path change.
+        default_target = _REPO_ROOT / "target"
+        _NESTED_SUFFIX = 204   # measured from cmake's own diagnostic
+        _DIR_CEILING = 238     # 250 minus room for the object filename
+        if not env.get("CARGO_TARGET_DIR") and \
+                len(str(default_target)) + _NESTED_SUFFIX >= _DIR_CEILING - 30:
+            short_target = os.environ.get("SystemDrive", "C:") + os.sep + "m3t"
+            os.makedirs(short_target, exist_ok=True)
+            env["CARGO_TARGET_DIR"] = short_target
+            print(f"[build_local] {backend}: CARGO_TARGET_DIR -> {short_target} "
+                  f"(default path is {len(str(default_target)) + _NESTED_SUFFIX} "
+                  "chars at llama.cpp's nested vulkan-shaders-gen depth; cmake "
+                  "caps object paths at 250 and ExternalProject ignores "
+                  "CMAKE_OBJECT_PATH_MAX)")
 
         # glslc ships in the Vulkan SDK's Bin dir and is not on PATH by default.
         sdk = env.get("VULKAN_SDK")

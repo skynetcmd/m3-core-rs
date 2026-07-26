@@ -56,8 +56,8 @@ version** rides in the wheel filename's `cpXY` compatibility tag.
 2. **Python versions are NOT separate projects, tags, or publishers.** One
    project + version holds 4 wheels (`...-cp311-...`, `-cp312-`, `-cp313-`,
    `-cp314-`). pip picks the match. You never make a per-Python tag or
-   publisher — that fights the ecosystem. The git tag (`v2026.05.30`) stores
-   the **package version** (`3.5.30`) only.
+   publisher — that fights the ecosystem. The git tag (`v2026.7.25`) stores
+   the **package version** (`3.7.25`) only.
 
 ### Naming — use `build_wheel.py`, nothing else
 
@@ -68,7 +68,7 @@ the maturin call. **Always build through it.** A wheel built with a bare
 wizard's `pip install m3-core-rs-<os>-<backend>==<ver>` will **not** find it.
 
 > ⚠️ **Do NOT** use a `+cpu` / `+vulkan` PEP 440 *local version* label
-> (e.g. `m3_core_rs-3.5.30+vulkan-...`). PyPI **rejects local-version wheels on
+> (e.g. `m3_core_rs-3.7.25+vulkan-...`). PyPI **rejects local-version wheels on
 > upload**, and it doesn't match the wizard's per-project install. Any such
 > wheels currently attached to a GitHub Release are non-canonical and predate
 > this guide — re-build them through `build_wheel.py`.
@@ -282,7 +282,7 @@ python3.12 -m venv /tmp/v && /tmp/v/bin/python -m pip install <the>.whl
 
 # 1. Project name resolves the way the wizard installs it:
 /tmp/v/bin/python -m pip show m3-core-rs-linux-vulkan | grep -E '^Name|^Version'
-#   Name: m3-core-rs-linux-vulkan   Version: 3.5.30
+#   Name: m3-core-rs-linux-vulkan   Version: 3.7.25
 
 # 2. Imports as m3_core_rs:
 /tmp/v/bin/python -c "import m3_core_rs as m; print(m.embed_backend_label())"
@@ -319,7 +319,7 @@ from); **GitHub Releases** are an interim/secondary mirror.
 
 1. Bump `workspace.package.version` in the top-level `Cargo.toml` **and**
    `M3_CORE_RS_VERSION` / `M3_CORE_RS_GIT_TAG` in m3-memory's
-   `m3_memory/rust_core_install.py`, in lockstep. Current: `3.5.30` ↔ `v2026.05.30`.
+   `m3_memory/rust_core_install.py`, in lockstep. Current: `3.7.25` ↔ `v2026.7.25`.
 2. Ensure each target project has a **trusted publisher** registered on PyPI
    (owner `skynetcmd`, repo `m3-core-rs`, workflow `release.yml`, environment
    `pypi-<os>-<backend>`). See `docs/PUBLISHING.md`.
@@ -353,15 +353,22 @@ For users who can't reach PyPI yet (e.g. before all publishers are set up),
 attach the verified wheels to the `v<ver>` release as assets. Build a draft
 first; don't touch a published release's assets without intent:
 
+> **CI does this for you now.** `release.yml`'s `publish-github-release`
+> job attaches EVERY backend's wheels to the Release for the tag
+> automatically, so the manual commands below are only for a hand-built
+> or backfilled release. They are also the guaranteed path for CUDA,
+> whose wheels exceed PyPI's per-file limit (~970 MB linux-cuda) and are
+> expected to be rejected there.
+
 ```bash
-gh release create v2026.05.30 --draft --title "..." --notes "..." \
+gh release create v2026.7.25 --draft --title "..." --notes "..." \
     dist/m3-core-rs-linux-cpu/*.whl dist/m3-core-rs-linux-vulkan/*.whl
 # or attach to an existing draft:
-gh release upload v2026.05.30 <wheel>... --clobber
+gh release upload v2026.7.25 <wheel>... --clobber
 ```
 
 Install from a Release asset URL:
-`pip install https://github.com/skynetcmd/m3-core-rs/releases/download/v2026.05.30/<wheel>`
+`pip install https://github.com/skynetcmd/m3-core-rs/releases/download/v2026.7.25/<wheel>`
 
 > Wheels are build outputs, **not** source — they're `.gitignore`d in both
 > repos (`*.whl`, `dist/`). Never `git add` a wheel.
@@ -574,7 +581,14 @@ Notes that save time on a re-run:
 
 ---
 
-## 8. Current state (2026-05-31)
+## 8. Release history
+
+> Dated snapshots, newest last. These record what was true AT THE TIME —
+> the version numbers in them are deliberately NOT updated on a bump, or
+> the history stops being history. For the current pinned version see
+> §5a and m3-memory's `rust_core_install.py`.
+
+### Snapshot 2026-05-31
 
 - ✅ **Linux CPU + Vulkan**, cp311–cp314 (8 wheels): built via `build_wheel.py`,
   verified (Vulkan does real BGE-M3 GPU offload on the iGPU); attached to the

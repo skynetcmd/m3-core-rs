@@ -437,10 +437,21 @@ mod tests {
         // span(start=0,width=2) -> [0,2) score 0.95
         // span(start=1,width=1) -> [1,2) score 0.6  (overlaps, lower score -> dropped)
         // span(start=2,width=1) -> [2,3) score 0.7  (no overlap -> kept)
-        let mut scores = vec![0.0; 3 * 2 * 1];
-        scores[(0 * 2 + 1) * 1] = 0.95; // start 0, width idx 1 -> [0,2)
-        scores[(1 * 2 + 0) * 1] = 0.6; // start 1, width idx 0 -> [1,2)
-        scores[(2 * 2 + 0) * 1] = 0.7; // start 2, width idx 0 -> [2,3)
+        // Index the (span, width, label) tensor by name rather than by hand.
+        // The literal arithmetic this replaces — `(0 * 2 + 1) * 1` — documented
+        // the layout but tripped clippy's erasing_op/identity_op (the `* 1` and
+        // `+ 0` terms are meaningful to a reader and meaningless to the
+        // compiler). A helper keeps the intent legible AND the lint clean.
+        const N_WIDTHS: usize = 2;
+        const N_LABELS: usize = 1;
+        let idx = |start: usize, width_idx: usize, label: usize| {
+            (start * N_WIDTHS + width_idx) * N_LABELS + label
+        };
+
+        let mut scores = vec![0.0; 3 * N_WIDTHS * N_LABELS];
+        scores[idx(0, 1, 0)] = 0.95; // start 0, width idx 1 -> [0,2)
+        scores[idx(1, 0, 0)] = 0.6; // start 1, width idx 0 -> [1,2)
+        scores[idx(2, 0, 0)] = 0.7; // start 2, width idx 0 -> [2,3)
         let spans = decode_spans(&scores, (3, 2, 1), 0.5);
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0], Span { start: 0, end: 2, label: 0, score: 0.95 });

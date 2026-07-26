@@ -70,16 +70,15 @@ jobs:
     - name: cargo test (m3-embed-server, embedded feature)
       run: cargo test -p m3-embed-server --features embedded
 
-    # NOT `-D warnings` (yet). The workspace carries 14 pre-existing clippy
-    # warnings (items-after-test-module, no-effect operations, ...). Turning
-    # them into errors would make this gate red on its first run, and a CI job
-    # that is red on arrival gets ignored or switched off — which would cost
-    # the cross-platform coverage this workflow exists to provide.
-    #
-    # So: report the backlog, do not block on it. The `check` and `test` steps
-    # above ARE hard gates, and they are what catch the platform-gated compile
-    # errors this file was added for. Tighten to `-D warnings` in a separate
-    # change that also clears the 14, so the flip is a one-line no-op.
-    - name: cargo clippy (advisory — existing warnings do not fail the build)
-      continue-on-error: true
-      run: cargo clippy --workspace --all-targets
+    # `-D warnings`: the workspace is clippy-clean, so any NEW warning fails the
+    # build rather than joining a backlog nobody reads. The 14 pre-existing
+    # warnings this gate used to tolerate were cleared in the same change that
+    # flipped it, so this has never been red.
+    - name: cargo clippy (workspace)
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
+    # The embedded feature compiles a different set of cfg arms (notably the
+    # platform-split shutdown_signal), so it needs its own lint pass — a clean
+    # default-feature run says nothing about it.
+    - name: cargo clippy (m3-embed-server, embedded feature)
+      run: cargo clippy -p m3-embed-server --features embedded --all-targets -- -D warnings

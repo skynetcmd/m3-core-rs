@@ -446,6 +446,120 @@ pub fn mmr_rerank_scored(
     Ok(selected)
 }
 
+
+/// Token-set Jaccard similarity, lowercased, punctuation-stripped.
+///
+/// Strips anything that is not alphanumeric, whitespace, or underscore
+/// (approximate parity with Python's `[^\w\s]` regex).
+pub fn token_jaccard(a: &str, b: &str) -> f32 {
+    let ta = tokenize(a);
+    let tb = tokenize(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let intersection = ta.intersection(&tb).count() as f32;
+    let union = ta.union(&tb).count() as f32;
+    intersection / union
+}
+
+/// Batch token-set Jaccard similarity.
+///
+/// Returns a vector of scores, one per candidate, in parallel via rayon.
+pub fn token_jaccard_batch(query: &str, candidates: &[&str]) -> Vec<f32> {
+    let q_tokens = tokenize(query);
+    if q_tokens.is_empty() {
+        return vec![0.0; candidates.len()];
+    }
+    candidates
+        .par_iter()
+        .map(|c| {
+            let c_tokens = tokenize(c);
+            if c_tokens.is_empty() {
+                return 0.0;
+            }
+            let intersection = q_tokens.intersection(&c_tokens).count() as f32;
+            let union = q_tokens.union(&c_tokens).count() as f32;
+            intersection / union
+        })
+        .collect()
+}
+
+/// Combined content-dedup and MMR reranking.
+///
+/// 1. Sorts all candidates by relevance score descending.
+/// 2. Iterates and dedups by `contents[i].trim()`.
+/// 3. Runs MMR on the top `k*3` unique candidates.
+/// 4. Returns the top `k` selected indices in original index order.
+pub fn rank_hybrid(
+    relevance: &[f32],
+    contents: &[&str],
+    embeddings: &[&[f32]],
+    lambda: f32,
+    k: usize,
+) -> Result<Vec<usize>> {
+    let n = relevance.len();
+    if contents.len() != n || embeddings.len() != n {
+        return Err(M3Error::Other(format!(
+            "rank_hybrid length mismatch: relevance={}, contents={}, embeddings={}",
+            n, contents.len(), embeddings.len()
+        )));
+    }
+
+    // 1. Sort indices by relevance
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_unstable_by(|&a, &b| {
+        relevance[b]
+            .partial_cmp(&relevance[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // 2. Content dedup
+    let mut seen_content = std::collections::HashSet::new();
+    let mut pre_ranked_idx = Vec::new();
+    for idx in indices {
+        let c = contents[idx].trim();
+        if !c.is_empty() {
+            if seen_content.contains(c) {
+                continue;
+            }
+            seen_content.insert(c);
+        }
+        pre_ranked_idx.push(idx);
+        if pre_ranked_idx.len() >= k * 3 {
+            break;
+        }
+    }
+
+    if pre_ranked_idx.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 3. MMR
+    let mmr_relevance: Vec<f32> = pre_ranked_idx.iter().map(|&i| relevance[i]).collect();
+    let mmr_vecs: Vec<&[f32]> = pre_ranked_idx.iter().map(|&i| embeddings[i]).collect();
+
+    let sel_mmr_idx = mmr_rerank_scored(&mmr_relevance, &mmr_vecs, lambda, k, true)?;
+
+    // 4. Map back to original indices
+    Ok(sel_mmr_idx.iter().map(|&i| pre_ranked_idx[i]).collect())
+}
+
+fn tokenize(s: &str) -> std::collections::HashSet<String> {
+    s.to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() || c == '_' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|t| t.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,7 +606,7 @@ mod tests {
         let b2 = f32_as_blob(v2).to_vec();
         let blobs: Vec<&[u8]> = vec![&b0, &b1, &b2];
         let got = cosine_batch_packed(q, &blobs, 4).unwrap();
-        let want = vec![
+        let want = [
             cosine_unchecked(q, v0),
             cosine_unchecked(q, v1),
             cosine_unchecked(q, v2),
@@ -683,117 +797,4 @@ mod tests {
         // No tokens
         assert_eq!(token_jaccard("!!!", "???"), 0.0);
     }
-}
-
-/// Token-set Jaccard similarity, lowercased, punctuation-stripped.
-///
-/// Strips anything that is not alphanumeric, whitespace, or underscore
-/// (approximate parity with Python's `[^\w\s]` regex).
-pub fn token_jaccard(a: &str, b: &str) -> f32 {
-    let ta = tokenize(a);
-    let tb = tokenize(b);
-    if ta.is_empty() || tb.is_empty() {
-        return 0.0;
-    }
-    let intersection = ta.intersection(&tb).count() as f32;
-    let union = ta.union(&tb).count() as f32;
-    intersection / union
-}
-
-/// Batch token-set Jaccard similarity.
-///
-/// Returns a vector of scores, one per candidate, in parallel via rayon.
-pub fn token_jaccard_batch(query: &str, candidates: &[&str]) -> Vec<f32> {
-    let q_tokens = tokenize(query);
-    if q_tokens.is_empty() {
-        return vec![0.0; candidates.len()];
-    }
-    candidates
-        .par_iter()
-        .map(|c| {
-            let c_tokens = tokenize(c);
-            if c_tokens.is_empty() {
-                return 0.0;
-            }
-            let intersection = q_tokens.intersection(&c_tokens).count() as f32;
-            let union = q_tokens.union(&c_tokens).count() as f32;
-            intersection / union
-        })
-        .collect()
-}
-
-/// Combined content-dedup and MMR reranking.
-///
-/// 1. Sorts all candidates by relevance score descending.
-/// 2. Iterates and dedups by `contents[i].trim()`.
-/// 3. Runs MMR on the top `k*3` unique candidates.
-/// 4. Returns the top `k` selected indices in original index order.
-pub fn rank_hybrid(
-    relevance: &[f32],
-    contents: &[&str],
-    embeddings: &[&[f32]],
-    lambda: f32,
-    k: usize,
-) -> Result<Vec<usize>> {
-    let n = relevance.len();
-    if contents.len() != n || embeddings.len() != n {
-        return Err(M3Error::Other(format!(
-            "rank_hybrid length mismatch: relevance={}, contents={}, embeddings={}",
-            n, contents.len(), embeddings.len()
-        )));
-    }
-
-    // 1. Sort indices by relevance
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_unstable_by(|&a, &b| {
-        relevance[b]
-            .partial_cmp(&relevance[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // 2. Content dedup
-    let mut seen_content = std::collections::HashSet::new();
-    let mut pre_ranked_idx = Vec::new();
-    for idx in indices {
-        let c = contents[idx].trim();
-        if !c.is_empty() {
-            if seen_content.contains(c) {
-                continue;
-            }
-            seen_content.insert(c);
-        }
-        pre_ranked_idx.push(idx);
-        if pre_ranked_idx.len() >= k * 3 {
-            break;
-        }
-    }
-
-    if pre_ranked_idx.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // 3. MMR
-    let mmr_relevance: Vec<f32> = pre_ranked_idx.iter().map(|&i| relevance[i]).collect();
-    let mmr_vecs: Vec<&[f32]> = pre_ranked_idx.iter().map(|&i| embeddings[i]).collect();
-
-    let sel_mmr_idx = mmr_rerank_scored(&mmr_relevance, &mmr_vecs, lambda, k, true)?;
-
-    // 4. Map back to original indices
-    Ok(sel_mmr_idx.iter().map(|&i| pre_ranked_idx[i]).collect())
-}
-
-fn tokenize(s: &str) -> std::collections::HashSet<String> {
-    s.to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c.is_whitespace() || c == '_' {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .map(|t| t.to_string())
-        .collect()
 }

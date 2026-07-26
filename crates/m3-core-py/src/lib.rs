@@ -1201,7 +1201,7 @@ fn format_log(
             let val = v_str.to_str()?;
             out.push_str(" | ");
             out.push_str(key);
-            out.push_str("=");
+            out.push('=');
             out.push_str(val);
         }
     }

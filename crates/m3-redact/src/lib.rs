@@ -241,6 +241,23 @@ impl Redactor {
     }
 }
 
+
+/// Convenience: build a throwaway `Redactor` and scrub in one call.
+/// Faithful to Python's per-call `compile_patterns()` + `scrub()`.
+///
+/// If `config.enabled` is false, returns `(content, 0, [])` immediately.
+pub fn scrub(content: &str, config: &RedactionConfig) -> ScrubResult {
+    if !config.enabled {
+        return ScrubResult {
+            content: content.to_string(),
+            match_count: 0,
+            groups_fired: Vec::new(),
+            compile_errors: Vec::new(),
+        };
+    }
+    Redactor::new(config).apply(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,20 +292,4 @@ mod tests {
         assert_eq!(out.match_count, 0);
         assert!(out.groups_fired.is_empty());
     }
-}
-
-/// Convenience: build a throwaway `Redactor` and scrub in one call.
-/// Faithful to Python's per-call `compile_patterns()` + `scrub()`.
-///
-/// If `config.enabled` is false, returns `(content, 0, [])` immediately.
-pub fn scrub(content: &str, config: &RedactionConfig) -> ScrubResult {
-    if !config.enabled {
-        return ScrubResult {
-            content: content.to_string(),
-            match_count: 0,
-            groups_fired: Vec::new(),
-            compile_errors: Vec::new(),
-        };
-    }
-    Redactor::new(config).apply(content)
 }

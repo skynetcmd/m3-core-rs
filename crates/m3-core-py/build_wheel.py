@@ -156,9 +156,54 @@ def _staged_embed_server(features: list[str], release: bool):
             "ship without it. Fix the build rather than publishing a binary-less wheel."
         )
     profile = "release" if release else "debug"
-    built = _WORKSPACE / "target" / profile / exe
+    # Honour CARGO_TARGET_DIR. Hardcoding <workspace>/target reads from a
+    # directory cargo may not have written to — and then silently ships whatever
+    # binary happens to be sitting there. That is not hypothetical: with
+    # CARGO_TARGET_DIR redirected (build_local.py does this on Windows to dodge
+    # cmake's object-path limit), the vulkan build wrote its 65 MB server to the
+    # relocated dir while this line picked up the 138 MB CUDA server left in
+    # <workspace>/target by an earlier build. The result was a
+    # m3-core-rs-windows-vulkan wheel containing a CUDA embed-server: it passed
+    # every existing check (binary present, plausible size, RECORD valid) and
+    # was only caught by scanning the binary for backend symbols. Caught before
+    # release, 2026-07-26.
+    target_root = Path(os.environ.get("CARGO_TARGET_DIR") or (_WORKSPACE / "target"))
+    built = target_root / profile / exe
     if not built.is_file():
-        raise SystemExit(f"error: expected embed-server binary not found at {built}")
+        raise SystemExit(
+            f"error: expected embed-server binary not found at {built}"
+            + (f" (CARGO_TARGET_DIR={os.environ['CARGO_TARGET_DIR']})"
+               if os.environ.get("CARGO_TARGET_DIR") else "")
+        )
+    # Assert the binary we are about to ship was actually built for THIS
+    # backend. The path fix above closes the known way a mismatched server got
+    # staged, but any future one (a silently-skipped rebuild, a stale artifact,
+    # a wrong --features) would be just as invisible: the wheel still contains
+    # "a binary of about the right size", which is all the downstream checks
+    # look at. Scanning for a backend-defining symbol is cheap and turns a
+    # silent mis-ship into a build failure.
+    _BACKEND_SYMBOL = {
+        "embedded-vulkan": (b"ggml_backend_vk", "Vulkan"),
+        "embedded-cuda": (b"ggml_backend_cuda", "CUDA"),
+        "embedded-metal": (b"ggml_backend_metal", "Metal"),
+    }
+    for feat, (needle, label) in _BACKEND_SYMBOL.items():
+        if feat not in features:
+            continue
+        blob = built.read_bytes()
+        if needle not in blob:
+            others = [
+                lbl for f, (n, lbl) in _BACKEND_SYMBOL.items()
+                if f != feat and n in blob
+            ]
+            raise SystemExit(
+                f"error: {built.name} was built for {features} but contains no "
+                f"{label} symbols"
+                + (f" (it looks like a {'/'.join(others)} build)" if others else "")
+                + f". Refusing to ship a wrong-backend embed-server. Path: {built}"
+            )
+        break
+
     _PY_PKG_DIR.mkdir(parents=True, exist_ok=True)
     staged = _PY_PKG_DIR / exe
     shutil.copy2(built, staged)

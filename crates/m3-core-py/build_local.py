@@ -46,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Reuse the single-source-of-truth mapping and helpers from build_wheel.py
@@ -146,6 +147,99 @@ def resolve_interpreter(version: str, *, install_missing: bool) -> str | None:
     return None
 
 
+def _vcvars_env() -> dict[str, str] | None:
+    """Environment produced by running MSVC's ``vcvars64.bat``, or None.
+
+    Windows GPU backends need the MSVC toolchain on PATH (cl.exe, link.exe, the
+    Windows SDK) before llama-cpp-sys's cmake step runs. A plain shell has none
+    of it, so the build dies deep inside cmake with errors that do not name the
+    real cause. Rather than require every caller to remember to launch from a
+    "x64 Native Tools" prompt, run vcvars64 in a subshell and lift the resulting
+    environment — the same thing that prompt does.
+
+    Discovery order: VSINSTALLDIR (already inside a dev shell), then vswhere
+    (the supported API, finds any edition), then the known BuildTools/Community
+    paths. Returns None when MSVC is not installed; the caller then proceeds
+    unchanged so a CPU-only box is unaffected.
+    """
+    if os.name != "nt":
+        return None
+
+    candidates: list[Path] = []
+    vsdir = os.environ.get("VSINSTALLDIR")
+    if vsdir:
+        candidates.append(Path(vsdir) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) \
+        / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        try:
+            found = subprocess.run(
+                [str(vswhere), "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, text=True, timeout=60,
+            ).stdout.strip()
+            if found:
+                candidates.append(Path(found) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+        except Exception:  # noqa: BLE001 — vswhere is best-effort discovery
+            pass
+
+    pf86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+    for edition in ("BuildTools", "Community", "Professional", "Enterprise"):
+        candidates.append(pf86 / "Microsoft Visual Studio" / "2022" / edition
+                          / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
+
+    bat = next((c for c in candidates if c.is_file()), None)
+    if bat is None:
+        return None
+
+    # `set` after vcvars64 dumps the fully-populated environment. The marker
+    # separates vcvars' own banner from the variable list.
+    #
+    # Driven through a temp .bat rather than `cmd /c "call ... && set"`: the
+    # inline form is brittle here — quoting/redirection inside the one-liner
+    # made cmd exit 1 with "The system cannot find the path specified" before
+    # vcvars even ran, while calling the same script on its own succeeded.
+    # A script file sidesteps cmd's parsing entirely.
+    #
+    # cwd is pinned to %SystemRoot%: this process may be launched from a path
+    # cmd cannot resolve (e.g. a Git-bash-style path), which makes cmd fail on
+    # startup regardless of what it was asked to do.
+    marker = "__M3_VCVARS_DONE__"
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False,
+                                         encoding="ascii") as fh:
+            fh.write("@echo off\n")
+            fh.write(f'call "{bat}" >nul 2>&1\n')
+            fh.write(f"echo {marker}\n")
+            fh.write("set\n")
+            tmp = fh.name
+        proc = subprocess.run(
+            ["cmd", "/c", tmp],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.environ.get("SystemRoot", r"C:\Windows"),
+        )
+    except Exception:  # noqa: BLE001 — never let discovery break the build
+        return None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if proc.returncode != 0 or marker not in proc.stdout:
+        return None
+
+    env: dict[str, str] = {}
+    for line in proc.stdout.split(marker, 1)[1].splitlines():
+        key, sep, val = line.partition("=")
+        if sep and key:
+            env[key] = val
+    return env or None
+
+
 def build_one(
     backend: str,
     os_tok: str,
@@ -187,6 +281,51 @@ def build_one(
     extra: list[str] = []
     if use_zig:
         extra.append("--zig")
+
+    # Windows GPU: the MSVC toolchain + the Ninja generator, both required.
+    #
+    # 1. MSVC must be on PATH before llama-cpp-sys's cmake step runs, which a
+    #    plain shell does not provide.
+    # 2. The Visual Studio CMake generator hits a CMake-4.x + MSBuild
+    #    ExternalProject batch-label bug (`VCEnd`) while building
+    #    vulkan-shaders-gen — the build fails with "The system cannot find the
+    #    batch label specified - VCEnd" and MSB8066. Forcing Ninja avoids it.
+    # 3. glslc (Vulkan SDK) must be on PATH for shader compilation.
+    #
+    # This was documented in WHEEL_BUILD_GUIDE.md §3b as something the operator
+    # had to set up by hand, and CI did it separately — so a local build failed
+    # for anyone who had not read that far. Doing it here means the driver is
+    # self-sufficient on Windows, matching what it already does for Linux CUDA
+    # below. Explicit env still wins: nothing is overwritten if the caller
+    # already ran vcvars (setdefault + only prepending to PATH).
+    if os_tok == "windows" and backend in ("cuda", "vulkan"):
+        vc = _vcvars_env()
+        if vc:
+            for key, val in vc.items():
+                if key.upper() == "PATH":
+                    continue
+                env.setdefault(key, val)
+            # PATH must MERGE, not be replaced: the caller's PATH carries uv,
+            # cargo and python, which vcvars64 knows nothing about.
+            vc_path = next((v for k, v in vc.items() if k.upper() == "PATH"), "")
+            if vc_path:
+                env["PATH"] = vc_path + os.pathsep + env.get("PATH", "")
+        else:
+            print(f"[build_local] WARNING: MSVC (vcvars64) not found — {backend} "
+                  "will likely fail in llama-cpp-sys's cmake step. Install VS "
+                  "Build Tools with the C++ workload.")
+
+        env.setdefault("CMAKE_GENERATOR", "Ninja")
+
+        # glslc ships in the Vulkan SDK's Bin dir and is not on PATH by default.
+        sdk = env.get("VULKAN_SDK")
+        if sdk:
+            sdk_bin = os.path.join(sdk, "Bin")
+            if os.path.isdir(sdk_bin) and sdk_bin.lower() not in env.get("PATH", "").lower():
+                env["PATH"] = sdk_bin + os.pathsep + env.get("PATH", "")
+        elif backend == "vulkan":
+            print("[build_local] WARNING: VULKAN_SDK is unset — glslc will not be "
+                  "found and the Vulkan shader build will fail.")
 
     # Linux CUDA needs several things the generic path doesn't (see PUBLISHING.md
     # "Linux CUDA build recipe"):

@@ -455,6 +455,29 @@ when it returns.
 
 ## 7. Gotchas (learned the hard way)
 
+- **A failed build POISONS the next one via `CMakeCache.txt`.** cmake writes the
+  resolved compiler flags into its cache, and reuses them on every subsequent
+  configure — so a build that failed because of a bad flag keeps failing with the
+  *identical* error after you fix the flag. The obvious conclusion ("my fix
+  didn't work") is wrong. This cost real time on 2026-07-26. Fix: wipe the
+  nested cmake tree, not just `cargo clean`:
+  `rm -rf target/release/build/llama-cpp-sys-2-*/out/build`. Verify with
+  `grep <the-flag> target/release/build/llama-cpp-sys-2-*/out/build/CMakeCache.txt`
+  — an empty result means the cache is genuinely clean.
+
+- **Windows Vulkan: `fatal error C1083: Cannot open compiler generated file: ''`.**
+  Reads like a broken MSVC install; it is actually cmake's 250-char
+  `CMAKE_OBJECT_PATH_MAX` being exceeded. llama.cpp builds `vulkan-shaders-gen`
+  as a nested `ExternalProject`, whose TryCompile lands ~204 chars below the
+  cargo target dir, so a normal user clone path overflows. cmake says so — but
+  in a warning ~15 lines *above* the error. Two traps: (a) the cap covers the
+  directory PLUS the object filename (~12 more), so "under 250" can still fail
+  (observed failing at 244); (b) raising `CMAKE_OBJECT_PATH_MAX` does NOT help,
+  because `ExternalProject_Add` forwards only the explicit `CMAKE_ARGS` list and
+  that variable is not in it. Fix: shorten the path —
+  `CARGO_TARGET_DIR=C:\m3t`. `build_local.py` now does this automatically when
+  the default would be tight.
+
 - **Stale 0-byte `.so` after a failed build.** A failed maturin run can leave an
   empty `target/release/libm3_core_rs.so`; cargo then sees it as fresh and skips
   the relink (`0.09s Finished`), and patchelf fails `missing ELF header`. Fix:

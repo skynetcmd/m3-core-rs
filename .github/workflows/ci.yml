@@ -25,6 +25,18 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # m3-core-py builds pyo3 with `extension-module`, which deliberately does NOT
+  # link libpython: a Python extension resolves _PyExc_* / _Py* at import time
+  # from the host interpreter. Linux and Windows tolerate the resulting
+  # undefined symbols in a cdylib; macOS's linker rejects them outright, so a
+  # bare `cargo test` fails at link with "Undefined symbols for architecture
+  # arm64: _PyExc_AttributeError, ...".
+  #
+  # release.yml never hits this because it builds through maturin, which injects
+  # these link args itself. This CI calls cargo directly, so it must supply
+  # them. `dynamic_lookup` is the same mechanism maturin uses — defer the
+  # symbols to load time rather than requiring them at link time.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
   check:
@@ -55,6 +67,12 @@ jobs:
 
     # The whole workspace, default features. This is the gate that catches a
     # cfg-gated arm that only compiles on the author's platform.
+    # macOS only: see the MACOSX_DEPLOYMENT_TARGET note above. Setting this as
+    # a step (not a job-level env) keeps Linux/Windows link lines untouched.
+    - name: Allow undefined Python symbols (macOS pyo3 extension-module)
+      if: runner.os == 'macOS'
+      run: echo 'RUSTFLAGS=-C link-arg=-undefined -C link-arg=dynamic_lookup' >> "$GITHUB_ENV"
+
     - name: cargo check (workspace)
       run: cargo check --workspace --all-targets
 

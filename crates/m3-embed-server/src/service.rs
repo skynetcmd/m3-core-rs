@@ -204,6 +204,25 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
+    // Idempotency: `create_service` on an existing service fails with
+    // ERROR_SERVICE_EXISTS (1073), which `windows-service` flattens into the
+    // opaque "IO error in winapi call" — indistinguishable from a permission
+    // failure. m3 setup then declared the embedder "SKIPPED (not installed)"
+    // and told the operator to re-run elevated, while the service was already
+    // registered, Automatic, and serving :8082. Re-registering is a no-op, so
+    // report success rather than erroring.
+    if let Ok(existing) = service_manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        let state = existing.query_status().map(|s| s.current_state).ok();
+        println!("service already installed: {SERVICE_NAME}");
+        match state {
+            Some(ServiceState::Running) => println!("state: running (nothing to do)"),
+            Some(_) => println!("state: stopped — start it with `m3-embed-server start`"),
+            None => println!("state: unknown (could not query SCM)"),
+        }
+        println!("to re-register from scratch: `m3-embed-server uninstall` then `install`");
+        return Ok(());
+    }
+
     let exe = std::env::current_exe()?;
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),

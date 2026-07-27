@@ -207,8 +207,47 @@ def test_dispatcher_and_env() -> None:
     del os.environ["M3_EMBED_STREAMS"]
 
 
+def test_version() -> None:
+    """__version__ must exist AND match the installed wheel's metadata.
+
+    m3-memory's rust_core_install reads getattr(m3_core_rs, "__version__",
+    None). When that was absent, is_rust_core_current() took its conservative
+    "assume stale" branch and every `m3 setup` re-downloaded the core --
+    244 MB on windows-cuda, ~949 MB on linux-cuda, on every run.
+
+    The equality check is the point: __version__ comes from CARGO_PKG_VERSION at
+    compile time and the dist metadata from the wheel build, so a mismatch means
+    the two drifted and the skip-if-current logic would be trusting a lie.
+    """
+    assert hasattr(m, "__version__"), "m3_core_rs must export __version__"
+    ver = m.__version__
+    assert isinstance(ver, str) and ver, f"bad __version__: {ver!r}"
+    assert ver[0].isdigit(), f"__version__ should look like 3.7.25, got {ver!r}"
+
+    # Compare against whichever platform dist provided this module. The generic
+    # "m3-core-rs" name is a shim pinned at 0.0.0, so it is NOT authoritative --
+    # querying it is what made 3.7.25 look like 0.0.0 during diagnosis.
+    import importlib.metadata as md
+
+    seen = []
+    for dist in md.distributions():
+        name = (dist.metadata["Name"] or "").lower()
+        if not name.startswith("m3-core-rs"):
+            continue
+        dist_ver = dist.version
+        seen.append((name, dist_ver))
+        if dist_ver == "0.0.0":
+            continue  # umbrella/shim dist, not the real wheel
+        assert dist_ver == ver, (
+            f"module __version__ {ver!r} != dist {name} {dist_ver!r} -- "
+            "the PyO3 module and the wheel it shipped in have drifted"
+        )
+    assert seen, "no m3-core-rs* distribution found"
+
+
 def main() -> None:
     tests = [
+        test_version,
         test_hash,
         test_vector,
         test_redact,

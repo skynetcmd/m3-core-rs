@@ -1405,5 +1405,18 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "embedded")]
     m.add_class::<PyEmbeddedEmbedder>()?;
 
+    // Module version, taken from CARGO_PKG_VERSION at COMPILE time so it can
+    // never drift from the wheel it was built into.
+    //
+    // Its absence was not cosmetic. m3-memory's rust_core_install reads
+    // `getattr(m3_core_rs, "__version__", None)`; with nothing to read,
+    // is_rust_core_current() takes its deliberately conservative branch and
+    // reports "not current" for a wheel that IS current. The skip-if-current
+    // check therefore never fired and every `m3 setup` re-downloaded the core
+    // — 244 MB on windows-cuda, ~949 MB on linux-cuda, silently, on every run.
+    // The guard was right to distrust a missing version; the fix belongs here,
+    // at the producer.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+
     Ok(())
 }

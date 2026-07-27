@@ -319,7 +319,13 @@ from); **GitHub Releases** are an interim/secondary mirror.
 
 1. Bump `workspace.package.version` in the top-level `Cargo.toml` **and**
    `M3_CORE_RS_VERSION` / `M3_CORE_RS_GIT_TAG` in m3-memory's
-   `m3_memory/rust_core_install.py`, in lockstep. Current: `3.7.25` ↔ `v2026.7.25`.
+   `m3_memory/rust_core_install.py`, in lockstep. Current: `3.7.27` ↔ `v2026.7.27`.
+
+   > **CUDA does not publish to PyPI.** Its wheels (~949 MiB linux, ~244 MiB
+   > windows) are roughly 10x the 100 MB per-file limit, so `release.yml`'s
+   > publish matrix covers the 5 PyPI-eligible backends only and CUDA ships via
+   > the GitHub Release. Size is a barrier, not a hurdle — do not re-add CUDA to
+   > that matrix expecting a retry to succeed.
 2. Ensure each target project has a **trusted publisher** registered on PyPI
    (owner `skynetcmd`, repo `m3-core-rs`, workflow `release.yml`, environment
    `pypi-<os>-<backend>`). See `docs/PUBLISHING.md`.

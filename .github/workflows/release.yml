@@ -359,15 +359,28 @@ jobs:
   # package publishes from its own environment. They all pull from the same
   # build artifacts.
   #
-  # We ATTEMPT to publish every backend to PyPI, including CUDA. Today the CUDA
-  # wheels are far over PyPI's per-file limit (linux-cuda ~970 MB, windows-cuda
-  # ~256 MB) so PyPI rejects them — but that limit can change (or a size
-  # exception may be granted), and we'd rather try and let it succeed than
-  # hard-code an exclusion. The CUDA publish step is `continue-on-error`, so a
-  # size rejection is a yellow (skipped) job, not a failed run. Independently,
-  # the `publish-github-release` job below attaches ALL wheels (CUDA included)
-  # to the GitHub Release, so there is always a complete fallback set regardless
-  # of what PyPI accepts. See docs/CUDA_INSTALL.md in the m3-memory repo.
+  # CUDA is NOT published to PyPI: size is a barrier, not a hurdle. The wheels
+  # are ~949 MiB (linux-cuda) and ~244 MiB (windows-cuda) against a 100 MB
+  # per-file limit — an order of magnitude over, which no incremental slimming
+  # closes. GitHub Releases is their distribution channel BY DESIGN, and the
+  # `publish-github-release` job below attaches every wheel (CUDA included), so
+  # the Release is always the complete set. `m3 setup` resolves PyPI first, then
+  # falls back to the Release. See docs/CUDA_INSTALL.md in the m3-memory repo.
+  #
+  # This job therefore covers the 5 PyPI-eligible backends only. Attempting CUDA
+  # anyway is what produced the 2026-07-26 false-green: the attempt was wrapped
+  # in `continue-on-error` (justified by the expected size rejection), so when
+  # both CUDA jobs actually died on `Trusted publishing exchange failure` — the
+  # same invalid-publisher misconfiguration the other five were reporting
+  # loudly — the run showed `publish windows-cuda: success` with nothing
+  # published. A step that cannot succeed should not run; one that can must not
+  # have its failures tolerated.
+  #
+  # Known-open as of 2026-07-27: all 5 PyPI-eligible backends fail trusted
+  # publishing (invalid-publisher), so they are stuck on PyPI at 3.7.4
+  # (2026-07-04). The fix is registering each PyPI project's trusted publisher
+  # (repo + workflow + environment) in PyPI's project settings — nothing in this
+  # file can do it. These jobs fail LOUDLY until then, which is correct.
   publish:
     name: publish ${{ matrix.os_tok }}-${{ matrix.backend }}
     needs: build
@@ -377,11 +390,11 @@ jobs:
       fail-fast: false     # one backend's PyPI rejection must not cancel the others
       matrix:
         include:
+          # CUDA is absent on purpose — see the note above this job. Its wheels
+          # are ~10x PyPI's per-file limit and ship via GitHub Releases instead.
           - { os_tok: windows, backend: cpu }
-          - { os_tok: windows, backend: cuda }
           - { os_tok: windows, backend: vulkan }
           - { os_tok: linux, backend: cpu }
-          - { os_tok: linux, backend: cuda }
           - { os_tok: linux, backend: vulkan }
           - { os_tok: macos, backend: metal }
     environment:
@@ -396,11 +409,27 @@ jobs:
           name: wheel-${{ matrix.os_tok }}-${{ matrix.backend }}
           path: dist
 
+      # Guard against a wheel silently growing past PyPI's limit and turning
+      # this job into a recurring red. If it ever trips, that backend belongs
+      # on the GitHub-Release-only path with CUDA — it is not a retry situation.
+      - name: Assert the wheel is under PyPI's per-file limit
+        run: |
+          limit=$((100 * 1000 * 1000))    # PyPI default per-file limit
+          rc=0
+          for whl in dist/*.whl; do
+            size=$(stat -c%s "$whl")
+            printf '%s  %s MiB\n' "$(basename "$whl")" "$((size / 1048576))"
+            if [ "$size" -gt "$limit" ]; then
+              echo "::error title=Wheel exceeds PyPI limit::$(basename "$whl") is $((size / 1048576)) MiB, over PyPI's 100 MB per-file limit. Move this backend to the GitHub-Release-only path (see the note on the publish job)."
+              rc=1
+            fi
+          done
+          exit $rc
+
       - name: Publish to PyPI
-        # CUDA wheels currently exceed PyPI's size limit; attempt anyway (limits
-        # may change) but don't fail the run if PyPI rejects them — the GitHub
-        # Release job below is the guaranteed distribution path for CUDA.
-        continue-on-error: ${{ matrix.backend == 'cuda' }}
+        # No continue-on-error: every backend reaching this step CAN publish, so
+        # a failure here is real and must fail the run. Tolerating failures is
+        # what let two CUDA jobs report success while publishing nothing.
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: dist

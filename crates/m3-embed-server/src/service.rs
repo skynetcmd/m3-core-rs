@@ -201,16 +201,28 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
 // ---------------------------------------------------------------------------
 
 pub fn install() -> Result<(), Box<dyn std::error::Error>> {
-    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
-    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
+    // Connect with CONNECT only. Requesting CREATE_SERVICE here needs
+    // Administrator, so unelevated this call failed outright and `?` returned
+    // before the idempotency check below could run — the 3.7.27 wheel shipped
+    // that check as dead code and `install` still printed the opaque
+    // "IO error in winapi call" against an already-registered service.
+    //
+    // The absence of a UAC prompt was the tell: the failure is at SCM CONNECT,
+    // before any service call, so nothing ever asks to elevate. Querying an
+    // existing service needs only CONNECT + QUERY_STATUS, both available to a
+    // normal user, so the common "already installed" path now works unelevated
+    // and we escalate to CREATE_SERVICE only when there is really something to
+    // create.
+    let service_manager =
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
 
     // Idempotency: `create_service` on an existing service fails with
     // ERROR_SERVICE_EXISTS (1073), which `windows-service` flattens into the
-    // opaque "IO error in winapi call" — indistinguishable from a permission
-    // failure. m3 setup then declared the embedder "SKIPPED (not installed)"
-    // and told the operator to re-run elevated, while the service was already
-    // registered, Automatic, and serving :8082. Re-registering is a no-op, so
-    // report success rather than erroring.
+    // same opaque "IO error in winapi call" — indistinguishable from a
+    // permission failure. m3 setup then declared the embedder "SKIPPED (not
+    // installed)" and told the operator to re-run elevated, while the service
+    // was already registered, Automatic, and serving :8082. Re-registering is a
+    // no-op, so report success rather than erroring.
     if let Ok(existing) = service_manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         let state = existing.query_status().map(|s| s.current_state).ok();
         println!("service already installed: {SERVICE_NAME}");
@@ -222,6 +234,25 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         println!("to re-register from scratch: `m3-embed-server uninstall` then `install`");
         return Ok(());
     }
+
+    // Nothing registered — creating one genuinely needs Administrator. Reconnect
+    // asking for CREATE_SERVICE and translate the access-denied case into advice
+    // instead of the opaque winapi string (§3 fail loud, and loudly ACCURATE:
+    // the old message could not tell "already installed" from "needs elevation",
+    // which is what sent the operator chasing the wrong fix).
+    let service_manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .map_err(|e| {
+        Box::<dyn std::error::Error>::from(format!(
+            "cannot register the service: {e}\n  \
+             Registering a Windows Service requires Administrator rights.\n  \
+             Open an *Administrator* terminal and run: m3-embed-server install\n  \
+             (The service is NOT currently registered — this is not the \
+             already-installed case.)"
+        ))
+    })?;
 
     let exe = std::env::current_exe()?;
     let service_info = ServiceInfo {

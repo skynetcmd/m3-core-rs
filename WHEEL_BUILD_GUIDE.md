@@ -319,7 +319,7 @@ from); **GitHub Releases** are an interim/secondary mirror.
 
 1. Bump `workspace.package.version` in the top-level `Cargo.toml` **and**
    `M3_CORE_RS_VERSION` / `M3_CORE_RS_GIT_TAG` in m3-memory's
-   `m3_memory/rust_core_install.py`, in lockstep. Current: `3.7.28` ↔ `v2026.7.28`.
+   `m3_memory/rust_core_install.py`, in lockstep. Current: `3.7.29` ↔ `v2026.7.29`.
 
    > **CUDA does not publish to PyPI.** Its wheels (~949 MiB linux, ~244 MiB
    > windows) are roughly 10x the 100 MB per-file limit, so `release.yml`'s

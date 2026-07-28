@@ -338,6 +338,17 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
+    // Check "is it even installed?" with QUERY_STATUS FIRST. The privileged open
+    // below asks for STOP|DELETE, which an unprivileged user cannot open
+    // (ERROR_ACCESS_DENIED, 5) — so unelevated it failed there and the
+    // ERROR_SERVICE_DOES_NOT_EXIST (1060) arm was unreachable. Uninstalling a
+    // service that is already absent is the desired end state, but it reported
+    // the opaque "IO error in winapi call" and exit 1 instead.
+    if !service_exists(&service_manager) {
+        println!("service not installed: {SERVICE_NAME}");
+        return Ok(());
+    }
+
     let service_access =
         ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
     let service = match service_manager.open_service(SERVICE_NAME, service_access) {
@@ -348,7 +359,15 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
             println!("service not installed: {SERVICE_NAME}");
             return Ok(());
         }
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "cannot remove the service: {e}\n  \
+                 Removing a Windows Service requires Administrator rights.\n  \
+                 Open an *Administrator* terminal and run: m3-embed-server uninstall\n  \
+                 (The service IS currently registered — `m3-embed-server status` \
+                 shows its state.)"
+            )))
+        }
     };
 
     // Best-effort stop.
@@ -375,27 +394,136 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// ERROR_SERVICE_ALREADY_RUNNING — `start` on a service that is already up.
+const ERROR_SERVICE_ALREADY_RUNNING: i32 = 1056;
+/// ERROR_SERVICE_NOT_ACTIVE — `stop` on a service that is already stopped.
+const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
+
+// PRIVILEGE MAP (measured on Windows 11, unelevated, 2026-07-27):
+//
+//   SCM      CONNECT ............. OK        CONNECT|CREATE_SERVICE .. DENIED(5)
+//   service  QUERY_STATUS ........ OK        START ................... DENIED(5)
+//            QUERY_CONFIG ........ OK        STOP .................... DENIED(5)
+//            ENUMERATE_DEPENDENTS  OK        CHANGE_CONFIG ........... DENIED(5)
+//                                            DELETE .................. DENIED(5)
+//
+// Every MUTATING right needs Administrator; the read rights do not. Because
+// `open_service` fails as a whole, requesting a mutating right up front means
+// the call dies with ERROR_ACCESS_DENIED before any state check can run — and
+// `windows-service` flattens that into "IO error in winapi call", which is
+// indistinguishable from every other failure.
+//
+// Hence the rule these helpers exist to enforce: ANSWER "IS THERE WORK TO DO?"
+// WITH READ ACCESS FIRST, AND ESCALATE ONLY WHEN THERE IS. Four subcommands
+// shipped without it (install through 3.7.27; start/stop/uninstall through
+// 3.7.28), each reporting a no-op as a failure.
+//
+// WINDOWS-ONLY BY CONSTRUCTION. This module is `cfg(windows)`; `service_unix.rs`
+// serves macOS (launchd) and Linux (systemd) and does NOT have this flaw:
+// `systemctl start` on a running unit and `launchctl kickstart` on a running job
+// both exit 0, and both `uninstall` paths already guard on `plist.exists()` /
+// `unit.exists()` before acting. The asymmetry is real, not an oversight there —
+// SCM is the only one of the three that refuses to even OPEN a handle when you
+// ask for a right you lack, which is what makes the check-before-escalate order
+// mandatory here and merely tidy elsewhere. (Audited across all three OSes,
+// 2026-07-27.)
+
+/// True when the service is registered at all. QUERY_STATUS only, so it works
+/// unelevated — unlike an open that asks for DELETE.
+fn service_exists(manager: &ServiceManager) -> bool {
+    manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .is_ok()
+}
+
+/// True when the service is already in `want`. Uses QUERY_STATUS only, which an
+/// unprivileged user CAN open — unlike START/STOP.
+fn already_in_state(manager: &ServiceManager, want: ServiceState) -> bool {
+    manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
+        .ok()
+        .and_then(|s| s.query_status().ok())
+        .map(|s| s.current_state == want)
+        .unwrap_or(false)
+}
+
 pub fn start() -> Result<(), Box<dyn std::error::Error>> {
     let service_manager =
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = service_manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::START | ServiceAccess::QUERY_STATUS,
-    )?;
-    service.start::<&str>(&[])?;
-    println!("start signal sent to {SERVICE_NAME}");
+
+    // Check BEFORE asking for privileged access. `open_service` with START (or
+    // STOP) requires Administrator and returns ERROR_ACCESS_DENIED (5)
+    // unelevated — verified at the Win32 layer — so the privileged open failed
+    // first and the caller got the opaque "IO error in winapi call" even when
+    // the service was already running and there was nothing to do. `m3 setup`
+    // surfaced that as "`m3-embed-server start` exited 1" against a service
+    // that was Automatic, running, and serving :8082 (2026-07-27).
+    //
+    // QUERY_STATUS opens fine for a normal user, so answer the "is this already
+    // done?" question with the access we HAVE, and only escalate when there is
+    // real work. Same shape as the install() fix one level down.
+    if already_in_state(&service_manager, ServiceState::Running) {
+        println!("{SERVICE_NAME} is already running (nothing to do)");
+        return Ok(());
+    }
+
+    let service = service_manager
+        .open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
+        .map_err(|e| {
+            Box::<dyn std::error::Error>::from(format!(
+                "cannot start the service: {e}\n  \
+                 Starting a Windows Service requires Administrator rights.\n  \
+                 Open an *Administrator* terminal and run: m3-embed-server start\n  \
+                 (It is not already running — `m3-embed-server status` shows the \
+                 current state.)"
+            ))
+        })?;
+
+    // Belt-and-braces: it could have started between the check and here.
+    match service.start::<&str>(&[]) {
+        Ok(()) => println!("start signal sent to {SERVICE_NAME}"),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) =>
+        {
+            println!("{SERVICE_NAME} is already running (nothing to do)");
+        }
+        Err(e) => return Err(Box::new(e)),
+    }
     Ok(())
 }
 
 pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
     let service_manager =
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = service_manager.open_service(
-        SERVICE_NAME,
-        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
-    )?;
-    service.stop()?;
-    println!("stop signal sent to {SERVICE_NAME}");
+
+    // Mirror of start(): STOP access also needs Administrator, so answer
+    // "already stopped?" with QUERY_STATUS before escalating.
+    if already_in_state(&service_manager, ServiceState::Stopped) {
+        println!("{SERVICE_NAME} is already stopped (nothing to do)");
+        return Ok(());
+    }
+
+    let service = service_manager
+        .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+        .map_err(|e| {
+            Box::<dyn std::error::Error>::from(format!(
+                "cannot stop the service: {e}\n  \
+                 Stopping a Windows Service requires Administrator rights.\n  \
+                 Open an *Administrator* terminal and run: m3-embed-server stop\n  \
+                 (It is not already stopped — `m3-embed-server status` shows the \
+                 current state.)"
+            ))
+        })?;
+
+    match service.stop() {
+        Ok(_) => println!("stop signal sent to {SERVICE_NAME}"),
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_NOT_ACTIVE) =>
+        {
+            println!("{SERVICE_NAME} is already stopped (nothing to do)");
+        }
+        Err(e) => return Err(Box::new(e)),
+    }
     Ok(())
 }
 

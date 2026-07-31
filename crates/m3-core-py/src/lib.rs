@@ -1345,11 +1345,45 @@ impl PyEmbeddedEmbedder {
 // module
 // ---------------------------------------------------------------------------
 
+/// Which llama.cpp backend this wheel was compiled with, resolved at compile
+/// time from the cargo features `build_wheel.py` passes. Exposed to Python as
+/// `m3_core_rs.__build_backend__` so a support question ("which core is
+/// actually loaded?") is answerable without guessing among 7 platform dist
+/// names. The GPU features each imply `embedded`, so test them first.
+const BUILD_BACKEND: &str = if cfg!(feature = "embedded-cuda") {
+    "cuda"
+} else if cfg!(feature = "embedded-vulkan") {
+    "vulkan"
+} else if cfg!(feature = "embedded-metal") {
+    "metal"
+} else if cfg!(feature = "embedded") {
+    "cpu"
+} else {
+    "none"
+};
+
 #[pymodule]
 fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Bridge env_logger to stderr; `RUST_LOG` controls verbosity.
     let _ = env_logger::try_init();
     log::info!("m3_core_rs initialized (hash provider: {})", m3_hash::active_provider());
+
+    // Version of the LOADED extension, from CARGO_PKG_VERSION so it can never
+    // drift from the wheel it was built into.
+    //
+    // Its absence was not cosmetic. m3-memory's installer chain is:
+    //     installed_rust_core_version() -> getattr(m3_core_rs, "__version__", None)
+    //     is_rust_core_current()        -> unreadable version => False
+    // and False is deliberately conservative ("never skip an upgrade on a
+    // guess"). With nothing to read, the skip-if-current optimisation NEVER
+    // fired, so every `m3 setup` re-downloaded the core even when the correct
+    // version was already installed — 244 MB on windows-cuda, ~949 MB on
+    // linux-cuda, silently, on every run. The guard was right; the producer was
+    // missing. Also lets `m3 doctor` name the core it actually loaded and makes
+    // stale dist-info dirs detectable.
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // Build provenance: which backend/features this wheel was compiled with.
+    m.add("__build_backend__", BUILD_BACKEND)?;
 
     m.add_function(wrap_pyfunction!(sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(sha256_hex_bytes, m)?)?;

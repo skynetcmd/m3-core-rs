@@ -68,6 +68,56 @@ fn aws_keys_group() {
     assert!(r.content.contains("[REDACTED:aws_keys]"));
 }
 
+/// STS (temporary) credentials start with ASIA, not AKIA. Until 2026-07-31 the
+/// group matched only AKIA, so pasted S3 pre-signed URLs stored their key id,
+/// signature and session token in plaintext. Mirrors
+/// tests/test_redaction_parity.py::test_aws_sts_key_is_redacted.
+///
+/// Fixtures below are SYNTHETIC (sequential/repeated filler) — never paste a
+/// real credential into a test, even an expired one: it would publish the
+/// secret and permanently record the leak in git history.
+const STS_ID: &str = "ASIAEXAMPLE1234567XZ";
+const STS_SIG: &str = "c2lnbmF0dXJlRXhhbXBsZTAwMDA%3D";
+const STS_TOKEN: &str =
+    "FwoGZXIvYXdzEExampleSessionTokenPaddingAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+#[test]
+fn aws_sts_temporary_key_is_redacted() {
+    let c = cfg(true, &["aws_keys"], &[], false);
+    let r = scrub(&format!("id={STS_ID} end"), &c);
+    assert!(r.match_count > 0, "STS key id left in plaintext");
+    assert!(!r.content.contains(STS_ID));
+}
+
+#[test]
+fn aws_presigned_url_fully_redacted() {
+    let c = cfg(true, &["aws_keys"], &[], false);
+    let url = format!(
+        "https://x.s3.amazonaws.com/f.md\
+         ?AWSAccessKeyId={STS_ID}\
+         &Signature={STS_SIG}\
+         &x-amz-security-token={STS_TOKEN}"
+    );
+    let r = scrub(&url, &c);
+    assert!(!r.content.contains(STS_ID), "key id survived");
+    assert!(!r.content.contains(STS_SIG), "signature survived");
+    assert!(!r.content.contains(STS_TOKEN), "session token survived");
+}
+
+/// Widening must not turn ordinary English into [REDACTED].
+#[test]
+fn aws_patterns_do_not_eat_prose() {
+    let c = cfg(true, &["aws_keys"], &[], false);
+    for prose in [
+        "We discussed the AWS migration and the signature of the function.",
+        "ASIA is a continent; AKIA Corp makes batteries.",
+        "The method signature changed in this release.",
+    ] {
+        let r = scrub(prose, &c);
+        assert_eq!(r.match_count, 0, "false positive on prose: {}", r.content);
+    }
+}
+
 #[test]
 fn custom_regex_group() {
     let c = cfg(true, &["custom_regex"], &[r"MY_SECRET_\d+"], false);

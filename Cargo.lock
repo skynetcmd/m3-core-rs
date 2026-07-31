@@ -1308,7 +1308,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "m3-core-py"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "bytemuck",
  "env_logger",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "m3-dispatcher"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "criterion",
  "log",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "m3-embed-llamacpp"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "crossbeam-channel",
  "llama-cpp-2",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "m3-embed-server"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "anyhow",
  "axum",
@@ -1379,11 +1379,11 @@ dependencies = [
 
 [[package]]
 name = "m3-error"
-version = "3.7.29"
+version = "3.7.31"
 
 [[package]]
 name = "m3-fts"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "m3-error",
  "regex",
@@ -1391,11 +1391,11 @@ dependencies = [
 
 [[package]]
 name = "m3-governor"
-version = "3.7.29"
+version = "3.7.31"
 
 [[package]]
 name = "m3-graph"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "m3-error",
  "petgraph",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "m3-hash"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "log",
  "m3-error",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "m3-ingest"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "log",
  "m3-error",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "m3-ner-ort"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "m3-dispatcher",
  "m3-error",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "m3-rank"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "criterion",
  "m3-error",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "m3-redact"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "criterion",
  "m3-error",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "m3-route"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "criterion",
  "m3-error",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "m3-vector"
-version = "3.7.29"
+version = "3.7.31"
 dependencies = [
  "bytemuck",
  "criterion",

@@ -416,6 +416,18 @@ impl EmbeddedBackend {
         Ok(pool.n_embd())
     }
 
+    /// Exact token counts for `texts`, one per input, in input order.
+    ///
+    /// The counts include BOS/EOS, matching what the embed path measures
+    /// against `n_ctx`. Forces the GGUF load on first call (like
+    /// `embedding_dim`) but performs no decode — tokenization needs only the
+    /// model, so this never queues behind an in-flight embed batch.
+    #[cfg(feature = "embedded")]
+    pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
+        let pool = self.pool()?;
+        pool.count_tokens(texts)
+    }
+
     /// Test-only: peek at the cached `Arc<ContextPool>` without forcing a
     /// load. Returns `None` until `embedding_dim`/`run` has populated the
     /// `OnceLock`. Used by the shared-pool invariant test in `tests` below
@@ -562,6 +574,18 @@ pub mod embedded {
         workers: Mutex<Vec<JoinHandle<()>>>,
         n_embd: i32,
         streams: usize,
+        /// The loaded GGUF, retained so `count_tokens` can tokenize WITHOUT
+        /// going through a worker.
+        ///
+        /// `str_to_token` is a `&LlamaModel` method — it needs no
+        /// `LlamaContext`, no KV cache and no decode. Only the CONTEXT is
+        /// `!Send` and lifetime-bound to its thread; the model itself is
+        /// already shared across every worker (each gets an `Arc` clone at
+        /// spawn), so holding one more clone here adds no synchronisation and
+        /// keeps token counting off the embed job queue entirely. Counting
+        /// therefore never waits behind an in-flight batch, which matters
+        /// because callers count in order to DECIDE how to batch.
+        model: Arc<LlamaModel>,
     }
 
     impl ContextPool {
@@ -642,7 +666,30 @@ pub mod embedded {
                 workers: Mutex::new(workers),
                 n_embd,
                 streams,
+                model,
             })
+        }
+
+        /// Exact token counts, one per input, in input order.
+        ///
+        /// Uses the SAME tokenizer call the embed path already makes
+        /// (`str_to_token(text, AddBos::Always)`), so a count returned here is
+        /// exactly what `embed_on_ctx` will measure against `n_ctx` — a caller
+        /// that chunks to a budget below `n_ctx` cannot then be surprised by an
+        /// overflow. An estimate cannot offer that guarantee.
+        ///
+        /// Counts INCLUDE the BOS/EOS frame, because `AddBos::Always` is what
+        /// the embed path uses and those tokens occupy `n_ctx` like any other.
+        pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
+            let mut out = Vec::with_capacity(texts.len());
+            for text in texts {
+                let tokens = self
+                    .model
+                    .str_to_token(text, AddBos::Always)
+                    .map_err(|e| M3Error::Backend(format!("tokenize failed: {e}")))?;
+                out.push(tokens.len());
+            }
+            Ok(out)
         }
 
         /// Embedding dimension reported by the model.

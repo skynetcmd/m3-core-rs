@@ -474,10 +474,60 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
     }
 }
 
-/// Rough token-length estimate; the dispatcher only needs bucket granularity,
-/// not exact tokenization. ~4 chars/token, minimum 1.
+/// Special tokens BGE-M3 wraps every sequence in (BOS + EOS; `AddBos::Always`
+/// in m3-embed-llamacpp). Measured exactly 2, independent of input length —
+/// even the empty string encodes to 2, not 0. They occupy n_ctx like any other
+/// token, so an estimate that omits them under-counts by exactly this much.
+pub const SPECIAL_TOKENS: usize = 2;
+
+/// Conservative token-length estimate that never UNDER-counts (BGE-M3).
+///
+/// `max(bytes/3, chars) + SPECIAL_TOKENS`.
+///
+/// The previous form was `(text.len() / 4).max(1)` — bytes/4, which is the
+/// ENGLISH ratio. Measured against the real BGE-M3 tokenizer, density spans 4x
+/// across content one corpus routinely mixes:
+///
+/// | content        | chars/token | bytes/token |
+/// |----------------|-------------|-------------|
+/// | English prose  | 4.18        | 4.18        |
+/// | Python code    | 2.96        | 3.15        |
+/// | logs / traces  | 2.26        | 2.26        |
+/// | Chinese        | 1.66        | 4.88        |
+/// | JSON           | 1.63        | 1.63        |
+/// | UUID lists     | 1.61        | 1.61        |
+/// | base64         | 1.00        | 1.00        |
+///
+/// So bytes/4 under-counted by up to 4x, which mis-placed jobs in the
+/// dispatcher's `LengthBucketQueue` and mis-fed its running-total cap: a batch
+/// of JSON or base64 was scheduled as though it were a quarter of its true
+/// size. (The `embed_with_token_count` escape hatch below exists precisely
+/// because someone already diagnosed this — see its doc comment — but nothing
+/// upstream could supply a real count.)
+///
+/// The `chars` term is load-bearing: BGE-M3 uses SentencePiece, which cannot
+/// emit more CONTENT tokens than there are characters, so `chars` is a hard
+/// upper bound for ANY input rather than for sampled ones. Formulas measured
+/// and REJECTED: `max(bytes/4, chars/1.1)` (worst ratio 0.91),
+/// `max(bytes/3, chars/1.05)` (0.95), `max(bytes/3, chars)` without the special
+/// tokens (0.999 — under-counts base64 by exactly 2).
+///
+/// MUST stay byte-identical to `estimate_tokens` in
+/// `m3-memory/bin/memory/tokens.py`; the Python fallback and this path are two
+/// implementations of one contract, and `tests/test_token_budget.py` plus the
+/// Rust tests below pin the same cases on both sides.
+///
+/// ⚠ The `chars` ceiling is a property of SentencePiece, NOT of tokenizers in
+/// general — a byte-level BPE model can exceed 1 token/char. A model swap must
+/// revisit this bound.
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.len() / 4).max(1)
+    if text.is_empty() {
+        return SPECIAL_TOKENS;
+    }
+    // `text.len()` is BYTES in Rust; `chars().count()` is the character count.
+    let by_bytes = text.len() / 3;
+    let by_chars = text.chars().count();
+    by_bytes.max(by_chars) + SPECIAL_TOKENS
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -705,5 +755,95 @@ mod tests {
         let _ = q.drain_one(usize::MAX);
         assert_eq!(q.total_tokens.load(Ordering::Relaxed), 0);
         assert!(q.drain_one(usize::MAX).is_none());
+    }
+
+    // ── estimate_tokens: the contract is "never UNDER-count" ─────────────────
+    // Mirrors m3-memory/tests/test_token_budget.py. Both sides are two
+    // implementations of ONE contract; drift here silently re-opens the n_ctx
+    // overflow these tests exist to stop.
+
+    #[test]
+    fn estimate_never_below_chars_plus_frame() {
+        // The load-bearing bound: SentencePiece cannot emit more CONTENT tokens
+        // than there are characters, plus the BOS/EOS frame.
+        let cases = [
+            String::new(),
+            "a".to_string(),
+            "ab".repeat(100),
+            "\u{0}".repeat(50),
+            "\u{1F389}".repeat(40),
+            "\u{6570}\u{636E}\u{5E93}".repeat(30),
+        ];
+        for s in &cases {
+            assert!(
+                estimate_tokens(s) >= s.chars().count() + SPECIAL_TOKENS,
+                "estimate dropped below chars+frame for a {}-char input",
+                s.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_costs_the_frame_not_zero() {
+        // BGE-M3 emits BOS+EOS even for empty input; reporting 0 would be a lie
+        // a caller might budget against.
+        assert_eq!(estimate_tokens(""), SPECIAL_TOKENS);
+    }
+
+    #[test]
+    fn byte_term_dominates_for_multibyte_text() {
+        // 4-byte astral chars: bytes/3 (133) beats chars (100).
+        let s = "\u{1F389}".repeat(100);
+        assert_eq!(estimate_tokens(&s), 400 / 3 + SPECIAL_TOKENS);
+    }
+
+    #[test]
+    fn cjk_is_not_under_counted() {
+        // The regression that mattered. 3-byte CJK under the old bytes/4 form
+        // scored 0.75 tokens/char; the truth is ~0.6 chars/token, so the old
+        // form mis-placed these jobs in the length-bucket queue.
+        let s = "\u{6570}\u{636E}\u{5E93}\u{8FDE}\u{63A5}".repeat(100);
+        let old_form = s.len() / 4; // the previous implementation
+        assert!(
+            estimate_tokens(&s) > old_form,
+            "new estimate must exceed the old bytes/4 form for CJK"
+        );
+        assert!(estimate_tokens(&s) >= s.chars().count());
+    }
+
+    #[test]
+    fn monotonic_in_length() {
+        let base = "abc".repeat(50);
+        let mut prev = 0usize;
+        for n in 0..10 {
+            let e = estimate_tokens(&base.repeat(n));
+            assert!(e >= prev, "estimate went down as the input grew");
+            prev = e;
+        }
+    }
+
+    #[test]
+    fn matches_the_python_seam_formula() {
+        // Byte-for-byte parity with memory/tokens.py estimate_tokens().
+        let cases = [
+            "hello world",
+            "\u{6570}\u{636E}\u{5E93}\u{8FDE}\u{63A5}\u{5931}\u{8D25}",
+            "\u{1F389}\u{1F525}",
+            "",
+            "a",
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        ];
+        for s in cases {
+            let expected = if s.is_empty() {
+                SPECIAL_TOKENS
+            } else {
+                std::cmp::max(s.len() / 3, s.chars().count()) + SPECIAL_TOKENS
+            };
+            assert_eq!(
+                estimate_tokens(s),
+                expected,
+                "drift from the Python seam for {s:?}"
+            );
+        }
     }
 }

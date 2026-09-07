@@ -1328,6 +1328,36 @@ impl PyEmbeddedEmbedder {
         map_err(out)
     }
 
+    /// Exact BGE-M3 token counts for `texts`, one per input, in input order.
+    ///
+    /// Uses the SAME tokenizer call the embed path makes
+    /// (`str_to_token(text, AddBos::Always)`), so a count returned here is
+    /// exactly what the embedder will measure against `n_ctx`. A caller that
+    /// chunks to a budget below `n_ctx` therefore cannot be surprised by an
+    /// overflow — a guarantee no character/byte estimate can make, because
+    /// token density spans 4x across content one corpus routinely mixes
+    /// (English prose 4.18 chars/token, base64 1.00).
+    ///
+    /// Counts INCLUDE the BOS/EOS frame (2 tokens), because those occupy
+    /// `n_ctx` like any other token.
+    ///
+    /// Tokenization needs only the model — no context, no KV cache, no decode —
+    /// so this does NOT queue behind an in-flight embed batch. That matters:
+    /// callers count in order to decide how to batch. Releases the GIL for the
+    /// duration; the `Vec<String>` extraction happens before the detach.
+    ///
+    /// The Python side (`memory/tokens.py`) treats this as an OPTIONAL
+    /// optimisation: without it the conservative estimator keeps the system
+    /// correct, just over-chunked (~3.7x on English prose). Nothing requires a
+    /// wheel upgrade to embed a long row correctly.
+    fn count_tokens(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<usize>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let out = py.detach(|| self.backend.count_tokens(&texts));
+        map_err(out)
+    }
+
     /// Embedding dimension reported by the model. Forces the lazy GGUF
     /// load on first call (no full inference needed).
     fn embedding_dim(&self) -> PyResult<i32> {
@@ -1364,8 +1394,25 @@ const BUILD_BACKEND: &str = if cfg!(feature = "embedded-cuda") {
 
 #[pymodule]
 fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Bridge env_logger to stderr; `RUST_LOG` controls verbosity.
-    let _ = env_logger::try_init();
+    // Bridge env_logger to stderr. `RUST_LOG` controls verbosity as usual, but
+    // honour `M3_DEBUG` too: it lights up ~10 call sites on the Python side
+    // (including the `DEBUG SQL` output in memory/search.py) and previously went
+    // completely dark the moment execution crossed into Rust — a user debugging
+    // a chunking or token-count discrepancy saw one half of the seam and had no
+    // indication the other half existed. `RUST_LOG` keeps precedence for anyone
+    // who wants finer-grained control.
+    if std::env::var_os("RUST_LOG").is_none()
+        && std::env::var("M3_DEBUG").map(|v| {
+            let v = v.to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        }) == Ok(true)
+    {
+        let _ = env_logger::Builder::new()
+            .filter_level(log::LevelFilter::Debug)
+            .try_init();
+    } else {
+        let _ = env_logger::try_init();
+    }
     log::info!("m3_core_rs initialized (hash provider: {})", m3_hash::active_provider());
 
     // Version of the LOADED extension, from CARGO_PKG_VERSION so it can never

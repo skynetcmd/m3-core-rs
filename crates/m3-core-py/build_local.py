@@ -147,6 +147,39 @@ def resolve_interpreter(version: str, *, install_missing: bool) -> str | None:
     return None
 
 
+def _find_vulkan_sdk() -> str | None:
+    """Newest installed Vulkan SDK root on Windows, or None.
+
+    The SDK installer sets VULKAN_SDK machine-wide, but a shell started before
+    the install (or a stripped environment) will not have it, and the resulting
+    failure is a shader-compile error that mentions neither glslc nor the SDK.
+    Mirrors what ``_vcvars_env`` does for MSVC: look where the installer puts
+    things instead of requiring the operator to export it.
+
+    Picks the highest version directory that actually contains ``Bin/glslc.exe``
+    — a partially-removed SDK leaves the directory behind without the tools.
+    """
+    if os.name != "nt":
+        return None
+    root = Path(os.environ.get("SystemDrive", "C:") + "\\VulkanSDK")
+    if not root.is_dir():
+        return None
+
+    def _ver_key(p: Path) -> tuple[int, ...]:
+        parts: list[int] = []
+        for chunk in p.name.split("."):
+            parts.append(int(chunk) if chunk.isdigit() else 0)
+        return tuple(parts)
+
+    candidates = [
+        d for d in root.iterdir()
+        if d.is_dir() and (d / "Bin" / "glslc.exe").is_file()
+    ]
+    if not candidates:
+        return None
+    return str(sorted(candidates, key=_ver_key)[-1])
+
+
 def _vcvars_env() -> dict[str, str] | None:
     """Environment produced by running MSVC's ``vcvars64.bat``, or None.
 
@@ -381,14 +414,22 @@ def build_one(
                   "CMAKE_OBJECT_PATH_MAX)")
 
         # glslc ships in the Vulkan SDK's Bin dir and is not on PATH by default.
-        sdk = env.get("VULKAN_SDK")
+        # Discover the SDK the same way we discover vcvars64 above, rather than
+        # only honouring a pre-set VULKAN_SDK: an operator running this from a
+        # plain shell has the SDK installed but not exported, and the resulting
+        # failure is a shader-compile error that names neither glslc nor the SDK.
+        # Explicit env still wins.
+        sdk = env.get("VULKAN_SDK") or _find_vulkan_sdk()
         if sdk:
+            env.setdefault("VULKAN_SDK", sdk)
             sdk_bin = os.path.join(sdk, "Bin")
             if os.path.isdir(sdk_bin) and sdk_bin.lower() not in env.get("PATH", "").lower():
                 env["PATH"] = sdk_bin + os.pathsep + env.get("PATH", "")
         elif backend == "vulkan":
-            print("[build_local] WARNING: VULKAN_SDK is unset — glslc will not be "
-                  "found and the Vulkan shader build will fail.")
+            print("[build_local] WARNING: VULKAN_SDK is unset and no SDK was found "
+                  "under C:\\VulkanSDK — glslc will not be found and the Vulkan "
+                  "shader build will fail. Install the Vulkan SDK from "
+                  "https://vulkan.lunarg.com/ or set VULKAN_SDK explicitly.")
 
     # Linux CUDA needs several things the generic path doesn't (see PUBLISHING.md
     # "Linux CUDA build recipe"):

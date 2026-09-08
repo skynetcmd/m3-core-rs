@@ -228,10 +228,21 @@ Build host: a Windows machine with Visual Studio Build Tools.
 
 **Preferred:** `python crates\m3-core-py\build_local.py all` — same cache-optimal
 driver as Linux (one llama.cpp compile per backend). Windows uses native builds
-for every backend (no zig). It must run inside a `vcvars64` environment with the
-MSVC linker ahead of Git's `link.exe` and `CMAKE_GENERATOR=Ninja` — see the
-Windows gotchas in §7. The explicit per-backend `build_wheel.py` calls below are
-the fallback:
+for every backend (no zig).
+
+**Run it from an ordinary shell — no manual setup.** `build_local.py` is
+self-sufficient on Windows: it locates and runs `vcvars64.bat` itself (merging,
+not replacing, PATH so uv/cargo/python survive), sets `CMAKE_GENERATOR=Ninja`,
+shortens `CARGO_TARGET_DIR` to dodge the 250-char cmake object-path cap, and
+discovers the Vulkan SDK under `C:\VulkanSDK` to put `glslc` on PATH. Explicit
+environment always wins — anything you export yourself is left untouched — so an
+"x64 Native Tools" prompt still works, it is simply not required. Verified
+2026-09-07 by building windows/vulkan from a bare shell with `VULKAN_SDK` and
+`CMAKE_GENERATOR` unset.
+
+The explicit per-backend `build_wheel.py` calls below are the fallback — but note
+they do **none** of the above, which is exactly how the `C1083` path-length
+failure in §7 happens:
 
 ```powershell
 # CPU
@@ -387,7 +398,44 @@ Install from a Release asset URL:
 |----------|------|-------|
 | Linux x86_64 | A provisioned Debian 13 LXC build container | rustc 1.95, maturin 1.13.3, uv, CUDA 13.2 toolkit, Vulkan dev stack + AMD/RADV iGPU. Builds **all three** Linux backends. **Not** the bare Proxmox hypervisor. |
 | Windows | A Windows build box | VS Build Tools, CUDA, Vulkan SDK. |
-| macOS (Metal) | An Apple-Silicon Mac | Metal build leg to be verified on a device. |
+| macOS (Metal) | An Apple-Silicon Mac | ✅ **Device-verified 2026-09-07** (3.9.7). Homebrew cmake + pipx maturin + brew python3.11–3.14, rustc via rustup. Probe it with `zsh -lc` and reach it over the **LAN**, not a Tailscale relay — see §7. |
+
+### Per-machine quick reference (the whole matrix, three commands)
+
+There is deliberately **no per-OS wrapper script**: `build_local.py` replaced the
+old `build_windows_wheels.sh` / `build_linux_wheels.sh` pair so the OS-specific
+logic lives in exactly one place, and it now sets up its own environment on every
+platform (MSVC + Ninja + Vulkan SDK on Windows; the zig/native split and CUDA PIC
+flags on Linux). Adding wrappers back would re-fragment that. These three commands
+ARE the per-machine procedure — run them concurrently, one per host (§ Building
+all three OSes in parallel):
+
+```bash
+# WINDOWS — from an ordinary shell; no vcvars prompt needed.
+python crates\m3-core-py\build_local.py all
+
+# LINUX — login shell is mandatory. CUDA is build-only on an AMD/RADV box.
+ssh <linux-host> 'bash -lc "cd ~/m3-core-rs/crates/m3-core-py && \
+    nohup python3 build_local.py cpu vulkan > ~/linux_cpu_vulkan.log 2>&1 &"'
+ssh <linux-host> 'bash -lc "cd ~/m3-core-rs/crates/m3-core-py && \
+    nohup python3 build_local.py cuda --no-smoke-test > ~/linux_cuda.log 2>&1 &"'
+
+# MACOS — login shell (zsh) + LAN address, and prepend ~/.local/bin for pipx maturin.
+ssh <user>@<mac-lan-ip> "zsh -lc 'cd ~/m3-core-rs/crates/m3-core-py && \
+    export PATH=\$HOME/.local/bin:\$PATH && \
+    nohup python3.12 build_local.py metal > ~/macos_metal.log 2>&1 &'"
+```
+
+Run long builds **detached** (`nohup … &`) and poll the log — a dropped SSH link
+then never kills the build. Wheels land in
+`<repo>/ci-wheels/local-<version>/<os>-<backend>/`.
+
+Verify every wheel on its own interpreter before trusting it:
+
+```bash
+python crates/m3-core-py/verify_wheels.py <dir-of-wheels>   # or, per wheel:
+<venv>/bin/python -c "import m3_core_rs as m; print(m.__version__, m.__build_backend__)"
+```
 
 ### Linux build box (provisioned Debian 13 LXC)
 
@@ -460,6 +508,76 @@ when it returns.
 ---
 
 ## 7. Gotchas (learned the hard way)
+
+- **An INTERRUPTED GPU build leaves a 0-byte `.obj`, and cmake never rebuilds it.**
+  Killing a CUDA/Vulkan compile mid-flight can leave a truncated object; the next
+  build prints `CMake project was already configured. Skipping configuration
+  step.`, reuses the corrupt tree, and dies at link time with
+  `fatal error LNK1136: invalid or corrupt file`. The error names the *object*,
+  which reads like a toolchain or CUDA-version problem — it is not; nothing is
+  wrong with the compiler. Confirm before theorising:
+  `find target/release/build/llama-cpp-sys-2-*/out/build -name '*.obj' -size 0`
+  A non-empty result IS the bug. Fix: `rm -rf target/release/build/llama-cpp-sys-2-*`
+  and rebuild (a full llama.cpp recompile). Observed 2026-09-07 on a Windows CUDA
+  build: `argsort.obj` was 0 bytes while its sibling `acc.obj` was 123 KB. Two CUDA
+  toolkits on PATH (v13.3 + v13.2) were suspected and were a red herring — PATH
+  order resolved v13.3 unambiguously. Same family as the `CMakeCache.txt` poisoning
+  below: **a failed build's leftovers are the default suspect for the next
+  build's failure.**
+
+- **PREFER `build_local.py` OVER A HAND-ROLLED `build_wheel.py` LOOP.** This is
+  not a style preference — the driver encodes fixes you will otherwise rediscover
+  the hard way, one failed build at a time:
+  - `CARGO_TARGET_DIR` shortening on Windows (the `C1083` path-limit gotcha below)
+  - the Linux zig split (CPU `--zig` for a low glibc floor; GPU native, because
+    zig's sysroot hides the host Vulkan/CUDA libs)
+  - backend-outer / interpreter-inner ordering (one llama.cpp compile per backend)
+  - uv-based interpreter discovery that rejects the project `.venv`
+  Verified 2026-09-07: a hand-rolled `build_wheel.py --backend vulkan` call on
+  Windows failed with `C1083` *because* it lacked the `CARGO_TARGET_DIR` shortening.
+  Re-run through `build_local.py`, it printed its own diagnosis — *"default path is
+  244 chars at llama.cpp's nested vulkan-shaders-gen depth; cmake caps object paths
+  at 250"* — redirected to `C:\m3t`, and built all 4 wheels. The runbook already
+  said to prefer the driver; ignoring that cost a full failed build.
+
+- **Probe a remote build host with a LOGIN shell, or you will get false MISSINGs.**
+  §6 states this for the Linux LXC; it applies just as hard to **macOS**, where
+  Homebrew (`/opt/homebrew/bin`) and pipx (`~/.local/bin`) are added by
+  `~/.zprofile`. Use `ssh <host> "zsh -lc '...'"` (macOS) / `bash -lc` (Linux).
+  A non-login probe on 2026-09-07 reported brew, cmake, maturin and every
+  Python 3.11-3.14 as MISSING on a Mac that had **all of them installed** — and
+  produced a wrong plan to "provision" a machine that needed nothing but a
+  `git clone`. **A MISSING from a non-login probe is not evidence of absence.**
+  Note `~/.local/bin` may be absent even from the login PATH: pipx tools then need
+  an absolute path, or `export PATH=$HOME/.local/bin:$PATH` before the build.
+  (`build_wheel.py` already falls back to `python -m maturin` when the binary is
+  not on PATH.)
+
+- **Tailscale relaying makes SSH look like a dead host.** A peer with
+  `Relay: <derp>` and an empty `CurAddr` in `tailscale status --json` has no
+  direct path; short commands return but longer ones stall with
+  `Connection reset` / `Connection timed out`, which reads as "the machine is
+  asleep." Check the LAN first — `ping <host>.local` — and prefer the LAN address
+  for builds. Observed 2026-09-07: a MacBook was 46 ms and dropping over a DERP
+  relay vs **8 ms and rock-steady on the LAN**. Long builds should be launched
+  detached (`nohup ... &`) and polled, so a dropped link never kills the build.
+
+- **Editing THIS runbook: never rewrite it with a `split()`-based script.** An
+  in-place edit on 2026-09-07 used `s.split(anchor, 1)[1]`, which silently
+  discarded everything *before* the anchor and truncated the file from 662 lines
+  to 297 — §§1-6 gone. It was caught only by a later `grep` that found 2 `##`
+  sections where there should be 8, and recovered with `git checkout --`. Use a
+  line-anchored editor, and **verify after any scripted edit**:
+  `wc -l WHEEL_BUILD_GUIDE.md && grep -c '^## ' WHEEL_BUILD_GUIDE.md` (expect 8).
+
+- **A failed build can leave `pyproject.toml` renamed — CHECK `git status` BEFORE
+  COMMITTING.** `build_wheel.py` patches `[project].name` to the per-backend
+  package name (`m3-core-rs-windows-vulkan`, …) inside a context manager that
+  restores it in a `finally`. A build that dies hard can still leave the patched
+  name in the working tree. Committing that would publish every subsequent wheel
+  under the wrong project name. Observed 2026-09-07 after the `C1083` Vulkan
+  failure. Always `git status --porcelain` before committing build work, and
+  `git checkout -- crates/m3-core-py/pyproject.toml` if it shows dirty.
 
 - **A failed build POISONS the next one via `CMakeCache.txt`.** cmake writes the
   resolved compiler flags into its cache, and reuses them on every subsequent
@@ -660,3 +778,48 @@ also hit two gotchas now in §7: `CMAKE_GENERATOR=Ninja` must be set **without a
 trailing space** (`set "CMAKE_GENERATOR=Ninja"`, not `set CMAKE_GENERATOR=Ninja &&`),
 and the Windows SDK `bin\<ver>\x64` (rc.exe / mt.exe) must be on PATH for CMake's
 compiler test.
+
+### Update 2026-09-07 — 3.9.7 full local matrix; macOS Metal FIRST device build
+
+Built the **complete** local matrix — all **28 wheels** (7 backends × cp311–314) —
+at crate **3.9.7**, across three real machines concurrently (§6 parallel pattern).
+Each leg was verified by installing into a clean venv of its own interpreter and
+asserting `__version__`, `__build_backend__`, and
+`hasattr(EmbeddedEmbedder, "count_tokens")` — the API added in 3.9.7 for the
+issue-#139 token-budget fix.
+
+| Leg | Wheels | Tag | Size | Verified |
+|---|---|---|---|---|
+| linux-cpu | 4 | `manylinux_2_17` | ~6 MB | 3.9.7 / `cpu` / count_tokens ✅ |
+| linux-vulkan | 4 | `manylinux_2_38` | ~30 MB | smoke-tested on RADV iGPU |
+| linux-cuda | 4 | `linux_x86_64` ⚠️ | 929 MB | built `--no-smoke-test` (AMD box) |
+| windows-cpu | 4 | `win_amd64` | ~6 MB | 3.9.7 / `cpu` / count_tokens ✅ |
+| windows-cuda | 4 | `win_amd64` | 244 MB | 3.9.7 / `cuda` / count_tokens ✅ |
+| windows-vulkan | 4 | `win_amd64` | ~40 MB | 3.9.7 / `vulkan` / count_tokens ✅ |
+| macos-metal | 4 | `macosx_11_0_arm64` | ~6 MB | 3.9.7 / `metal` / count_tokens ✅ |
+
+**macOS Metal is now DEVICE-VERIFIED.** Every prior snapshot carried it as
+"authored in CI, never run on a device." It built clean on an Apple-Silicon Mac
+(M3-class, macOS 27, Homebrew cmake 4.4.3, rustc 1.96, pipx maturin 1.13.3) and
+smoke-tested to `backend=metal`. Sizes and platform tags match what CI produced
+for 3.7.31, which is the cross-check that matters.
+
+⚠️ **`build_local.py` does NOT run `auditwheel` — local Linux CUDA wheels are
+mis-tagged.** CI's `release.yml` has a dedicated
+`auditwheel repair --exclude libcuda.so.1` step, so CI's 3.7.31 linux-cuda wheels
+are `manylinux_2_39`, while a local build produces bare **`linux_x86_64`** — a tag
+**pip refuses to install** on most hosts. Local CUDA wheels are therefore fine for
+verification but must NOT be attached to a Release as-is: either run auditwheel by
+hand, or (preferred) let CI build the shipped artifacts. Other legs are unaffected;
+local linux-cpu came out `manylinux_2_17` (zig) vs CI's `manylinux_2_38` — *more*
+portable, not less.
+
+**How releases actually ship (confirmed against the v2026.7.31 run).** All 28
+wheels for 3.7.31 came from ONE tag push to `release.yml` (1h49m), not from local
+builds. Local builds are pre-release verification plus the macOS device check.
+**Every release run in the history reports `failure` at the top level** — all 7
+build jobs and the GitHub-Release attach succeed; only the PyPI publish jobs fail,
+per the §5a pending-publisher rotation (PyPI caps pending trusted publishers at 3,
+and CUDA never publishes there at all). **A red release run is expected and is NOT
+evidence the wheels are bad** — read the per-job conclusions with
+`gh run view <id> --json jobs`, never the top-level status.

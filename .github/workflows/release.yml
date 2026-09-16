@@ -187,12 +187,39 @@ jobs:
           # <inc>/vulkan/vulkan.h, so its parent's parent is the include root.
           $incRoot = $vkhdr.Directory.Parent.FullName
           Copy-Item (Join-Path $incRoot '*') "$root\Include\" -Recurse -Force
+
+          # llama.cpp's ggml-vulkan gained a hard
+          # `find_package(SPIRV-Headers CONFIG REQUIRED)` between
+          # llama-cpp-sys-2 0.1.146 and 0.1.156 — the previous release built
+          # clean on 0.1.146 and windows-vulkan failed at cmake configure on
+          # 0.1.156 (2026-09-16).
+          #
+          # The LunarG SDK that install-vulkan-sdk fetches ALREADY ships it at
+          # Lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake — this merge step
+          # was simply dropping it, copying only Bin/Lib/Include. So the fix is
+          # to carry the cmake package dir across, not to fetch anything more.
+          $spirvCfg = Get-ChildItem $ws -Recurse -Filter 'SPIRV-HeadersConfig.cmake' -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+          if (-not $spirvCfg) {
+            Write-Error "SPIRV-HeadersConfig.cmake not found under the workspace; ggml-vulkan's find_package(SPIRV-Headers CONFIG REQUIRED) will fail at configure"
+            exit 1
+          }
+          Write-Host "SPIRV-Headers config=$($spirvCfg.FullName)"
+          # Copy the whole Lib/cmake tree so sibling packages (SPIRV-Tools, ...)
+          # stay resolvable if a future llama.cpp requires one of those too.
+          $cmakeSrc = $spirvCfg.Directory.Parent.FullName
+          Copy-Item $cmakeSrc "$root\Lib\" -Recurse -Force
+          $spirvDir = Join-Path $root 'Lib\cmake\SPIRV-Headers'
+
           Write-Host "=== merged SDK tree ==="
           Get-ChildItem $root -Recurse | Select-Object -ExpandProperty FullName
           @(
             "VULKAN_SDK=$root"
             "Vulkan_ROOT=$root"
-            "CMAKE_PREFIX_PATH=$root"
+            # Both roots: the merged SDK for FindVulkan, the SPIRV-Headers
+            # install prefix for its CONFIG package.
+            "CMAKE_PREFIX_PATH=$root;$spirvDir"
+            "SPIRV-Headers_DIR=$spirvDir"
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "$root\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 

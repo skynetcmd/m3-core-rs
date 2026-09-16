@@ -1,9 +1,11 @@
-# Release workflow — build the m3-core-rs backend wheel matrix and publish.
+# Release workflow — build the m3-core-rs backend wheel matrix and attach it to
+# the GitHub Release for the tag.
 #
-# m3-core-rs ships one Rust source but is published as several differently
-# named PyPI packages, one per (OS, backend) pair, all installing the same
-# `m3_core_rs` import module. The m3 setup wizard detects (os, backend) and
-# installs the matching package. See crates/m3-core-py/build_wheel.py — the
+# m3-core-rs ships one Rust source as several differently named wheels, one per
+# (OS, backend) pair, all installing the same `m3_core_rs` import module. The
+# package names follow PyPI convention because PyPI is a possible (currently
+# disabled) channel, but the wheels are distributed via the Release. The m3
+# setup wizard detects (os, backend) and installs the matching wheel. See crates/m3-core-py/build_wheel.py — the
 # single source of truth for the (os, backend) -> package-name + features
 # mapping; this workflow calls it so the two can never drift.
 #
@@ -13,11 +15,17 @@
 # (nvcc compiles CUDA kernels; glslc compiles Vulkan shaders) — we never run
 # them in CI. Building needs the toolkits, not a device.
 #
-# Publishing uses PyPI Trusted Publishing (OIDC) — no API tokens stored. Each
-# of the 7 PyPI projects must have this repo + workflow registered as a
-# trusted publisher first (https://docs.pypi.org/trusted-publishers/). Until
-# that's set up, run with workflow_dispatch + publish=false to only build and
-# upload wheels as workflow artifacts.
+# THE GITHUB RELEASE IS THE DISTRIBUTION CHANNEL. A `v*` tag builds every
+# backend and attaches all of them to the Release for that tag. That set is
+# complete by construction; PyPI can never be, because the CUDA wheels are an
+# order of magnitude over its 100 MB per-file limit.
+#
+# PyPI publishing is OPT-IN and currently disabled by default (2026-09-16) —
+# see the note on the `publish` job. It still uses Trusted Publishing (OIDC),
+# no API tokens; each PyPI project needs this repo + workflow registered as a
+# trusted publisher (https://docs.pypi.org/trusted-publishers/) before it can
+# work at all. To attempt it anyway:
+#   gh workflow run release.yml -f publish=true
 #
 # checkov:skip=CKV_GHA_7: the `publish` workflow_dispatch input is a constrained
 # boolean (default false) consumed only by an `if: ... == true` equality gate on
@@ -376,15 +384,34 @@ jobs:
   # published. A step that cannot succeed should not run; one that can must not
   # have its failures tolerated.
   #
-  # Known-open as of 2026-07-27: all 5 PyPI-eligible backends fail trusted
-  # publishing (invalid-publisher), so they are stuck on PyPI at 3.7.4
-  # (2026-07-04). The fix is registering each PyPI project's trusted publisher
-  # (repo + workflow + environment) in PyPI's project settings — nothing in this
-  # file can do it. These jobs fail LOUDLY until then, which is correct.
+  # ⛔ DISABLED 2026-09-16 — PyPI is no longer a release channel for this
+  # project. It is opt-in only: `gh workflow run release.yml -f publish=true`.
+  #
+  # Why, in order of weight:
+  #   1. CUDA can never go to PyPI. linux-cuda is ~949 MiB and windows-cuda
+  #      ~244 MiB against a 100 MB per-file limit — an order of magnitude, so
+  #      this is a permanent barrier, not a hurdle a rebuild clears. A channel
+  #      that structurally cannot carry every backend cannot be the canonical
+  #      one, and the GitHub Release already carries all 7.
+  #   2. It has not worked since 2026-07-04. All 5 PyPI-eligible backends fail
+  #      trusted publishing with `invalid-publisher`, so PyPI still serves
+  #      3.7.4 while every tag since shipped a complete Release.
+  #   3. A red publish job on an otherwise-successful release trains readers to
+  #      ignore the workflow status. v2026.9.7 reported FAILURE with all 32
+  #      assets attached and a working release — a false alarm is worse than
+  #      silence, because the next real failure gets waved through too.
+  #
+  # The job is GATED OFF, not deleted: the matrix, the size assertion and the
+  # Trusted Publishing wiring are all still correct and should be reused the day
+  # the publishers are registered. To re-enable permanently, restore
+  # `startsWith(github.ref, 'refs/tags/v')` to the condition below.
+  #
+  # ⚠ `publish-github-release` does NOT depend on this job — both `needs: build`
+  # independently — so disabling this cannot affect the Release.
   publish:
     name: publish ${{ matrix.os_tok }}-${{ matrix.backend }}
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish == 'true'
+    if: inputs.publish == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false     # one backend's PyPI rejection must not cancel the others
@@ -440,9 +467,12 @@ jobs:
 
   # Attach EVERY backend's wheels to the GitHub Release for this tag, so the
   # Release is always a complete set — the guaranteed distribution path when a
-  # wheel (currently: CUDA) is too large for PyPI. `m3 setup` resolves PyPI
-  # first, then falls back here. Runs only on a real tag push (it needs a
-  # Release to attach to); softprops/action-gh-release creates it if absent.
+  # wheel (currently: CUDA) is too large for PyPI. This is the CANONICAL
+  # channel: `m3 setup` resolves the Release FIRST and only then PyPI — see
+  # m3-memory's `rust_core_install.py`, which explains that a PyPI-first cascade
+  # would install the stale 3.7.4 core and stop, because pip exits 0. Runs only
+  # on a real tag push (it needs a Release to attach to);
+  # softprops/action-gh-release creates it if absent.
   publish-github-release:
     name: attach all wheels to GitHub Release
     needs: build

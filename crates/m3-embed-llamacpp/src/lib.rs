@@ -382,7 +382,7 @@ impl EmbeddedBackend {
             let n_batch = n_batch.max(n_ctx);
             let n_ubatch = n_ubatch.max(n_ctx).min(n_batch);
             if req_batch < n_batch || req_ubatch < n_ubatch {
-                eprintln!(
+                log::warn!(
                     "m3-embed: n_batch/n_ubatch ({req_batch}/{req_ubatch}) below \
                      n_ctx ({n_ctx}); raised to {n_batch}/{n_ubatch} — the BERT \
                      encoder requires n_ubatch >= the largest decode chunk"
@@ -513,21 +513,21 @@ pub mod embedded {
     pub(crate) fn maybe_disable_cuda_graphs_for_blackwell() {
         // Skip if the operator already set the var (any value — explicit override wins).
         if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_some() {
-            eprintln!("GGML_CUDA_DISABLE_GRAPHS already set, leaving it alone");
+            log::info!("GGML_CUDA_DISABLE_GRAPHS already set, leaving it alone");
             return;
         }
 
         let cap = detect_cuda_compute_cap();
         match cap {
             Some(c) if c >= 12.0 => {
-                eprintln!("detected CUDA compute cap {c:.1} (Blackwell+) — setting GGML_CUDA_DISABLE_GRAPHS=1");
+                log::info!("detected CUDA compute cap {c:.1} (Blackwell+) — setting GGML_CUDA_DISABLE_GRAPHS=1");
                 std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
             }
             Some(c) => {
-                eprintln!("detected CUDA compute cap {c:.1} (<12.0) — CUDA Graphs enabled");
+                log::info!("detected CUDA compute cap {c:.1} (<12.0) — CUDA Graphs enabled");
             }
             None => {
-                eprintln!("could not detect CUDA compute cap — setting GGML_CUDA_DISABLE_GRAPHS=1 defensively");
+                log::warn!("could not detect CUDA compute cap — setting GGML_CUDA_DISABLE_GRAPHS=1 defensively");
                 std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
             }
         }

@@ -145,6 +145,44 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     env_str(key).and_then(|v| v.parse().ok())
 }
 
+/// Default worker-context count, chosen by the COMPILED backend.
+///
+/// Each stream materialises its own compute graph on first use, sized for a
+/// worst-case `n_ctx` batch, and holds it for the process lifetime. Measured
+/// 2026-09-16 on bge-m3 at `n_ctx=8192`: **~3.85 GiB per stream on CUDA and
+/// ~4.0 GiB on a CPU-only build** — the cost is a property of the model and
+/// `n_ctx`, not of the backend, so a CPU box pays exactly as much per stream as
+/// a GPU box. It is linear in `streams` and quadratic in `n_ctx`.
+///
+/// The split is therefore about the HARDWARE the backend implies, not the
+/// backend's own cost:
+///
+/// * **GPU builds (cuda / vulkan / metal) -> 2.** A machine with a discrete GPU
+///   or Apple unified memory is very likely to have the headroom, and the second
+///   context buys concurrency for bulk ingest.
+/// * **CPU-only -> 1.** A CPU-only deployment is the modest-hardware case
+///   almost by definition, and ~4 GiB for a second graph is a large fraction of
+///   such a machine. Better to ship something that runs than something fast that
+///   will not fit.
+///
+/// ⚠ This is a DEFAULT, not a cap. `M3_EMBED_STREAMS` and the `[embed].streams`
+/// key both still win, so a CPU box with plenty of RAM can raise it and a small
+/// GPU box can lower it. The resolved value is logged at startup.
+const fn default_streams() -> usize {
+    if cfg!(any(
+        feature = "embedded-cuda",
+        feature = "embedded-vulkan",
+        feature = "embedded-metal"
+    )) {
+        // GPU build (cuda / vulkan / metal): 2 contexts.
+        2
+    } else {
+        // CPU-ONLY build: 1 context. This is the modest-hardware case, and a
+        // second compute graph costs ~4 GiB it probably does not have.
+        1
+    }
+}
+
 /// Resolve config with priority: env var > file value > default.
 /// Returns an error only if `gguf` is unresolved (it has no default).
 pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
@@ -171,7 +209,7 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
             .unwrap_or_else(|| "127.0.0.1".into()),
         streams: env_parse("M3_EMBED_STREAMS")
             .or(file.embed.streams)
-            .unwrap_or(2),
+            .unwrap_or_else(default_streams),
         n_ctx: env_parse("M3_EMBED_CTX").or(file.embed.ctx).unwrap_or(8192),
         seq_max: env_parse("M3_EMBED_SEQ_MAX")
             .or(file.embed.seq_max)
@@ -227,4 +265,100 @@ pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
     let s = toml::to_string_pretty(cfg)?;
     std::fs::write(path, s)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The backend-dependent default must actually DIFFER by backend.
+    ///
+    /// A `cfg!` chain that silently always takes one arm looks correct, compiles
+    /// clean, and quietly ships the wrong default to half the fleet. This pins
+    /// the value for whichever backend the test binary was built with, so a
+    /// mis-edited feature name fails here rather than in a user's RAM.
+    #[test]
+    fn default_streams_matches_the_compiled_backend() {
+        let expected = if cfg!(any(
+            feature = "embedded-cuda",
+            feature = "embedded-vulkan",
+            feature = "embedded-metal"
+        )) {
+            2 // GPU build: headroom assumed
+        } else {
+            1 // CPU-only: ~4 GiB per extra graph is too much for modest hardware
+        };
+        assert_eq!(
+            default_streams(),
+            expected,
+            "default_streams() disagrees with the compiled backend"
+        );
+    }
+
+    /// A CPU-only box with spare RAM must still be able to ask for more.
+    /// The default is a floor for the common case, never a cap.
+    #[test]
+    fn file_value_overrides_the_backend_default() {
+        let (file, _guard) = file_config_with_real_gguf(Some(4));
+        let resolved = temp_env_without_streams(|| resolve(&file).expect("resolve"));
+        assert_eq!(resolved.streams, 4, "[embed].streams must beat the default");
+    }
+
+    /// Guard the *other* direction too: with nothing set anywhere, the resolved
+    /// value is the backend default rather than an accidental hardcode.
+    #[test]
+    fn unset_falls_back_to_the_backend_default() {
+        let (file, _guard) = file_config_with_real_gguf(None);
+        let resolved = temp_env_without_streams(|| resolve(&file).expect("resolve"));
+        assert_eq!(resolved.streams, default_streams());
+    }
+
+    /// `resolve()` rejects a non-existent GGUF, so these tests need a real file.
+    /// Returns the config plus a guard whose Drop removes the temp file — the
+    /// path must stay alive for the duration of the call.
+    fn file_config_with_real_gguf(streams: Option<usize>) -> (FileConfig, TempGguf) {
+        let guard = TempGguf::new();
+        let mut file = FileConfig::default();
+        file.embed.gguf = Some(guard.path.to_string_lossy().into_owned());
+        file.embed.streams = streams;
+        (file, guard)
+    }
+
+    struct TempGguf {
+        path: PathBuf,
+    }
+
+    impl TempGguf {
+        fn new() -> Self {
+            // Unique per test: the suite runs threads in one process.
+            let path = std::env::temp_dir().join(format!(
+                "m3-streams-test-{}-{:?}.gguf",
+                std::process::id(),
+                std::thread::current().id(),
+            ));
+            std::fs::write(&path, b"not a real gguf; resolve() only stats it")
+                .expect("write temp gguf");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempGguf {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    /// Run `f` with `M3_EMBED_STREAMS` removed, restoring it afterwards.
+    ///
+    /// Tests share a process, so a stray env var from the developer's shell
+    /// would make these pass or fail for the wrong reason.
+    fn temp_env_without_streams<T>(f: impl FnOnce() -> T) -> T {
+        let saved = std::env::var("M3_EMBED_STREAMS").ok();
+        std::env::remove_var("M3_EMBED_STREAMS");
+        let out = f();
+        if let Some(v) = saved {
+            std::env::set_var("M3_EMBED_STREAMS", v);
+        }
+        out
+    }
 }

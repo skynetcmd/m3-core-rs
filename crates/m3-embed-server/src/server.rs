@@ -22,7 +22,27 @@ use serde::{Deserialize, Serialize};
 use m3_dispatcher::{BreakerCfg, Dispatcher, DispatcherConfig};
 use m3_embed_llamacpp::EmbeddedBackend;
 
-use crate::config::ResolvedConfig;
+use crate::config::{self, ResolvedConfig};
+
+/// Which GPU backend this binary was COMPILED with.
+///
+/// Reported at startup because a backend mismatch is otherwise invisible: a
+/// wheel labelled `-cuda` whose server fell back to CPU presents only as
+/// "embedding got slow". The feature flags are mutually exclusive and enforced
+/// at compile time in `m3-embed-llamacpp`, so at most one arm is ever live.
+const fn compiled_backend() -> &'static str {
+    if cfg!(feature = "embedded-cuda") {
+        "cuda"
+    } else if cfg!(feature = "embedded-vulkan") {
+        "vulkan"
+    } else if cfg!(feature = "embedded-metal") {
+        "metal"
+    } else if cfg!(feature = "embedded") {
+        "cpu"
+    } else {
+        "none (no embed backend compiled in)"
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct EmbedRequest {
@@ -57,12 +77,59 @@ pub async fn run<F>(cfg: ResolvedConfig, shutdown: F) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // n_ctx and streams are the two knobs that decide this process's footprint,
+    // so both belong in the startup line. Each stream materialises its own
+    // compute graph on first use, sized for a worst-case n_ctx batch, and holds
+    // it for the process lifetime -- measured 2026-09-16 at ~3.85 GiB per stream
+    // at n_ctx=8192 on CUDA and ~4.0 GiB on a CPU-only build, matching
+    // n_ctx^2 x heads x 4 bytes. The cost is therefore LINEAR in streams and
+    // QUADRATIC in n_ctx: halving n_ctx cuts it ~4x.
+    //
+    // It is logged rather than merely documented because the growth is lazy --
+    // it appears over the first `streams` requests, which reads as a leak to
+    // anyone watching RSS climb after startup.
+    // A complete startup fingerprint. Every field here was needed to diagnose a
+    // real incident and was absent from the log at the time:
+    //   * gguf   — the server ran for months against a model under a THIRD-PARTY
+    //              app's directory; nothing said so until the path was printed.
+    //   * config — which file those values came from, since env > file > default
+    //              and the wrong file looks identical to no file.
+    //   * backend— a `-cuda` wheel silently falling back to CPU presents only as
+    //              "embedding got slow"; the compiled feature is the only proof.
+    //   * streams/n_ctx — the two knobs that decide the process footprint.
+    //   * n_batch/n_ubatch — these are RAISED to n_ctx at the FFI, so a value set
+    //              here is not necessarily the value in force.
     log::info!(
-        "m3-embed-server starting: host={} port={} streams={} gguf={}",
+        "m3-embed-server starting: host={} port={} backend={} gguf={} config={}",
         cfg.host,
         cfg.port,
+        compiled_backend(),
+        cfg.gguf,
+        config::default_config_path().display(),
+    );
+    log::info!(
+        "embed params: streams={} n_ctx={} seq_max={} n_batch={} n_ubatch={} \
+         coalesce_ms={} max_batch_tokens={}",
         cfg.streams,
-        cfg.gguf
+        cfg.n_ctx,
+        cfg.seq_max,
+        cfg.n_batch,
+        cfg.n_ubatch,
+        cfg.coalesce_ms,
+        cfg.max_batch_tokens,
+    );
+    // Deliberately NOT a computed byte figure: the size depends on the model's
+    // head count and layer shape, which this layer does not know. Printing
+    // `n_ctx^2 * 16 * 4` would be exact for bge-m3 and confidently wrong for
+    // anything else. State the scaling and the measured anchor instead.
+    log::info!(
+        "footprint: {} compute graph(s), allocated lazily on the first \
+         {} request(s) and held for the process lifetime. Scales linearly with \
+         streams and QUADRATICALLY with n_ctx. Anchor: bge-m3 at n_ctx=8192 \
+         measured ~3.85 GiB per stream. Reduce with M3_EMBED_STREAMS or \
+         M3_EMBED_CTX.",
+        cfg.streams,
+        cfg.streams,
     );
 
     let backend = EmbeddedBackend::with_streams_ctx_seqmax_batch(

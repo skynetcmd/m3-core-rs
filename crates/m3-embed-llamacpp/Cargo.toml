@@ -30,6 +30,11 @@ embedded-metal  = ["embedded", "llama-cpp-2/metal"]
 [dependencies]
 m3-error = { workspace = true }
 m3-dispatcher = { workspace = true }
+# Diagnostics here must reach the SERVICE log, not just a console. Under the
+# Windows SCM there is no usable stderr, so `eprintln!` discards the CUDA
+# compute-cap detection and the n_batch/n_ubatch flooring notice — exactly the
+# lines an operator needs when the footprint or the backend looks wrong.
+log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -165,6 +165,13 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
 ///   such a machine. Better to ship something that runs than something fast that
 ///   will not fit.
 ///
+/// ⚠ **This trades THROUGHPUT for memory, it is not a free win.** One context
+/// serves one embedding batch at a time, so at `streams = 1` concurrent callers
+/// queue rather than running in parallel — most visible during bulk ingest.
+/// `queue_depth` on `/metrics` is the signal: sustained non-zero means callers
+/// are waiting and the host would benefit from another stream if it has ~4 GiB
+/// spare.
+///
 /// ⚠ This is a DEFAULT, not a cap. `M3_EMBED_STREAMS` and the `[embed].streams`
 /// key both still win, so a CPU box with plenty of RAM can raise it and a small
 /// GPU box can lower it. The resolved value is logged at startup.

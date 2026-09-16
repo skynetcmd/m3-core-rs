@@ -42,7 +42,17 @@ fn service_main(args: Vec<OsString>) {
     if let Err(e) = run_service(args) {
         // We can't log to stderr usefully under SCM; the env_logger sink
         // (set up by run_dispatcher) will already be pointed at the log file.
-        log::error!("service error: {e}");
+        // That makes this the LAST thing written before the service dies, and
+        // the only record an operator gets — so it names what failed and where
+        // to look rather than echoing the error alone.
+        log::error!(
+            "observed: service startup failed ({e}). \
+             possible: the configured port is already bound, the GGUF model is \
+             missing or unreadable, or the account the service runs as cannot \
+             reach its config. \
+             inspect: %PROGRAMDATA%\\m3-embed-server\\config.toml for [embed].gguf \
+             and [embed].port; the service log beside it for the lines above this one."
+        );
     }
 }
 
@@ -106,6 +116,15 @@ fn init_service_logging() -> std::io::Result<tracing_appender::non_blocking::Wor
     let _ = tracing_log::LogTracer::init();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // ⚠ Timestamps MUST stay UTC. `fmt()`'s default timer is `SystemTime`,
+    // which renders RFC-3339 UTC with a trailing `Z` — verified against the
+    // live log (`2026-09-16T14:56:34.831521Z` while the box read 10:56 local).
+    // These lines are correlated with the Python task logs and a PostgreSQL
+    // warehouse on another host, so a local stamp would line up with neither,
+    // and during the daylight-saving fold an hour of lines repeats with no way
+    // to order them. Do not add `.with_timer(LocalTime…)`; switching to
+    // `UtcTime` would be equivalent but pulls in the `time` feature for no
+    // behavioural gain.
     let subscriber = tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_env_filter(filter)

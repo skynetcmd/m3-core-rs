@@ -138,11 +138,31 @@ async fn embed_handler(
         return Err((StatusCode::BAD_REQUEST, "input is empty".into()));
     }
 
+    // ⚠ ONLY a length problem becomes 413. OOM, a poisoned mutex and a dead
+    // worker pool must keep propagating as 500: mislabelling an infrastructure
+    // failure as a client length error sends an operator off to shrink their
+    // inputs while the real fault goes unreported — the same misdiagnosis
+    // issue #139 caused, in the opposite direction. The match is on the TYPED
+    // variant, never on message text.
     let rows = state
         .dispatcher
         .embed_batch(texts)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("embed failed: {e}")))?;
+        .map_err(|e| match e {
+            m3_error::M3Error::InputTooLong { tokens, n_ctx } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                // Message preserved verbatim so an older client parsing the
+                // text keeps working; the counts are also machine-readable.
+                format!(
+                    "input too long: {tokens} tokens > n_ctx {n_ctx} \
+                     (code=input_too_long observed_tokens={tokens} max_tokens={n_ctx})"
+                ),
+            ),
+            other => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("embed failed: {other}"),
+            ),
+        })?;
 
     let data: Vec<EmbedData> = rows
         .into_iter()
@@ -161,8 +181,30 @@ async fn embed_handler(
     }))
 }
 
-async fn health_handler() -> &'static str {
-    "OK\n"
+/// Liveness probe. Returns JSON `{"status":"ok","model":"..."}`.
+///
+/// ⚠ MUST BE JSON. This previously returned the bare string `"OK\n"`, which
+/// silently disabled m3's own recovery path: `bin/memory/embed.py`'s
+/// `_try_recover_shared_embedder()` does `json.loads()` on this body and
+/// requires `status == "ok"` before it will steer traffic back here. Against a
+/// bare string it raised `JSONDecodeError`, a bare `except` swallowed it, and
+/// the function became structurally dead code -- the server would come back up
+/// and no client would ever notice. Nothing failed loudly; the recovery simply
+/// never happened (§3).
+///
+/// The shape matches upstream `llama-server`, which answers `{"status":"ok"}`
+/// when serving and `503 {"status":"loading model"}` while loading -- i.e. the
+/// contract our client was already written against.
+///
+/// Backward compatible: the literal substring `ok` still appears in the body,
+/// so a caller doing a naive string match keeps working. `model` is included so
+/// a probe can tell WHICH embedder answered without a second request -- an
+/// identity check that matters when several servers can bind this port.
+async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "model": state.model_label,
+    }))
 }
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -23,7 +23,19 @@ python-source = "python"
 # backend), so it must be listed explicitly or maturin would omit it — the exact
 # regression that silently shipped binary-less wheels. Path is relative to
 # python-source. See build_wheel.py::_staged_embed_server.
+#
+# The PDB is listed for the same reason and is easy to get wrong twice over:
+# (1) it is gitignored like the binary, so maturin omits it unless named here;
+# (2) its name is NOT the exe's. Cargo names the binary from the [[bin]] target
+#     (`m3-embed-server.exe`, hyphens); MSVC names the PDB from the crate, which
+#     Rust normalises to underscores (`m3_embed_server.pdb`).
+# Without it a crash dump cannot be attributed to our frames: a debugger matches
+# on the CODEVIEW GUID embedded in the PE, so a PDB from any other build is
+# rejected -- or, if forced, yields a plausible WRONG stack under the same
+# filename. Observed 2026-09-16 (deployed GUID 25E9D9EF-..., only PDB on disk
+# 5AA032C4-...). Windows-only; absent elsewhere and simply not matched.
 include = [
   { path = "m3_core_rs/m3-embed-server", format = "wheel" },
   { path = "m3_core_rs/m3-embed-server.exe", format = "wheel" },
+  { path = "m3_core_rs/m3_embed_server.pdb", format = "wheel" },
 ]

@@ -1,0 +1,6 @@
+# Shell scripts must be LF in the repo and in the checkout. A CRLF checkout
+# breaks the shebang on macOS/Linux ("bad interpreter: /bin/sh^M"), and the
+# pre-commit hook below is the guard against a silent wheel-naming leak — a
+# guard that fails to execute is worse than none.
+*.sh text eol=lf
+.githooks/* text eol=lf

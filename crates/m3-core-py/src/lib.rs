@@ -43,6 +43,11 @@ impl From<PyM3Error> for PyErr {
             M3Error::DatabaseLocked | M3Error::Io(_) | M3Error::Backend(_) => {
                 PyOSError::new_err(e.0.to_string())
             }
+            // Oversize input is a CALLER error, so ValueError — not OSError.
+            // It groups with VectorDimMismatch (the caller passed something the
+            // model cannot accept), not with Backend/Io (the environment
+            // failed). The same distinction the HTTP layer draws as 413-vs-500.
+            M3Error::InputTooLong { .. } => PyValueError::new_err(e.0.to_string()),
             M3Error::Parity { .. } | M3Error::Other(_) => PyValueError::new_err(e.0.to_string()),
         }
     }

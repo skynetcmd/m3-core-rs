@@ -17,7 +17,8 @@ embedded = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:crossbeam-channel"]
 # Wave 9.0 — GPU backends. Mutually exclusive: pick exactly one per build.
 # Each enables `embedded` (additive features) + the corresponding upstream
 # llama-cpp-2 backend feature. Confirmed against llama-cpp-2 0.1.146's
-# Cargo.toml: feature names are `cuda`, `vulkan`, `metal` (each forwards to
+# Cargo.toml and re-confirmed against 0.1.156's: feature names are
+# `cuda`, `vulkan`, `metal` (each forwards to
 # `llama-cpp-sys-2/<name>`). Mutual exclusivity is enforced at compile time
 # in src/lib.rs via `compile_error!`. Actual GPU builds are wired in waves
 # 9.2 (CUDA) and 9.6 (Vulkan/Metal); this wave only stages the feature
@@ -34,12 +35,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 # Only compiled when the `embedded` feature is on. CPU-only: no cuda/metal/etc.
-llama-cpp-2 = { version = "0.1.146", optional = true, default-features = false }
+llama-cpp-2 = { version = "0.1.156", optional = true, default-features = false }
 # Wave-3 fix #1: needed for the `LLAMA_FLASH_ATTN_TYPE_ENABLED` enum constant
 # passed to `LlamaContextParams::with_flash_attention_policy`. The llama-cpp-2
 # crate does not re-export `llama_cpp_sys_2`, so we depend on it directly.
-# Pinned to the same 0.1.146 patch as llama-cpp-2 to share the same C build.
-llama-cpp-sys-2 = { version = "0.1.146", optional = true, default-features = false }
+# Pinned to the same 0.1.156 patch as llama-cpp-2 to share the same C build.
+llama-cpp-sys-2 = { version = "0.1.156", optional = true, default-features = false }
 # Wave-3 fix #4: lock-free MPMC channel so the worker pool's job dispatch is
 # not serialized through a `Mutex<Receiver>`. Used unconditionally inside the
 # `embedded` module, which is itself feature-gated.

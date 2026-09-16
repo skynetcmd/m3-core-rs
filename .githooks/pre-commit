@@ -1,0 +1,73 @@
+#!/bin/sh
+# Refuse to commit build-time contamination from an in-repo wheel build.
+#
+# WHY THIS EXISTS
+# `crates/m3-core-py/build_wheel.py` temporarily rewrites `[project].name` in
+# `crates/m3-core-py/pyproject.toml` to the per-backend package name
+# (m3-core-rs-windows-cuda, ...) so maturin emits the right wheel, and restores
+# the original bytes in a `finally`. A build that dies HARD -- Ctrl-C, OOM kill,
+# a crashed shell -- never runs that `finally` and leaves the patched name in
+# the working tree.
+#
+# Committing that publishes EVERY subsequent wheel under the wrong project name,
+# and nothing downstream notices: the wheel builds, installs and imports fine.
+# Observed 2026-09-07 after a Vulkan C1083 failure.
+#
+# The documented mitigation was "always `git status --porcelain` before
+# committing" -- a discipline that works until the one time it is skipped. This
+# hook makes it mechanical, which is the point: the failure mode is silent, so
+# the guard must not depend on remembering.
+#
+# It is also what makes building in the working repo safe. The runbook says
+# "never build in a working repo"; the actual hazards are (a) this name leak,
+# (b) a poisoned CMakeCache.txt, (c) stale files on disposable remote build
+# boxes. This closes (a) mechanically. (b) is handled by clearing the cache on
+# failure and is not a commit-time concern. (c) does not apply locally.
+#
+# Bypass with `git commit --no-verify` only if you are DELIBERATELY changing the
+# canonical package name -- and if you are, update this hook in the same commit.
+
+set -e
+
+PYPROJECT="crates/m3-core-py/pyproject.toml"
+CANONICAL='name = "m3-core-rs"'
+
+# Only inspect the file as it would be COMMITTED (the index), not the working
+# tree: a build may legitimately be running right now with the name patched,
+# and that is fine as long as the staged content is canonical.
+if git diff --cached --name-only | grep -qx "$PYPROJECT"; then
+    staged_name=$(git show ":$PYPROJECT" 2>/dev/null \
+                  | awk '/^\[project\]/{p=1;next} /^\[/{p=0} p && /^name *=/{print;exit}')
+
+    if [ -n "$staged_name" ] && [ "$staged_name" != "$CANONICAL" ]; then
+        echo "pre-commit: REFUSING — $PYPROJECT has a patched [project].name staged." >&2
+        echo "" >&2
+        echo "  staged:   $staged_name" >&2
+        echo "  expected: $CANONICAL" >&2
+        echo "" >&2
+        echo "This is build_wheel.py's per-backend patch left behind by a build that" >&2
+        echo "died before its finally-block ran. Committing it would publish every" >&2
+        echo "subsequent wheel under the wrong project name, silently." >&2
+        echo "" >&2
+        echo "Fix:  git checkout -- $PYPROJECT" >&2
+        exit 1
+    fi
+fi
+
+# Staged build artifacts. .gitignore already covers these in the package dir,
+# but an explicit `git add -f` or a path outside that dir would slip through,
+# and a committed backend-specific binary ships the WRONG backend in a wheel.
+artifacts=$(git diff --cached --name-only \
+            | grep -E '(^|/)m3-embed-server(\.exe)?$|\.(pyd|pdb|so|dylib)$' || true)
+if [ -n "$artifacts" ]; then
+    echo "pre-commit: REFUSING — build artifacts staged:" >&2
+    echo "$artifacts" | sed 's/^/  /' >&2
+    echo "" >&2
+    echo "These are generated per-build and backend-specific. A committed copy" >&2
+    echo "would ship the wrong backend in a later wheel." >&2
+    echo "" >&2
+    echo "Fix:  git restore --staged <paths>" >&2
+    exit 1
+fi
+
+exit 0

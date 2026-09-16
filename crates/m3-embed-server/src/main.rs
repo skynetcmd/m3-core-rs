@@ -131,7 +131,13 @@ async fn shutdown_signal() {
         Ok(s) => s,
         Err(e) => {
             // Can't install the SIGTERM handler — fall back to ctrl-c only.
-            log::warn!("could not install SIGTERM handler: {e}; ctrl-c only");
+            log::warn!(
+                "observed: SIGTERM handler could not be installed ({e}). \
+                 effect: shutdown is driven by ctrl-c only, so a supervisor \
+                 stopping this process will kill it rather than let it drain. \
+                 inspect: whether the process is running under a restricted \
+                 signal mask or a sandbox that blocks signal registration."
+            );
             let _ = tokio::signal::ctrl_c().await;
             log::info!("ctrl-c received, draining...");
             return;

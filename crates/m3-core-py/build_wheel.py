@@ -34,9 +34,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -208,11 +210,54 @@ def _staged_embed_server(features: list[str], release: bool):
     staged = _PY_PKG_DIR / exe
     shutil.copy2(built, staged)
     print(f"[build_wheel] staged {exe} -> {staged.relative_to(_HERE)}")
+
+    # Ship the PDB next to the binary on Windows.
+    #
+    # WHY: a crash dump is only attributable to OUR frames if a PDB matching the
+    # crashing image is available, and a debugger matches on the CODEVIEW
+    # GUID+age embedded in the PE -- not on filename or date. MSVC emits a PDB
+    # for release builds by default, but it stayed in target/ and was never
+    # deployed, so on 2026-09-16 the deployed binary
+    # (GUID 25E9D9EF-7EAD-443E-A2BF-5B0AD80DD25D) had no retrievable symbols:
+    # the only PDB on disk belonged to a different build
+    # (GUID 5AA032C4-AEFD-458A-9348-6A00F136B172) and would be REJECTED -- or
+    # worse, forced, yielding a plausible wrong stack under the same filename.
+    #
+    # Staging it here keeps binary and symbols in one artifact so they cannot
+    # drift apart. Absence is non-fatal (a toolchain that emits no PDB is not a
+    # reason to fail a wheel) but is REPORTED rather than silent -- a missing
+    # PDB must not first be discovered from an unreadable dump.
+    # ⚠ The PDB is NOT `<exe stem>.pdb`. Cargo names the binary from the Cargo
+    # [[bin]] target (`m3-embed-server.exe`, hyphens) but MSVC names the PDB
+    # from the crate name, which Rust normalises to underscores
+    # (`m3_embed_server.pdb`). Deriving it with `.with_suffix('.pdb')` finds
+    # nothing -- observed 2026-09-16, when the wheel shipped without symbols and
+    # only the WARNING below revealed it.
+    #
+    # So try the hyphen form, then the underscore form. Do not "simplify" this
+    # to one name: the two conventions are set by different tools.
+    staged_pdb = None
+    if sys.platform.startswith("win"):
+        pdb_src = built.with_suffix(".pdb")
+        if not pdb_src.exists():
+            pdb_src = built.with_name(built.stem.replace("-", "_") + ".pdb")
+        if pdb_src.exists():
+            staged_pdb = _PY_PKG_DIR / pdb_src.name
+            shutil.copy2(pdb_src, staged_pdb)
+            print(f"[build_wheel] staged {pdb_src.name} -> "
+                  f"{staged_pdb.relative_to(_HERE)}")
+        else:
+            print(f"[build_wheel] WARNING: no PDB beside {built.name} "
+                  f"({pdb_src}); crash dumps from this wheel will not resolve "
+                  f"our frames")
     try:
         yield
     finally:
         with contextlib.suppress(FileNotFoundError):
             staged.unlink()
+        if staged_pdb is not None:
+            with contextlib.suppress(FileNotFoundError):
+                staged_pdb.unlink()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -269,7 +314,41 @@ def main(argv: list[str] | None = None) -> int:
     # maturin bundles it. Both happen under the patched package name.
     with _patched_name(name), _staged_embed_server(features, args.release):
         proc = subprocess.run(cmd, cwd=_HERE, env=os.environ.copy())
-    return proc.returncode
+    if proc.returncode != 0:
+        return proc.returncode
+
+    # VERIFY THE WHEEL, don't trust the staging log.
+    #
+    # Staging a file into python-source is necessary but NOT sufficient: these
+    # artifacts are gitignored, and maturin omits gitignored files unless they
+    # are named in [tool.maturin].include. On 2026-09-16 the log read
+    # "staged m3_embed_server.pdb" on a build whose wheel contained no PDB --
+    # the staging succeeded and maturin dropped it, so the only signal said
+    # everything was fine.
+    #
+    # That is the failure this check exists to prevent: a quieter log is not a
+    # fixed problem. Assert against the wheel's actual member list.
+    wheels = sorted(pathlib.Path(out_dir).glob("*.whl"),
+                    key=lambda p: p.stat().st_mtime)
+    if wheels:
+        with zipfile.ZipFile(wheels[-1]) as z:
+            members = set(z.namelist())
+        exe_member = f"m3_core_rs/{_EMBED_SERVER_BIN}" + (
+            ".exe" if sys.platform.startswith("win") else "")
+        if exe_member not in members:
+            print(f"[build_wheel] error: {wheels[-1].name} does not contain "
+                  f"{exe_member}", file=sys.stderr)
+            return 1
+        if sys.platform.startswith("win"):
+            pdbs = [m for m in members if m.endswith(".pdb")]
+            if pdbs:
+                print(f"[build_wheel] verified: wheel contains {pdbs[0]}")
+            else:
+                # Non-fatal: a wheel without symbols still works. Loud, because
+                # the cost lands much later, on an unreadable crash dump.
+                print("[build_wheel] WARNING: wheel contains NO .pdb — crash "
+                      "dumps from it will not resolve our frames", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":

@@ -896,10 +896,14 @@ pub mod embedded {
                 .str_to_token(text, AddBos::Always)
                 .map_err(|e| M3Error::Backend(format!("tokenize failed: {e}")))?;
             if tokens.len() > n_ctx_usize {
-                return Err(M3Error::Backend(format!(
-                    "input too long: {} tokens > n_ctx {}",
-                    tokens.len(), n_ctx
-                )));
+                // Typed, not Backend(String): the HTTP layer maps this to 413
+                // while real backend faults stay 500. Counts travel as fields
+                // so no caller has to parse the message. Display still renders
+                // the original wording verbatim.
+                return Err(M3Error::InputTooLong {
+                    tokens: tokens.len(),
+                    n_ctx: n_ctx as usize,
+                });
             }
             tokenized.push(tokens);
         }

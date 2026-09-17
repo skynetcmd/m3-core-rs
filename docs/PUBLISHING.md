@@ -18,9 +18,9 @@ GPU and runs `pip install m3-core-rs-<os>-<backend>` for the matching package.
 macOS is Metal-only by design — Apple Silicon always has a Metal GPU, so a
 CPU-only mac package would be pointless.
 
-Each (os, backend) ships across the supported CPython matrix: **3.11, 3.12,
-3.13, 3.14** (cp311–cp314). A full release is therefore 7 packages × 4
-interpreters = 28 wheels.
+Each (os, backend) ships across the supported CPython matrix: **3.12,
+3.13, 3.14** (cp312–cp314). A full release is therefore 7 packages × 3
+interpreters = 21 wheels.
 
 ## Distribution policy: PyPI for wheels that fit, GitHub Release for all of them
 

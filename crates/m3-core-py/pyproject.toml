@@ -5,7 +5,19 @@ build-backend = "maturin"
 [project]
 name = "m3-core-rs"
 description = "PyO3-backed Rust core for m3-memory (Project Oxidation)."
-requires-python = ">=3.9"
+# Tracks m3-memory's floor, which this crate exists to serve: m3-memory raised
+# requires-python to >=3.12 on 2026-09-13 (e43f0a1b) and its classifiers list
+# 3.12/3.13/3.14. The previous ">=3.9" was the untouched value from the first
+# Oxidation commit and was never true in practice: these wheels are built
+# per-interpreter (no abi3), so a 3.9 or 3.10 wheel has never existed.
+#
+# This floor IS enforced on our real install path even though nothing resolves
+# from an index. m3-memory's rust_core_install.py downloads a Release asset and
+# runs `pip install --force-reinstall --no-deps <path>.whl`; pip still reads
+# Requires-Python from the wheel's METADATA and refuses with "requires a
+# different Python" (verified 2026-09-16). Declaring the truth turns a confusing
+# ImportError or source-build attempt into that clear message.
+requires-python = ">=3.12"
 license = { text = "MIT" }
 dynamic = ["version"]
 

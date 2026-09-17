@@ -10,12 +10,12 @@ cross-platform script so the OS-specific logic lives in exactly one place.
 
 It is a thin driver around `build_wheel.py` (the single source of truth for the
 (os, backend) -> package-name/features mapping). For each requested backend it
-resolves the four interpreters, invokes `build_wheel.py` once, and writes a log.
+resolves the interpreters, invokes `build_wheel.py` once, and writes a log.
 
 Usage:
     python build_local.py <backend>...          # one or more of cpu vulkan cuda metal
     python build_local.py all                   # every backend valid for this host OS
-    python build_local.py cpu --pythons 3.11 3.12
+    python build_local.py cpu --pythons 3.12 3.13
     python build_local.py vulkan --no-smoke-test
 
 Backends must be valid for the host OS (see build_wheel._MATRIX); invalid combos
@@ -56,7 +56,10 @@ from build_wheel import _MATRIX, host_os, package_name  # noqa: E402
 
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent
-_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
+# Must not go below pyproject's requires-python: a cp311 wheel tagged for an
+# interpreter the metadata rejects is uninstallable everywhere. m3-memory's
+# floor moved to >=3.12 on 2026-09-13 (e43f0a1b), so 3.11 is dropped.
+_PYTHONS = ("3.12", "3.13", "3.14")
 
 # A path is a virtualenv interpreter (never use one to build a wheel) if it sits
 # under a venv layout. uv may return the active project venv from a plain

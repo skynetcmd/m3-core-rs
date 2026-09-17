@@ -12,14 +12,14 @@ publisher side) and [`crates/m3-core-py/build_wheel.py`](crates/m3-core-py/build
 
 > **TL;DR**: `m3-core-rs` is one Rust source tree published as **7 differently
 > named PyPI projects** — one per `(OS, backend)` — each containing **one wheel
-> per supported CPython** (3.11–3.14). All install the same `m3_core_rs` import
+> per supported CPython** (3.12–3.14). All install the same `m3_core_rs` import
 > module. CI (`.github/workflows/release.yml`) builds the matrix on native
 > runners and publishes via PyPI Trusted Publishing. Wheels are **never** committed
 > to git.
 
 ---
 
-## 1. The model — why 7 projects × 4 Pythons
+## 1. The model — why 7 projects × 3 Pythons
 
 `m3-core-rs` is **one crate** but ships as several PyPI packages because the GPU
 backend is compiled in, and a CUDA wheel can't run on a Vulkan/CPU host. So the
@@ -54,8 +54,8 @@ version** rides in the wheel filename's `cpXY` compatibility tag.
    in-process (dim 1024, L2-norm 1.0, `embed_backend_label()` == `cpu`).
 
 2. **Python versions are NOT separate projects, tags, or publishers.** One
-   project + version holds 4 wheels (`...-cp311-...`, `-cp312-`, `-cp313-`,
-   `-cp314-`). pip picks the match. You never make a per-Python tag or
+   project + version holds 3 wheels (`...-cp312-...`, `-cp313-`, `-cp314-`).
+   The installer picks the match by filename. You never make a per-Python tag or
    publisher — that fights the ecosystem. The git tag (`v2026.7.25`) stores
    the **package version** (`3.7.25`) only.
 
@@ -77,17 +77,58 @@ wizard's `pip install m3-core-rs-<os>-<backend>==<ver>` will **not** find it.
 
 ## 2. Supported Python versions
 
-m3-memory declares `requires-python >= 3.11`; the wheel matrix covers
-**3.11, 3.12, 3.13, 3.14**. Build all four for every package. A user on a Python
-outside this range gets a source-build fallback (needs Rust + a compiler) or the
-CPU embed-server path — functional but slow, so keep the prebuilt set complete.
+m3-memory declares `requires-python >= 3.12` (raised 2026-09-13, `e43f0a1b`);
+the wheel matrix covers **3.12, 3.13, 3.14**. Build all three for every package.
+A user on a Python outside this range gets a source-build fallback (needs Rust +
+a compiler) or the CPU embed-server path — functional but slow, so keep the
+prebuilt set complete.
+
+Three places must agree, and nothing enforces it — check all three when the
+floor moves:
+
+| Where | What |
+|---|---|
+| `crates/m3-core-py/pyproject.toml` | `requires-python` — the floor pip enforces |
+| `crates/m3-core-py/build_local.py` | `_PYTHONS` — local build matrix |
+| `.github/workflows/release.yml` | `setup-python` list, `--interpreter` args, smoke-test loop |
+
+A wheel built for an interpreter below the declared floor is uninstallable
+everywhere: pip reads `Requires-Python` from the wheel's own METADATA and
+refuses, even on a direct-path `--no-deps` install (verified 2026-09-16).
+
+That direct-path install is the real distribution channel — these wheels are
+**not** resolved from PyPI. `m3-memory`'s `rust_core_install.py` downloads the
+Release asset by filename and runs
+`pip install --force-reinstall --no-deps <path>.whl`. Consequences: a missing
+cpXY wheel is a hard miss rather than a fallback to a neighbouring version, and
+the filename mapping in that module must stay in step with the names
+`build_wheel.py` emits.
+
+⚠ **m3-memory's CI already tests 3.15** while this matrix stops at 3.14. When
+3.15 ships, those users get the slow source-build path until it is added here.
+
+### 3.9.16 is the cutover release — do not "fix" its cp311 wheels
+
+`v2026.9.16` was BUILT BEFORE the floor moved, so all 28 of its wheels carry
+`Requires-Python: >=3.9` in their METADATA, cp311 included. That is deliberate
+and is being shipped as-is:
+
+* the cp311 wheels install and run on 3.11, so a user on an unsupported
+  interpreter can try them manually;
+* nothing supported is affected — m3-memory itself requires >=3.12;
+* rebuilding to make the metadata match would discard a verified 28-wheel fleet
+  (the CUDA builds alone take hours) for no user-visible gain.
+
+From the next release the floor and the matrix agree: 21 wheels, cp312–cp314,
+`Requires-Python: >=3.12`. If you are comparing an old release against a new one
+and the asset counts differ, this is why.
 
 Debian/most distros don't ship every version. The clean way to get them without
 polluting the system Python is **[`uv`](https://docs.astral.sh/uv/)**:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv python install 3.11 3.12 3.13 3.14    # standalone CPython builds in ~/.local
+uv python install 3.12 3.13 3.14    # standalone CPython builds in ~/.local
 ```
 
 ---
@@ -178,7 +219,7 @@ not once per (backend, version)):
 
 ```bash
 # Builds every backend valid on this host (linux: cpu, vulkan, cuda) × the
-# default cp311–314, in the cache-optimal order, smoke-testing each.
+# default cp312–314, in the cache-optimal order, smoke-testing each.
 python crates/m3-core-py/build_local.py all
 # Or a subset / specific Pythons:
 python crates/m3-core-py/build_local.py cpu vulkan --pythons 3.11 3.12
@@ -420,8 +461,9 @@ $got  = (Get-FileHash $wheel -Algorithm SHA256).Hash.ToLower()
 if ($want -eq $got) { 'OK' } else { 'MISMATCH - do not install' }
 ```
 
-`--ignore-missing` matters: `SHA256SUMS` lists all 28 wheels for the release and
-you will normally have downloaded one, so a plain `-c` reports the other 27 as
+`--ignore-missing` matters: `SHA256SUMS` lists every wheel in the release (21
+from 3.10.x onward; 28 for releases through 3.9.16, which still shipped cp311)
+and you will normally have downloaded one, so a plain `-c` reports the rest as
 missing and exits nonzero.
 
 ⚠ This confirms the bytes you got are the bytes we published. It does **not**

@@ -180,6 +180,23 @@ def _find_vulkan_sdk() -> str | None:
     return str(sorted(candidates, key=_ver_key)[-1])
 
 
+def _find_on_path(path_value: str, exe: str) -> str | None:
+    """Absolute path to ``exe`` within ``path_value``, or None.
+
+    Deliberately NOT ``shutil.which``: that searches the CURRENT process's
+    PATH, while the value we care about is the merged vcvars+caller PATH we
+    are about to hand to the child build.
+    """
+    for d in path_value.split(os.pathsep):
+        d = d.strip().strip('"')
+        if not d:
+            continue
+        cand = Path(d) / exe
+        if cand.is_file():
+            return str(cand)
+    return None
+
+
 def _vcvars_env() -> dict[str, str] | None:
     """Environment produced by running MSVC's ``vcvars64.bat``, or None.
 
@@ -357,11 +374,71 @@ def build_one(
             # cargo and python, which vcvars64 knows nothing about.
             vc_path = next((v for k, v in vc.items() if k.upper() == "PATH"), "")
             if vc_path:
-                env["PATH"] = vc_path + os.pathsep + env.get("PATH", "")
+                # DEDUPLICATE, don't just concatenate. vcvars64 builds its PATH
+                # by prepending the toolchain dirs to the PATH it inherited, so
+                # a naive merge repeats nearly every caller entry: measured
+                # 5688 + 4261 -> 9950 bytes on this machine.
+                #
+                # That overruns cmd.exe's 8191-byte command-line limit, and nvcc
+                # is where it bites: nvcc shells out to the host compiler from a
+                # GENERATED BATCH FILE whose first statement is
+                # `set PATH=<nvcc dirs>;<inherited PATH>`. cmd truncates that
+                # assignment, the MSVC entry falls off the end, and nvcc reports
+                #     'cl.exe' is not recognized as an internal or external command
+                # while cl.exe is plainly present and on our PATH. -ccbin does
+                # NOT rescue this: nvcc still invokes `cl.exe` by bare name
+                # inside that batch file (verified 2026-09-16 -- the flag
+                # reached nvcc and the failure was identical).
+                #
+                # Order is preserved and vcvars wins, so the toolchain still
+                # shadows any stale compiler further down the caller's PATH.
+                seen: set[str] = set()
+                merged: list[str] = []
+                for entry in (vc_path + os.pathsep + env.get("PATH", "")).split(os.pathsep):
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    key = entry.rstrip("\\" + "/").lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(entry)
+                env["PATH"] = os.pathsep.join(merged)
+                print(f"[build_local] {backend}: PATH {len(env['PATH'])} bytes "
+                      f"after dedup ({len(merged)} entries; cmd.exe limit 8191)")
         else:
             print(f"[build_local] WARNING: MSVC (vcvars64) not found — {backend} "
                   "will likely fail in llama-cpp-sys's cmake step. Install VS "
                   "Build Tools with the C++ workload.")
+
+        # CUDA only: name the host compiler explicitly (defence in depth).
+        #
+        # ⚠ This is NOT what fixed the `'cl.exe' is not recognized` failure —
+        # the PATH dedup above is. -ccbin was tried FIRST and did not help:
+        # verified 2026-09-16 that the flag reached nvcc ("Id flags:
+        # ...-ccbin=...") and the failure was byte-identical, because nvcc
+        # still invokes `cl.exe` by bare name from its generated batch file
+        # after re-`set`ting PATH. Do not remove the dedup on the assumption
+        # that this block covers it.
+        #
+        # It is kept because it costs nothing and removes the PATH search from
+        # the paths that DO honour it (cmake's own compiler probe), which makes
+        # a future toolchain mismatch fail with a clear message rather than by
+        # silently picking a different cl.exe. CMake forwards
+        # CMAKE_CUDA_HOST_COMPILER to -ccbin; CUDAHOSTCXX is the env-var seam
+        # that sets it, and cmake honours it on first configure.
+        if backend == "cuda":
+            cl = _find_on_path(env.get("PATH", ""), "cl.exe")
+            if cl:
+                env.setdefault("CUDAHOSTCXX", cl)
+                flags = env.get("CUDAFLAGS", "").strip()
+                if "-ccbin" not in flags:
+                    env["CUDAFLAGS"] = (flags + f' -ccbin "{cl}"').strip()
+                print(f"[build_local] cuda: -ccbin -> {cl}")
+            else:
+                print("[build_local] WARNING: cuda backend but cl.exe not found "
+                      "on PATH after vcvars — the MSVC C++ workload may be "
+                      "missing. The cmake CUDA compiler probe will likely fail.")
 
         env.setdefault("CMAKE_GENERATOR", "Ninja")
 

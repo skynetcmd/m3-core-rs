@@ -165,6 +165,13 @@ sha256sum -c SHA256SUMS                   # self-check BEFORE upload; all must s
 gh release upload v2026.06.07 SHA256SUMS --clobber
 ```
 
+Then **commit a copy of the digests to the repo** as
+`docs/releases/v<tag>-SHA256SUMS.md`. The published `SHA256SUMS` asset sits next
+to the wheels, so whoever could replace an asset could replace it too; a copy
+under version control gives the digests a reference the Release cannot silently
+rewrite, and makes any later divergence visible in git history. It is still not
+a signature — see the attestation note below.
+
 Write **basenames only** (no path prefix): `sha256sum -c` resolves each entry
 relative to the current directory, so a prefix would force users to recreate our
 build layout. The `*` binary-mode marker GNU coreutils emits is fine — verified

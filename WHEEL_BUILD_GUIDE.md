@@ -387,6 +387,50 @@ gh release upload v2026.7.25 <wheel>... --clobber
 Install from a Release asset URL:
 `pip install https://github.com/skynetcmd/m3-core-rs/releases/download/v2026.7.25/<wheel>`
 
+### Verifying a downloaded wheel
+
+Every release carries a `SHA256SUMS` asset covering all of that release's
+wheels. Installing straight from a Release URL bypasses the hash check pip does
+for PyPI downloads, so verify before installing — especially the multi-hundred-MB
+CUDA wheels, where a truncated transfer looks fine until import fails.
+
+```bash
+BASE=https://github.com/skynetcmd/m3-core-rs/releases/download/v2026.7.25
+curl -LO $BASE/SHA256SUMS
+curl -LO $BASE/<wheel>
+
+# Linux
+sha256sum -c --ignore-missing SHA256SUMS
+# macOS (BSD shasum has no --ignore-missing; grep the one line instead)
+grep "<wheel>" SHA256SUMS | shasum -a 256 -c
+```
+
+```powershell
+# Windows PowerShell -- use the EXACT filename, and -SimpleMatch.
+# Without -SimpleMatch the pattern is a regex (so '.' matches any character),
+# and a partial name like 'cp314-cp314-win_amd64.whl' matches three lines --
+# cuda, cpu and vulkan all ship that tag. Select-String then returns an ARRAY
+# and .Line silently yields nothing, so the comparison fails for the wrong
+# reason. The -match guard below turns that into an explicit error.
+$wheel = '<wheel>'
+$line  = @(Select-String -Path SHA256SUMS -Pattern $wheel -SimpleMatch)
+if ($line.Count -ne 1) { throw "expected 1 entry for $wheel, found $($line.Count)" }
+$want = $line[0].Line.Split(' ')[0]
+$got  = (Get-FileHash $wheel -Algorithm SHA256).Hash.ToLower()
+if ($want -eq $got) { 'OK' } else { 'MISMATCH - do not install' }
+```
+
+`--ignore-missing` matters: `SHA256SUMS` lists all 28 wheels for the release and
+you will normally have downloaded one, so a plain `-c` reports the other 27 as
+missing and exits nonzero.
+
+⚠ This confirms the bytes you got are the bytes we published. It does **not**
+prove who published them — anyone able to replace a Release asset could replace
+`SHA256SUMS` alongside it. For build provenance, prefer a release that carries
+GitHub artifact attestations (`gh attestation verify <wheel> --repo
+skynetcmd/m3-core-rs`), which are signed and tied to the building workflow.
+Locally-built releases cannot carry them.
+
 > Wheels are build outputs, **not** source — they're `.gitignore`d in both
 > repos (`*.whl`, `dist/`). Never `git add` a wheel.
 

@@ -145,6 +145,36 @@ wheels to the Windows box) and attach them to the release tag with `--clobber` (
 gh release upload v2026.06.07 <wheel> [<wheel> ...] --clobber
 gh release view  v2026.06.07 --json assets --jq '.assets[].name' | sort   # verify
 ```
+
+#### Generate `SHA256SUMS` before uploading
+
+These wheels are installed by **URL from a Release asset**, not from PyPI. pip
+verifies a PyPI download against the hash PyPI serves in its JSON API; a raw
+GitHub asset download has no such backstop, so without a published digest a user
+following our own install line has nothing to check against. That matters most
+for the large wheels — a truncated 980 MB `linux-cuda` transfer is otherwise
+indistinguishable from a good one until it fails at import.
+
+Generate it over the **staged** wheels, i.e. the exact bytes being uploaded, and
+upload it as one more asset:
+
+```bash
+cd <staging-dir>
+sha256sum *.whl | sort -k2 > SHA256SUMS   # macOS: shasum -a 256 *.whl | sort -k2
+sha256sum -c SHA256SUMS                   # self-check BEFORE upload; all must say OK
+gh release upload v2026.06.07 SHA256SUMS --clobber
+```
+
+Write **basenames only** (no path prefix): `sha256sum -c` resolves each entry
+relative to the current directory, so a prefix would force users to recreate our
+build layout. The `*` binary-mode marker GNU coreutils emits is fine — verified
+accepted by `sha256sum` on Linux and `shasum` on macOS.
+
+⚠ **A checksum file is an integrity control, not an authenticity one.** Anyone
+who can replace a Release asset can replace `SHA256SUMS` next to it. It defends
+against corruption and truncation and lets a user confirm the download matches
+what we intended; it does not prove who built it. Signing is what provides that
+— see the attestation note in the CI section.
 The release stays a **draft** until every wave is attached; publish when the
 matrix is complete. Tag convention is date-based: `v2026.06.07` for the 3.6.6
 release.

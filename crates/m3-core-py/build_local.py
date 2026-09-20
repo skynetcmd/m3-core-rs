@@ -59,7 +59,17 @@ _REPO_ROOT = _HERE.parent.parent
 # Must not go below pyproject's requires-python: a cp311 wheel tagged for an
 # interpreter the metadata rejects is uninstallable everywhere. m3-memory's
 # floor moved to >=3.12 on 2026-09-13 (e43f0a1b), so 3.11 is dropped.
-_PYTHONS = ("3.12", "3.13", "3.14")
+#
+# Keep in lockstep with release.yml's setup-python list. 3.15 is included
+# because m3-memory's CI already tests it; without a cp315 wheel those users
+# silently fall through to a slow source build (the asset is matched BY
+# FILENAME, so a missing tag is a hard miss, not a downgrade).
+#
+# ⚠ 3.15 is PRE-RELEASE until GA. `uv python install 3.15` resolves it, but a
+# host that only has stable interpreters will report it MISSING — that is
+# expected, not a broken environment. Use --pythons to build a subset locally;
+# CI is the place the full matrix has to be complete.
+_PYTHONS = ("3.12", "3.13", "3.14", "3.15")
 
 # A path is a virtualenv interpreter (never use one to build a wheel) if it sits
 # under a venv layout. uv may return the active project venv from a plain

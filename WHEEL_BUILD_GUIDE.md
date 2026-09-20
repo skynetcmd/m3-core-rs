@@ -12,14 +12,14 @@ publisher side) and [`crates/m3-core-py/build_wheel.py`](crates/m3-core-py/build
 
 > **TL;DR**: `m3-core-rs` is one Rust source tree published as **7 differently
 > named PyPI projects** — one per `(OS, backend)` — each containing **one wheel
-> per supported CPython** (3.12–3.14). All install the same `m3_core_rs` import
+> per supported CPython** (3.12–3.15). All install the same `m3_core_rs` import
 > module. CI (`.github/workflows/release.yml`) builds the matrix on native
 > runners and publishes via PyPI Trusted Publishing. Wheels are **never** committed
 > to git.
 
 ---
 
-## 1. The model — why 7 projects × 3 Pythons
+## 1. The model — why 7 projects × 4 Pythons
 
 `m3-core-rs` is **one crate** but ships as several PyPI packages because the GPU
 backend is compiled in, and a CUDA wheel can't run on a Vulkan/CPU host. So the
@@ -54,7 +54,8 @@ version** rides in the wheel filename's `cpXY` compatibility tag.
    in-process (dim 1024, L2-norm 1.0, `embed_backend_label()` == `cpu`).
 
 2. **Python versions are NOT separate projects, tags, or publishers.** One
-   project + version holds 3 wheels (`...-cp312-...`, `-cp313-`, `-cp314-`).
+   project + version holds 4 wheels (`...-cp312-...`, `-cp313-`, `-cp314-`,
+   `-cp315-`).
    The installer picks the match by filename. You never make a per-Python tag or
    publisher — that fights the ecosystem. The git tag (`v2026.7.25`) stores
    the **package version** (`3.7.25`) only.
@@ -78,7 +79,7 @@ wizard's `pip install m3-core-rs-<os>-<backend>==<ver>` will **not** find it.
 ## 2. Supported Python versions
 
 m3-memory declares `requires-python >= 3.12` (raised 2026-09-13, `e43f0a1b`);
-the wheel matrix covers **3.12, 3.13, 3.14**. Build all three for every package.
+the wheel matrix covers **3.12, 3.13, 3.14, 3.15**. Build all four for every package.
 A user on a Python outside this range gets a source-build fallback (needs Rust +
 a compiler) or the CPU embed-server path — functional but slow, so keep the
 prebuilt set complete.
@@ -104,8 +105,13 @@ cpXY wheel is a hard miss rather than a fallback to a neighbouring version, and
 the filename mapping in that module must stay in step with the names
 `build_wheel.py` emits.
 
-⚠ **m3-memory's CI already tests 3.15** while this matrix stops at 3.14. When
-3.15 ships, those users get the slow source-build path until it is added here.
+⚠ **3.15 is in the matrix but is still PRE-RELEASE** (newest runner build is
+`3.15.0-rc.2`). `release.yml` sets `allow-prereleases: true`, which makes a bare
+`3.15` resolve to the newest pre-release and switch to GA automatically once it
+ships — no edit needed at that point. Without that flag `setup-python` matches
+stable only, fails the step, and takes every other wheel in the job with it.
+Locally, `uv python install 3.15` works, but a host with only stable
+interpreters will report 3.15 MISSING — expected, not a broken environment.
 
 ### 3.9.16 is the cutover release — do not "fix" its cp311 wheels
 
@@ -127,7 +133,7 @@ and is being shipped as-is:
 * rebuilding to make the metadata match would discard a verified 28-wheel fleet
   (the CUDA builds alone take hours) for no user-visible gain.
 
-From the next release the floor and the matrix agree: 21 wheels, cp312–cp314,
+From the next release the floor and the matrix agree: 28 wheels, cp312–cp315,
 `Requires-Python: >=3.12`. If you are comparing an old release against a new one
 and the asset counts differ, this is why.
 
@@ -136,7 +142,7 @@ polluting the system Python is **[`uv`](https://docs.astral.sh/uv/)**:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv python install 3.12 3.13 3.14    # standalone CPython builds in ~/.local
+uv python install 3.12 3.13 3.14 3.15   # standalone CPython builds in ~/.local
 ```
 
 ---
@@ -157,7 +163,7 @@ Everything after `--` is forwarded verbatim to `maturin build`.
 
 ### Optimal build order & caching (build the whole matrix fast)
 
-You ship `backends × {3.11, 3.12, 3.13, 3.14}` wheels. The expensive artifact in
+You ship `backends × {3.12, 3.13, 3.14, 3.15}` wheels. The expensive artifact in
 every build is the **cmake/C++ compile of llama.cpp + ggml** (and the GPU shader
 toolchains). The key fact that makes the matrix cheap:
 

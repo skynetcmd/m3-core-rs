@@ -89,7 +89,7 @@ jobs:
       # Install ALL supported CPython versions so one build job emits a wheel
       # per (Python, this-job's-backend). m3-memory declares
       # requires-python >= 3.12 (raised 2026-09-13, e43f0a1b), so we cover
-      # 3.12–3.14. Without the full set, only the last interpreter's wheel
+      # 3.12–3.15. Without the full set, only the last interpreter's wheel
       # ships and users on the other versions fall back to a slow source build.
       #
       # ⚠ Nothing resolves these from an index. m3-memory's
@@ -97,16 +97,26 @@ jobs:
       # `pip install --no-deps <path>.whl`, so a missing cpXY wheel is a hard
       # miss, not a silent downgrade to another version's wheel.
       #
+      # ⚠ 3.15 IS STILL PRE-RELEASE (newest on the runner manifest is
+      # 3.15.0-rc.2; there is no GA build yet). setup-python resolves a bare
+      # "3.15" against STABLE releases only, so without allow-prereleases the
+      # step fails outright and takes every wheel in the job with it — not just
+      # the 3.15 one. allow-prereleases falls back to the newest pre-release for
+      # an x.y range and silently starts picking GA the moment 3.15 ships, so
+      # this needs no follow-up edit at release time.
+      #
       # Keep this list == _PYTHONS in build_local.py == the floor in
       # crates/m3-core-py/pyproject.toml. A wheel built for an interpreter the
       # metadata rejects is uninstallable everywhere.
-      - name: Set up Python (3.12–3.14)
+      - name: Set up Python (3.12–3.15)
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
+          allow-prereleases: true
           python-version: |
             3.12
             3.13
             3.14
+            3.15
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -327,7 +337,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
 
       # ── Build the backend wheel via the canonical script ─────────────────
-      # One wheel per (CPython 3.12–3.14, this job's backend). build_wheel.py
+      # One wheel per (CPython 3.12–3.15, this job's backend). build_wheel.py
       # rewrites [project].name to m3-core-rs-<os>-<backend> and forwards the
       # interpreter list to maturin (everything after the literal `--`).
       # setup-python puts every requested version on PATH as pythonX.Y.
@@ -356,7 +366,7 @@ jobs:
             --backend "${{ matrix.backend }}" \
             --os "${{ matrix.os_tok }}" \
             --out "$GITHUB_WORKSPACE/dist" \
-            -- --interpreter python3.12 python3.13 python3.14 $extra
+            -- --interpreter python3.12 python3.13 python3.14 python3.15 $extra
 
       # Linux CUDA only: maturin left the wheels tagged linux_x86_64 (auditwheel
       # was skipped). PyPI rejects that tag. Re-tag to manylinux with auditwheel,
@@ -389,7 +399,7 @@ jobs:
         if: matrix.backend == 'cpu'
         shell: bash
         run: |
-          for v in 3.12 3.13 3.14; do
+          for v in 3.12 3.13 3.14 3.15; do
             whl=$(ls "$GITHUB_WORKSPACE"/dist/*-cp${v/./}-*.whl)
             if [ -z "$whl" ]; then
               echo "::error::no wheel matching cp${v/./} in dist/"; exit 1
@@ -398,6 +408,18 @@ jobs:
               py="py -$v"
             else
               py="python$v"
+            fi
+            # Fail with the INTERPRETER named, not a downstream pip error. A
+            # pre-release version (3.15 before GA) is the case most likely to be
+            # installed by setup-python yet not registered where this selector
+            # looks — on Windows `py -3.15` depends on the launcher having
+            # picked it up. Without this probe that surfaces as a confusing
+            # "no module named pip" or a silently skipped wheel.
+            if ! $py -c "import sys; print(sys.version)" >/dev/null 2>&1; then
+              echo "::error::interpreter '$py' not runnable on $RUNNER_OS — the" \
+                   "cp${v/./} wheel was BUILT but could not be smoke-tested." \
+                   "If $v is pre-release, check setup-python registered it."
+              exit 1
             fi
             $py -m pip install --force-reinstall "$whl"
             $py -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"

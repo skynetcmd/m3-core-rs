@@ -4,7 +4,7 @@
 //! Backends (llama.cpp embed, ONNX NER) implement `ModelBackend`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -89,14 +89,96 @@ impl Default for DispatcherConfig {
 }
 
 /// Point-in-time dispatcher metrics.
+///
+/// `p50_ms`/`p99_ms` are computed over the most recent
+/// [`LATENCY_WINDOW`] completed batches (see [`LatencyRing`]). They are
+/// `None` until at least one batch has completed — deliberately NOT `0.0`,
+/// because a constant zero is indistinguishable from a genuinely fast server
+/// and reads as observability while providing none.
 #[derive(Debug, Clone, Default)]
 pub struct DispatcherStats {
     pub in_flight: usize,
     pub queue_depth: usize,
-    /// TODO: latency histogram not yet wired; reported as 0.
-    pub p50_ms: f64,
-    /// TODO: latency histogram not yet wired; reported as 0.
-    pub p99_ms: f64,
+    /// p50 over the recent window; `None` when no batch has completed yet.
+    pub p50_ms: Option<f64>,
+    /// p99 over the recent window; `None` when no batch has completed yet.
+    pub p99_ms: Option<f64>,
+}
+
+/// Number of recent batch latencies retained for percentiles.
+///
+/// A fixed ring, not an unbounded histogram: percentiles over a RECENT window
+/// are what an operator watching a live server needs, and a bounded ring costs
+/// a fixed 8 KiB with no allocation on the hot path. 1024 samples covers
+/// several minutes at realistic embed rates while still reacting within
+/// seconds when latency moves.
+pub const LATENCY_WINDOW: usize = 1024;
+
+/// Lock-free ring of recent batch latencies, in microseconds.
+///
+/// Written on every completed batch from the dispatcher's hot path and read by
+/// [`Dispatcher::stats`], which must never block a caller that is only asking
+/// for metrics. Hence atomics rather than a `Mutex<Vec<_>>`: a metrics endpoint
+/// must not be able to contend with — or stall — request serving.
+///
+/// Microseconds (`u64`) rather than `f64` so samples can live in atomics at
+/// all; the conversion to milliseconds happens once, at read time.
+#[derive(Debug)]
+struct LatencyRing {
+    slots: Vec<AtomicU64>,
+    /// Total samples ever recorded. Doubles as the write cursor (modulo len)
+    /// and as the "have we seen anything yet" flag.
+    count: AtomicUsize,
+}
+
+impl LatencyRing {
+    fn new(n: usize) -> Self {
+        Self {
+            slots: (0..n.max(1)).map(|_| AtomicU64::new(0)).collect(),
+            count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Record one completed batch. Wait-free: a single fetch_add plus a store.
+    fn record(&self, d: Duration) {
+        let idx = self.count.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        // saturating: a pathological multi-thousand-second batch must clamp,
+        // never wrap into a small number that would silently flatter p99.
+        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        self.slots[idx].store(us, Ordering::Relaxed);
+    }
+
+    /// (p50, p99) in milliseconds over the recent window, or `None` if empty.
+    ///
+    /// Snapshots only the slots actually written, so the first reads after
+    /// startup are not diluted by unwritten zeros — that dilution is exactly
+    /// how a percentile ends up reporting a reassuring number it has not
+    /// earned.
+    fn percentiles(&self) -> Option<(f64, f64)> {
+        let n = self.count.load(Ordering::Relaxed);
+        if n == 0 {
+            return None;
+        }
+        let filled = n.min(self.slots.len());
+        let mut v: Vec<u64> = self.slots[..filled]
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .collect();
+        v.sort_unstable();
+        Some((pct(&v, 0.50), pct(&v, 0.99)))
+    }
+}
+
+/// Nearest-rank percentile of a sorted microsecond slice, returned as ms.
+///
+/// Nearest-rank (not interpolated): with a window this small an interpolated
+/// p99 invents a value between two real samples, and for a tail metric the
+/// honest answer is an observation that actually happened.
+fn pct(sorted_us: &[u64], q: f64) -> f64 {
+    debug_assert!(!sorted_us.is_empty());
+    let rank = (q * sorted_us.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted_us.len() - 1);
+    sorted_us[idx] as f64 / 1000.0
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -283,6 +365,8 @@ pub struct Dispatcher<B: ModelBackend> {
     queue: Arc<Mutex<LengthBucketQueue>>,
     slots: Arc<Semaphore>,
     in_flight: Arc<AtomicUsize>,
+    /// Recent batch latencies backing `stats().p50_ms` / `p99_ms`.
+    latency: Arc<LatencyRing>,
     /// Bounded channel: backpressure point for `embed`. Cap = 4 x streams.
     tx: mpsc::Sender<Job>,
 }
@@ -296,6 +380,7 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         let queue = Arc::new(Mutex::new(queue_inner));
         let slots = Arc::new(Semaphore::new(cfg.streams.max(1)));
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let latency = Arc::new(LatencyRing::new(LATENCY_WINDOW));
         let cap = (cfg.streams.max(1)) * 4;
         let (tx, rx) = mpsc::channel::<Job>(cap);
 
@@ -306,10 +391,11 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
             queue: queue.clone(),
             slots: slots.clone(),
             in_flight: in_flight.clone(),
+            latency: latency.clone(),
             tx,
         };
         tokio::spawn(scheduler_loop(
-            cfg, backend, breaker, queue, total_tokens, slots, in_flight, rx,
+            cfg, backend, breaker, queue, total_tokens, slots, in_flight, latency, rx,
         ));
         d
     }
@@ -392,7 +478,12 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
             .map_err(|_| M3Error::Backend("dispatcher closed".into()))?;
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let token_len = texts.iter().map(|t| estimate_tokens(t)).sum();
+        // Time the backend call only — the queue/semaphore wait before this
+        // point is already visible as queue_depth, and folding it in here
+        // would make a backlog look like a slow model.
+        let t0 = Instant::now();
         let res = self.backend.run(Batch::new(texts, token_len)).await;
+        self.latency.record(t0.elapsed());
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         match res {
             Ok(out) => {
@@ -440,7 +531,10 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
             .map_err(|_| M3Error::Backend("dispatcher closed".into()))?;
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         let token_len: usize = token_lens.iter().sum();
+        // See the sibling site above: backend call only, not the queue wait.
+        let t0 = Instant::now();
         let res = self.backend.run(Batch::new(texts, token_len)).await;
+        self.latency.record(t0.elapsed());
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         match res {
             Ok(out) => {
@@ -465,11 +559,15 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
 
     pub fn stats(&self) -> DispatcherStats {
         let queue_depth = self.queue.try_lock().map(|q| q.depth()).unwrap_or(0);
+        let (p50, p99) = match self.latency.percentiles() {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => (None, None),
+        };
         DispatcherStats {
             in_flight: self.in_flight.load(Ordering::SeqCst),
             queue_depth,
-            p50_ms: 0.0,
-            p99_ms: 0.0,
+            p50_ms: p50,
+            p99_ms: p99,
         }
     }
 }
@@ -539,6 +637,7 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
     total_tokens: Arc<AtomicUsize>,
     slots: Arc<Semaphore>,
     in_flight: Arc<AtomicUsize>,
+    latency: Arc<LatencyRing>,
     mut rx: mpsc::Receiver<Job>,
 ) {
     let window = Duration::from_millis(cfg.coalesce_window_ms.max(1));
@@ -615,13 +714,19 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
             let backend = backend.clone();
             let breaker = breaker.clone();
             let in_flight = in_flight.clone();
+            let latency = latency.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 in_flight.fetch_add(1, Ordering::SeqCst);
                 let (texts, replies): (Vec<String>, Vec<_>) =
                     jobs.into_iter().map(|j| (j.text, j.reply)).unzip();
                 let token_len = texts.iter().map(|t| estimate_tokens(t)).sum();
+                // This is the COALESCED path — the one that normally serves
+                // traffic. Missing it here would leave p50/p99 reflecting only
+                // the two direct-submit sites, i.e. almost nothing.
+                let t0 = Instant::now();
                 let res = backend.run(Batch::new(texts, token_len)).await;
+                latency.record(t0.elapsed());
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 match res {
                     Ok(out) => {
@@ -845,5 +950,109 @@ mod tests {
                 "drift from the Python seam for {s:?}"
             );
         }
+    }
+
+    // ── latency histogram ────────────────────────────────────────────────
+    //
+    // These pin the behaviour that the hardcoded `p50_ms: 0.0` could not have:
+    // each of them fails against a constant zero. §12c — a guard that cannot
+    // demonstrate a catch is indistinguishable from one that is blind.
+
+    struct SleepBackend(Duration);
+
+    impl ModelBackend for SleepBackend {
+        async fn run(&self, batch: Batch) -> Result<BatchOutput> {
+            tokio::time::sleep(self.0).await;
+            Ok(BatchOutput::new(vec![vec![0.0; 4]; batch.texts.len()]))
+        }
+    }
+
+    #[test]
+    fn latency_is_none_before_any_batch_completes() {
+        // The honest answer to "what is p99?" with no samples is "I do not
+        // know" -- not 0.0, which reads as a fast server.
+        let ring = LatencyRing::new(8);
+        assert!(ring.percentiles().is_none());
+    }
+
+    #[test]
+    fn latency_reports_real_percentiles() {
+        let ring = LatencyRing::new(128);
+        // 98 fast + 2 slow. The tail must be BIGGER than 1% of the window for
+        // p99 to be required to see it: at exactly 1-in-100, nearest-rank p99
+        // is the 99th of 100 samples and the single outlier sits above it, so
+        // returning the fast value is CORRECT, not a miss. The first draft of
+        // this test asserted otherwise and failed against a correct
+        // implementation — kept here so it is not "fixed" back.
+        for _ in 0..98 {
+            ring.record(Duration::from_millis(10));
+        }
+        ring.record(Duration::from_millis(500));
+        ring.record(Duration::from_millis(500));
+        let (p50, p99) = ring.percentiles().expect("samples recorded");
+        assert!((p50 - 10.0).abs() < 1.0, "p50 was {p50}");
+        assert!(p99 >= 500.0, "p99 must surface the tail, was {p99}");
+    }
+
+    #[test]
+    fn nearest_rank_percentile_is_an_observed_sample() {
+        // Pins the definition: p_q is the ceil(q*n)-th smallest, so every
+        // reported value is a latency that actually occurred rather than an
+        // interpolation between two of them.
+        let us: Vec<u64> = (1..=100).map(|i| i * 1000).collect(); // 1..100 ms
+        assert_eq!(pct(&us, 0.50), 50.0);
+        assert_eq!(pct(&us, 0.99), 99.0);
+        // Degenerate inputs must not panic or index out of bounds.
+        assert_eq!(pct(&[7_000], 0.50), 7.0);
+        assert_eq!(pct(&[7_000], 0.99), 7.0);
+    }
+
+    #[test]
+    fn latency_ring_wraps_and_forgets_old_samples() {
+        // A recent-window metric must TRACK, not average over all time: once
+        // the slow era scrolls out, the numbers must come back down.
+        let ring = LatencyRing::new(4);
+        for _ in 0..4 {
+            ring.record(Duration::from_millis(900));
+        }
+        let (p50_slow, _) = ring.percentiles().unwrap();
+        assert!(p50_slow >= 900.0, "was {p50_slow}");
+        for _ in 0..4 {
+            ring.record(Duration::from_millis(5));
+        }
+        let (p50_fast, p99_fast) = ring.percentiles().unwrap();
+        assert!(p50_fast < 50.0, "window did not forget: p50 {p50_fast}");
+        assert!(p99_fast < 50.0, "window did not forget: p99 {p99_fast}");
+    }
+
+    #[test]
+    fn latency_percentiles_ignore_unwritten_slots() {
+        // Only the filled prefix is read. Counting the zeroed remainder would
+        // dilute every percentile toward 0 for the first LATENCY_WINDOW
+        // batches -- precisely the reassuring-but-unearned number this work
+        // exists to remove.
+        let ring = LatencyRing::new(1024);
+        ring.record(Duration::from_millis(100));
+        let (p50, p99) = ring.percentiles().unwrap();
+        assert!((p50 - 100.0).abs() < 1.0, "p50 diluted by empty slots: {p50}");
+        assert!((p99 - 100.0).abs() < 1.0, "p99 diluted by empty slots: {p99}");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_stats_report_measured_latency_end_to_end() {
+        // The whole point: drive a real Dispatcher and confirm stats() carries
+        // a number that came from the backend actually taking time.
+        let d = Dispatcher::new(
+            DispatcherConfig::default(),
+            SleepBackend(Duration::from_millis(40)),
+        );
+        assert!(d.stats().p50_ms.is_none(), "no samples before any work");
+
+        d.embed("hello".to_string()).await.expect("embed");
+
+        let s = d.stats();
+        let p50 = s.p50_ms.expect("a completed batch must produce a sample");
+        assert!(p50 >= 30.0, "p50 {p50} did not reflect a 40ms backend");
+        assert!(p50 < 5_000.0, "p50 {p50} implausible");
     }
 }

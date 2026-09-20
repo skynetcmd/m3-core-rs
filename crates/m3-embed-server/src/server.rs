@@ -276,6 +276,11 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let s = state.dispatcher.stats();
+    // p50/p99 serialize as JSON `null` until at least one batch has completed.
+    // Deliberately null and not 0.0: a constant zero is indistinguishable from
+    // a genuinely fast server, so it reads as observability while providing
+    // none. `null` says "no samples yet", which is the truth and is what a
+    // scraper can correctly ignore.
     Json(serde_json::json!({
         "in_flight": s.in_flight,
         "queue_depth": s.queue_depth,

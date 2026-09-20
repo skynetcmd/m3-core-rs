@@ -17,7 +17,20 @@ description = "PyO3-backed Rust core for m3-memory (Project Oxidation)."
 # Requires-Python from the wheel's METADATA and refuses with "requires a
 # different Python" (verified 2026-09-16). Declaring the truth turns a confusing
 # ImportError or source-build attempt into that clear message.
-requires-python = ">=3.12"
+#
+# ⚠ TEMPORARILY >=3.11 FOR ONE RELEASE — REVERT TO >=3.12 IN THE NEXT ONE.
+# This release ships a final courtesy cp311 set for users still on 3.11. Those
+# wheels only INSTALL if the metadata permits 3.11, and the floor is global to
+# the build (build_wheel.py rewrites [project].name only — it has no per-wheel
+# requires-python knob), so the cp312-315 wheels in this release also advertise
+# >=3.11. That is the accepted cost of the courtesy build, NOT a reversal of
+# e43f0a1b: m3-memory itself still requires >=3.12, so nothing supported
+# regresses. Restore ">=3.12" once the cp311 set has shipped.
+#
+# ONE-TIME EXCEPTION — the floor only moves FORWARD from here (>=3.12, then
+# >=3.13, then >=3.14 as those become the supported set). Do not lower it again
+# for another interpreter; the cp311 set was a single farewell build.
+requires-python = ">=3.11"
 license = { text = "MIT" }
 dynamic = ["version"]
 

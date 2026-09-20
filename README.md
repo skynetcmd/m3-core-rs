@@ -45,7 +45,7 @@ and [`docs/BUILD_WHEELS.md`](docs/BUILD_WHEELS.md) for building your own.
 ### Wheel matrix
 
 m3-core-rs publishes **7 packages** (one per OS × backend) across **CPython
-3.12–3.15** → a full release is **28 wheels**. Every wheel bundles **both**
+3.12–3.15** (plus a final courtesy 3.11 set this release) → **35 wheels**. Every wheel bundles **both**
 native artifacts: the in-process `EmbeddedEmbedder` (`m3_core_rs.*.{pyd,so}`)
 **and** the `m3-embed-server` shared-server binary
 (`m3_core_rs/m3-embed-server[.exe]`) — see `crates/m3-core-py/build_wheel.py`.

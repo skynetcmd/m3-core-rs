@@ -19,8 +19,9 @@ macOS is Metal-only by design — Apple Silicon always has a Metal GPU, so a
 CPU-only mac package would be pointless.
 
 Each (os, backend) ships across the supported CPython matrix: **3.12,
-3.13, 3.14, 3.15** (cp312–cp315). A full release is therefore 7 packages × 4
-interpreters = 28 wheels.
+3.13, 3.14, 3.15** (cp312–cp315), plus a one-release courtesy **3.11** set.
+This release is therefore 7 packages × 5 interpreters = 35 wheels; it returns to
+7 × 4 = 28 once 3.11 is dropped.
 
 ## Distribution policy: PyPI for wheels that fit, GitHub Release for all of them
 

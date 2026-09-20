@@ -12,14 +12,15 @@ publisher side) and [`crates/m3-core-py/build_wheel.py`](crates/m3-core-py/build
 
 > **TL;DR**: `m3-core-rs` is one Rust source tree published as **7 differently
 > named PyPI projects** — one per `(OS, backend)` — each containing **one wheel
-> per supported CPython** (3.12–3.15). All install the same `m3_core_rs` import
+> per supported CPython** (3.12–3.15; `v2026.9.20` also ships 3.11). All
+> install the same `m3_core_rs` import
 > module. CI (`.github/workflows/release.yml`) builds the matrix on native
 > runners and publishes via PyPI Trusted Publishing. Wheels are **never** committed
 > to git.
 
 ---
 
-## 1. The model — why 7 projects × 4 Pythons
+## 1. The model — why 7 projects × N Pythons
 
 `m3-core-rs` is **one crate** but ships as several PyPI packages because the GPU
 backend is compiled in, and a CUDA wheel can't run on a Vulkan/CPU host. So the
@@ -54,8 +55,9 @@ version** rides in the wheel filename's `cpXY` compatibility tag.
    in-process (dim 1024, L2-norm 1.0, `embed_backend_label()` == `cpu`).
 
 2. **Python versions are NOT separate projects, tags, or publishers.** One
-   project + version holds 4 wheels (`...-cp312-...`, `-cp313-`, `-cp314-`,
-   `-cp315-`).
+   project + version holds one wheel per supported interpreter
+   (`...-cp312-...`, `-cp313-`, `-cp314-`, `-cp315-`; `v2026.9.20` adds
+   `-cp311-`).
    The installer picks the match by filename. You never make a per-Python tag or
    publisher — that fights the ecosystem. The git tag (`v2026.7.25`) stores
    the **package version** (`3.7.25`) only.
@@ -79,7 +81,9 @@ wizard's `pip install m3-core-rs-<os>-<backend>==<ver>` will **not** find it.
 ## 2. Supported Python versions
 
 m3-memory declares `requires-python >= 3.12` (raised 2026-09-13, `e43f0a1b`);
-the wheel matrix covers **3.12, 3.13, 3.14, 3.15**. Build all four for every package.
+the wheel matrix covers **3.12, 3.13, 3.14, 3.15** — plus a ONE-RELEASE
+courtesy **3.11** set in `v2026.9.20` (see below). Build every listed version
+for every package.
 A user on a Python outside this range gets a source-build fallback (needs Rust +
 a compiler) or the CPU embed-server path — functional but slow, so keep the
 prebuilt set complete.
@@ -133,7 +137,27 @@ and is being shipped as-is:
 * rebuilding to make the metadata match would discard a verified 28-wheel fleet
   (the CUDA builds alone take hours) for no user-visible gain.
 
-From the next release the floor and the matrix agree: 28 wheels, cp312–cp315,
+### v2026.9.20 ships a FINAL courtesy cp311 set — then 3.11 is done
+
+3.11 is included once more for users still on it. Because the floor is **global
+to the build** (`build_wheel.py` rewrites `[project].name` only — there is no
+per-wheel `requires-python` knob), `pyproject.toml` is temporarily `>=3.11`, so
+*every* wheel in this release advertises `>=3.11`, cp315 included. That is the
+accepted cost of the courtesy set, not a reversal of `e43f0a1b`: m3-memory
+itself still requires `>=3.12`, so nothing supported regresses.
+
+**Revert all four together next release** — `pyproject.toml` back to `>=3.12`,
+and drop `3.11` from `release.yml` (setup-python list, `--interpreter`, smoke
+loop) and `build_local.py`'s `_PYTHONS`.
+
+⚠ **This is a ONE-TIME exception, not a precedent.** The floor only moves
+FORWARD from here: `>=3.12` next release, then `>=3.13` and `>=3.14` as those
+become the supported set. Do not read the cp311 wheels in `v2026.9.20` as a
+signal that old interpreters get re-added on request — they were a single
+farewell build. The same four-file revert checklist applies to every future
+floor raise, so use it as the template each time.
+
+From the release AFTER v2026.9.20 the floor and the matrix agree: 28 wheels, cp312–cp315,
 `Requires-Python: >=3.12`. If you are comparing an old release against a new one
 and the asset counts differ, this is why.
 
@@ -163,7 +187,7 @@ Everything after `--` is forwarded verbatim to `maturin build`.
 
 ### Optimal build order & caching (build the whole matrix fast)
 
-You ship `backends × {3.12, 3.13, 3.14, 3.15}` wheels. The expensive artifact in
+You ship `backends × {3.12, 3.13, 3.14, 3.15}` wheels (plus 3.11 in v2026.9.20). The expensive artifact in
 every build is the **cmake/C++ compile of llama.cpp + ggml** (and the GPU shader
 toolchains). The key fact that makes the matrix cheap:
 

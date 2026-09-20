@@ -56,9 +56,10 @@ from build_wheel import _MATRIX, host_os, package_name  # noqa: E402
 
 _HERE = Path(__file__).resolve().parent
 _REPO_ROOT = _HERE.parent.parent
-# Must not go below pyproject's requires-python: a cp311 wheel tagged for an
-# interpreter the metadata rejects is uninstallable everywhere. m3-memory's
-# floor moved to >=3.12 on 2026-09-13 (e43f0a1b), so 3.11 is dropped.
+# Must not go ABOVE what pyproject's requires-python permits: a wheel tagged for
+# an interpreter the metadata rejects is uninstallable everywhere — pip reads
+# Requires-Python from the wheel's own METADATA and refuses, even on the direct
+# `--no-deps` install path that is our real distribution channel.
 #
 # Keep in lockstep with release.yml's setup-python list. 3.15 is included
 # because m3-memory's CI already tests it; without a cp315 wheel those users
@@ -69,7 +70,9 @@ _REPO_ROOT = _HERE.parent.parent
 # host that only has stable interpreters will report it MISSING — that is
 # expected, not a broken environment. Use --pythons to build a subset locally;
 # CI is the place the full matrix has to be complete.
-_PYTHONS = ("3.12", "3.13", "3.14", "3.15")
+# ⚠ 3.11 is a ONE-RELEASE COURTESY set (see pyproject requires-python,
+# temporarily >=3.11). Drop it, and restore the >=3.12 floor, next release.
+_PYTHONS = ("3.11", "3.12", "3.13", "3.14", "3.15")
 
 # A path is a virtualenv interpreter (never use one to build a wheel) if it sits
 # under a venv layout. uv may return the active project venv from a plain

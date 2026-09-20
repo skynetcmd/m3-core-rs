@@ -81,10 +81,30 @@ kept out of this public doc — see the private operator notes.)
 
 Notes that bite if forgotten:
 
-- **Linux CUDA needs an NVIDIA GPU + CUDA toolkit.** If your Linux build host
-  has no NVIDIA GPU (e.g. an AMD/integrated-GPU box), **build Linux CUDA via CI
-  instead** (see the CI workflow section) — that box can still build and verify Vulkan
-  on its own GPU.
+- **Linux CUDA needs the CUDA toolkit to BUILD and an NVIDIA driver to VERIFY.**
+  These are separate requirements and the distinction matters. A box with `nvcc`
+  but no GPU builds correct wheels it cannot load: `libcuda.so.1` ships with the
+  *driver*, not the toolkit, so the build's own smoke test ends in
+  `ImportError: libcuda.so.1: cannot open shared object file` — the wheel is
+  fine, the host simply cannot run it.
+
+  ⚠ **Falling back to CI does not solve this** — CI runners have no GPU either,
+  so they emit an equally unverified wheel. If your Linux host lacks a driver,
+  **WSL on a Windows machine with an NVIDIA GPU** both builds and *verifies*:
+  it exposes `/usr/lib/wsl/lib/libcuda.so.1` and passes the GPU through.
+
+  Whichever host builds it, **validate on a GPU before publishing** — import the
+  wheel and assert `embed_backend_label() == "cuda"`. A wheel that silently
+  degrades to CPU passes every structural check while being wrong.
+
+- **Local Linux CUDA wheels need a manual `auditwheel` repair.** `build_local.py`
+  passes `--auditwheel skip`, so maturin leaves them tagged `linux_x86_64`. CI
+  has a follow-up step for this; a local build does not, so run it yourself:
+  ```bash
+  auditwheel repair --exclude libcuda.so.1 -w . <wheel>-linux_x86_64.whl
+  ```
+  `--exclude libcuda.so.1` is deliberate: the driver stub stays an external
+  runtime dependency supplied by the consuming host.
 - **Login shell on the Linux box:** if rust/maturin/uv were installed per-user
   (cargo/uv under `~`), they are only on `PATH` in a **login** shell — run
   remote builds with `ssh <host> 'bash -lc "..."'`, not a bare `ssh <host> cmd`.

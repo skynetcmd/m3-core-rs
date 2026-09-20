@@ -153,12 +153,22 @@ jobs:
       # CMAKE_ARGS, so -D hint injection doesn't work — only a correctly-laid-out
       # VULKAN_SDK (read natively by FindVulkan) does. We run both, then the
       # merge step assembles one canonical SDK dir.
-      - name: Build Vulkan headers+loader (Windows vulkan backend)
+      # SPIRV-Headers is built here, NOT taken from the prebuilt SDK below.
+      # llama.cpp's ggml-vulkan gained a hard
+      # `find_package(SPIRV-Headers CONFIG REQUIRED)` between llama-cpp-sys-2
+      # 0.1.146 and 0.1.156, and that needs the package's CMAKE CONFIG FILE
+      # (Lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake), not just the
+      # headers. install-vulkan-sdk ships the runtime SDK and does NOT lay that
+      # config down anywhere in the workspace — verified 2026-09-16, where the
+      # merge step's guard correctly reported it absent and failed the job.
+      # setup-vulkan-sdk runs a real cmake install per component, which is what
+      # produces the config file, so the component belongs on THIS list.
+      - name: Build Vulkan headers+loader+SPIRV-Headers (Windows vulkan backend)
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
         uses: humbletim/setup-vulkan-sdk@c25f41106918cde0bf347e6f201277392b3a9e9d # v1.2.1
         with:
           vulkan-query-version: 1.4.341.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Headers
           vulkan-use-cache: true
 
       - name: Install prebuilt Vulkan SDK for glslc (Windows vulkan backend)
@@ -208,7 +218,11 @@ jobs:
           $spirvCfg = Get-ChildItem $ws -Recurse -Filter 'SPIRV-HeadersConfig.cmake' -ErrorAction SilentlyContinue |
                         Select-Object -First 1
           if (-not $spirvCfg) {
-            Write-Error "SPIRV-HeadersConfig.cmake not found under the workspace; ggml-vulkan's find_package(SPIRV-Headers CONFIG REQUIRED) will fail at configure"
+            Write-Error ("SPIRV-HeadersConfig.cmake not found under the workspace. " +
+              "ggml-vulkan's find_package(SPIRV-Headers CONFIG REQUIRED) would fail at configure. " +
+              "cause: the config file is produced by setup-vulkan-sdk's per-component cmake INSTALL, " +
+              "not by the prebuilt install-vulkan-sdk payload. " +
+              "fix: ensure 'SPIRV-Headers' is in that step's vulkan-components list.")
             exit 1
           }
           Write-Host "SPIRV-Headers config=$($spirvCfg.FullName)"

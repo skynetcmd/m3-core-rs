@@ -109,7 +109,15 @@ the filename mapping in that module must stay in step with the names
 
 ### 3.9.16 is the cutover release — do not "fix" its cp311 wheels
 
-`v2026.9.16` was BUILT BEFORE the floor moved, so all 28 of its wheels carry
+⚠ **The 28 are not the 7 backends you expect (verified against the Release
+2026-09-20).** `m3_core_rs_windows_cuda` is **absent**; the seventh set is
+generically-named `m3_core_rs-3.9.16-*`. So a Windows + NVIDIA host finds no
+matching asset — `rust_core_install.py` picks BY FILENAME, so a generic name is
+a miss, not a fallback. Cause: the `windows-vulkan` SPIRV-Headers failure below,
+plus a re-tag that cancelled the still-running CUDA jobs. Count the backends,
+not the assets, when judging whether a release is complete.
+
+`v2026.9.16` was BUILT BEFORE the floor moved, so its wheels carry
 `Requires-Python: >=3.9` in their METADATA, cp311 included. That is deliberate
 and is being shipped as-is:
 
@@ -687,6 +695,31 @@ when it returns.
   that variable is not in it. Fix: shorten the path —
   `CARGO_TARGET_DIR=C:\m3t`. `build_local.py` now does this automatically when
   the default would be tight.
+
+- **Windows Vulkan: `SPIRV-HeadersConfig.cmake not found under the workspace`.**
+  Between `llama-cpp-sys-2` 0.1.146 and 0.1.156, llama.cpp's ggml-vulkan gained
+  a hard `find_package(SPIRV-Headers CONFIG REQUIRED)`. That needs the package's
+  **cmake config file**, not just the SPIRV headers — and the two Vulkan actions
+  are not interchangeable here:
+  - `install-vulkan-sdk` unpacks the prebuilt runtime SDK. `SPIRV-Headers`
+    appears in its *available repos* list, which is misleading: it does **not**
+    lay `Lib/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake` down in the
+    workspace.
+  - `setup-vulkan-sdk` runs a real per-component cmake **install**, which is
+    what emits the config file.
+
+  So the component must be on `setup-vulkan-sdk`'s `vulkan-components` list:
+  `Vulkan-Headers, Vulkan-Loader, SPIRV-Headers`. Adding it anywhere else, or
+  assuming the prebuilt SDK already carries it, does not work.
+
+  ⚠ **This cost a release.** `v2026.9.16` carries 28 wheels but only 6 of the 7
+  backends — `windows_cuda` is missing and a generically-named `m3_core_rs-*`
+  set fills the count. The merge step's guard fired correctly, `windows-vulkan`
+  failed, and although `fail-fast: false` was already set, the CUDA jobs were
+  still in flight and a re-tag then cancelled the whole run. The
+  guard was right; the fix commit (`7b0a0f9`) fixed the *copy* step while the
+  component was never fetched in the first place. Changing the components list
+  invalidates the action's cache, so expect one slower build after this edit.
 
 - **Stale 0-byte `.so` after a failed build.** A failed maturin run can leave an
   empty `target/release/libm3_core_rs.so`; cargo then sees it as fresh and skips

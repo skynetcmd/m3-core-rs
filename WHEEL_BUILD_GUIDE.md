@@ -156,7 +156,7 @@ python crates/m3-core-py/build_wheel.py \
     --backend <cpu|cuda|vulkan|metal> \
     --os <linux|windows|macos> \
     --out dist/<project> \
-    -- --interpreter python3.11 python3.12 python3.13 python3.14
+    -- --interpreter python3.12 python3.13 python3.14 python3.15
 ```
 
 Everything after `--` is forwarded verbatim to `maturin build`.
@@ -175,7 +175,7 @@ toolchains). The key fact that makes the matrix cheap:
 Two rules fall out of this:
 
 1. **One `build_wheel.py` call per backend, with all four interpreters at once.**
-   Pass `--interpreter <py311> <py312> <py313> <py314>` in a single invocation.
+   Pass `--interpreter <py312> <py313> <py314> <py315>` in a single invocation.
    maturin builds the Rust/C artifacts once and fans out the per-interpreter
    binding — far better cache reuse than four separate calls.
 
@@ -189,7 +189,7 @@ Two rules fall out of this:
 
 ```
 for backend in cpu vulkan cuda:          # OUTER: each switch = 1 llama.cpp rebuild
-    build_wheel.py --backend $backend ... -- --interpreter py311 py312 py313 py314
+    build_wheel.py --backend $backend ... -- --interpreter py312 py313 py314 py315
                                          # INNER: 4 fast binding relinks, llama.cpp cached
 ```
 
@@ -236,7 +236,7 @@ not once per (backend, version)):
 # default cp312–314, in the cache-optimal order, smoke-testing each.
 python crates/m3-core-py/build_local.py all
 # Or a subset / specific Pythons:
-python crates/m3-core-py/build_local.py cpu vulkan --pythons 3.11 3.12
+python crates/m3-core-py/build_local.py cpu vulkan --pythons 3.12 3.13
 ```
 
 `build_local.py` handles two Linux-specific details for you:
@@ -255,13 +255,13 @@ build order):
 # compiler. Broad manylinux compat (add maturin's --zig for the lowest glibc floor).
 python crates/m3-core-py/build_wheel.py --backend cpu --os linux \
     --out dist/m3-core-rs-linux-cpu \
-    -- --interpreter python3.11 python3.12 python3.13 python3.14
+    -- --interpreter python3.12 python3.13 python3.14 python3.15
 
 # Vulkan — needs the shader toolchain + Vulkan dev headers:
 #   apt install glslc glslang-tools libvulkan-dev spirv-tools mesa-vulkan-drivers
 python crates/m3-core-py/build_wheel.py --backend vulkan --os linux \
     --out dist/m3-core-rs-linux-vulkan \
-    -- --interpreter python3.11 python3.12 python3.13 python3.14
+    -- --interpreter python3.12 python3.13 python3.14 python3.15
 
 # CUDA — needs the CUDA toolkit (nvcc + cuBLAS headers). Not yet built/verified
 # locally; CI's Jimver/cuda-toolkit action provides nvcc on the runner.
@@ -303,7 +303,7 @@ failure in §7 happens:
 # CPU
 python crates\m3-core-py\build_wheel.py --backend cpu --os windows `
     --out dist\m3-core-rs-windows-cpu `
-    -- --interpreter python3.11 python3.12 python3.13 python3.14
+    -- --interpreter python3.12 python3.13 python3.14 python3.15
 
 # CUDA — needs the CUDA Toolkit (nvcc + cuBLAS). Wheel links cublasLt64_*/cublas64_*;
 #        maturin warns these CUDA DLLs are NOT bundled (the package __init__.py
@@ -331,7 +331,7 @@ rustup-init -y && source "$HOME/.cargo/env"
 pipx install maturin
 python crates/m3-core-py/build_wheel.py --backend metal --os macos \
     --out dist/m3-core-rs-macos-metal \
-    -- --interpreter python3.11 python3.12 python3.13 python3.14
+    -- --interpreter python3.12 python3.13 python3.14 python3.15
 ```
 
 See `MACOS_BUILD_CONTRIBUTION.md` and `macos-wheels-workflow.yml.template`.
@@ -577,6 +577,47 @@ targets the GPU only.
 
 ### Building all three OSes in parallel
 
+> **The rule: parallelize ACROSS machines, serialize WITHIN a machine.**
+>
+> | Level | Concurrent? | Why |
+> |---|---|---|
+> | The 3 OS hosts (Windows / Linux / macOS) | **YES** | Independent machines, separate checkouts, no shared state |
+> | Backends on one host (`cpu` / `vulkan` / `cuda`) | **NO** | They share one working tree — see the three collisions below |
+> | Python versions on one host (cp312–cp315) | **NO — and you never choose this** | One `build_local.py` call hands all four interpreters to a SINGLE maturin call, which fans them out internally. You do not launch four processes. |
+
+**Why serializing within a host is mandatory, not stylistic.** Two builds
+running concurrently in one checkout collide on three pieces of shared state:
+
+1. **`pyproject.toml` is rewritten in place.** `build_wheel.py::_patched_name`
+   temporarily rewrites `[project].name` to `m3-core-rs-<os>-<backend>`, runs
+   maturin, then restores it. Two builds racing that file means one can read the
+   *other's* backend name and emit a correctly-compiled wheel under the **wrong
+   package name** — which the installer then never finds. This is the worst of
+   the three because the wheel looks perfectly fine.
+2. **`target/` (and `CARGO_TARGET_DIR`) is shared.** Concurrent cargo builds
+   contend on the same fingerprints and objects; §7 already records the related
+   trap that a failed build poisons the next one via `CMakeCache.txt`.
+3. **A GPU build already saturates the box.** Two cmake/llama.cpp compiles at
+   once contend for cores and RAM for no wall-clock gain.
+
+**`build_local.py` already enforces this** — it loops backends serially
+(`for backend in requested:`) and passes every interpreter to one maturin
+invocation, which is also the cache-optimal order described under *Optimal build
+order & caching* above. The hazard only appears if someone hand-rolls parallel
+`build_wheel.py` calls; §7's "prefer `build_local.py` over a hand-rolled loop"
+warning exists for this reason, not merely for convenience.
+
+So the correct usage is **one command per host**, run concurrently:
+
+```
+# SkyPC   (Windows)  — 3 backends × 4 interpreters, serial within the host
+python crates/m3-core-py/build_local.py cpu vulkan cuda
+# N5 box  (Linux)
+python crates/m3-core-py/build_local.py cpu vulkan cuda
+# MacBook (macOS)
+python crates/m3-core-py/build_local.py metal
+```
+
 The three OS build hosts are fully independent machines with separate source
 checkouts and no shared state, so the whole 28-wheel matrix can be built
 **concurrently** — one host per OS — instead of serially. Wall-clock drops from
@@ -633,6 +674,13 @@ when it returns.
     zig's sysroot hides the host Vulkan/CUDA libs)
   - backend-outer / interpreter-inner ordering (one llama.cpp compile per backend)
   - uv-based interpreter discovery that rejects the project `.venv`
+  - **serial backend execution.** A hand-rolled loop is where someone
+    "optimizes" by backgrounding the per-backend calls. Do not: the driver's
+    serialization is load-bearing, because `build_wheel.py` rewrites the shared
+    `pyproject.toml` in place and two concurrent builds can swap each other's
+    package name — producing a good wheel nobody can find. Parallelism belongs
+    ACROSS the three OS hosts, never within one; see §6 "Building all three
+    OSes in parallel".
   Verified 2026-09-07: a hand-rolled `build_wheel.py --backend vulkan` call on
   Windows failed with `C1083` *because* it lacked the `CARGO_TARGET_DIR` shortening.
   Re-run through `build_local.py`, it printed its own diagnosis — *"default path is

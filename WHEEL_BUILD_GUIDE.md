@@ -402,10 +402,26 @@ lives under `~/.lmstudio/models/.../bge-m3-GGUF-Q4_K_M.gguf`.
 
 ## 5. Deployment
 
-There are two channels. **PyPI is primary** (it's what the m3 wizard installs
-from); **GitHub Releases** are an interim/secondary mirror.
+> ⚠ **CORRECTED 2026-09-20 — the GitHub Release is the canonical channel, not
+> PyPI.** The headings below still read "PyPI (canonical) / GitHub Releases
+> (interim mirror)"; that is backwards and predates `c706174`, which made PyPI
+> publishing opt-in (`-f publish=true`, default off).
+>
+> - **The Release is complete by construction** — a `v*` tag builds every
+>   backend and attaches all of them. PyPI *cannot* be complete: the CUDA
+>   wheels are an order of magnitude over its 100 MB per-file limit, so that is
+>   a permanent structural barrier, not a hurdle a retry clears.
+> - **The Release is what m3 actually installs from.** `rust_core_install.py`
+>   tries the Release FIRST, then pip. It downloads an asset BY FILENAME and
+>   runs `pip install --force-reinstall --no-deps <path>.whl` — nothing is
+>   resolved from an index.
+> - PyPI publishing has also failed trusted-publishing exchange since 3.7.4, so
+>   those projects serve a 2026-07-04 build. A PyPI-first cascade would install
+>   that stale core and STOP, because pip exits 0.
+>
+> Read 5a as "how the optional PyPI leg works" and 5b as the real channel.
 
-### 5a. PyPI (canonical) — via CI + Trusted Publishing
+### 5a. PyPI (opt-in, currently disabled) — via CI + Trusted Publishing
 
 1. Bump `workspace.package.version` in the top-level `Cargo.toml` **and**
    `M3_CORE_RS_VERSION` / `M3_CORE_RS_GIT_TAG` in m3-memory's
@@ -634,11 +650,11 @@ warning exists for this reason, not merely for convenience.
 So the correct usage is **one command per host**, run concurrently:
 
 ```
-# SkyPC   (Windows)  — 3 backends × 4 interpreters, serial within the host
+# on the Windows host — every backend it can build, serial within the host
 python crates/m3-core-py/build_local.py cpu vulkan cuda
-# N5 box  (Linux)
+# on the Linux host
 python crates/m3-core-py/build_local.py cpu vulkan cuda
-# MacBook (macOS)
+# on the macOS host
 python crates/m3-core-py/build_local.py metal
 ```
 

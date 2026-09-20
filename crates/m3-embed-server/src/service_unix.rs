@@ -128,8 +128,22 @@ pub mod macos {
             &gguf,
             &log_path.to_string_lossy(),
         );
-        std::fs::write(&plist, body)
-            .map_err(|e| format!("cannot write plist {}: {e}", plist.display()))?;
+        // ⚠ FLUSH TO DISK BEFORE launchd READS IT. `fs::write` returns once the
+        // data is in the page cache; launchd opens the file itself moments
+        // later. Observed on macOS 2026-09-20: bootstrap raced the in-flight
+        // write and failed with `Bootstrap failed: 5: Input/output error`,
+        // after setup had already SIGTERMed the standalone embedder — so it
+        // killed a healthy server and registered no replacement, leaving
+        // nothing on :8082. An explicit sync_all() closes that window.
+        {
+            use std::io::Write;
+            let mut fh = std::fs::File::create(&plist)
+                .map_err(|e| format!("cannot write plist {}: {e}", plist.display()))?;
+            fh.write_all(body.as_bytes())
+                .map_err(|e| format!("cannot write plist {}: {e}", plist.display()))?;
+            fh.sync_all()
+                .map_err(|e| format!("cannot flush plist {}: {e}", plist.display()))?;
+        }
 
         // bootstrap loads the agent into the user's GUI domain; idempotent-ish
         // (re-bootstrap of an already-loaded label errors, so bootout first,
@@ -137,7 +151,30 @@ pub mod macos {
         let domain = gui_domain()?;
         let target = service_target()?;
         let _ = run_launchctl(&["bootout", &target]);
-        run_launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
+        // ⚠ RETRY ONCE. The EIO above is transient — a plain retry succeeded
+        // every time in the 2026-09-20 forensics, with no flags and no sudo.
+        // Failing outright on the first attempt turns a recoverable hiccup
+        // into "setup killed the embedder and left nothing running", which is
+        // the worst outcome available here.
+        let plist_arg = plist.to_string_lossy().to_string();
+        if let Err(first) = run_launchctl(&["bootstrap", &domain, &plist_arg]) {
+            eprintln!(
+                "launchctl bootstrap failed ({first}); retrying once — this is \
+                 usually a transient race with the plist write"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            run_launchctl(&["bootstrap", &domain, &plist_arg]).map_err(|second| {
+                format!(
+                    "launchctl bootstrap failed twice: {second}. \
+                     observed: first attempt said: {first}. \
+                     inspect: `launchctl print {target}`, \
+                     `launchctl print-disabled {domain}`, \
+                     `plutil -lint {plist_arg}`, and that {} exists and is \
+                     executable",
+                    exe.display()
+                )
+            })?;
+        }
 
         println!("launchd agent installed: {LAUNCHD_LABEL}");
         println!("plist:    {}", plist.display());

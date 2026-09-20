@@ -91,9 +91,26 @@ fn prune_old_logs(log_dir: &std::path::Path) {
         let Ok(modified) = meta.modified() else { continue; };
         if modified < cutoff {
             let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        // ⚠ AGE ALONE DOES NOT BOUND THE DISK. Rotation is daily and retention
+        // is 14 days, so a single noisy day is never pruned: one machine reached
+        // 254 MB in one file, almost entirely kernel-compile chatter emitted on
+        // every model load (macOS, 2026-09-20). Cap the size too — a rolled file
+        // past the cap has already served its purpose, and keeping it costs more
+        // than the tail it preserves.
+        if meta.len() > MAX_ROLLED_LOG_BYTES {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
+
+/// Largest rolled log file kept, regardless of age.
+///
+/// Generous on purpose: big enough that an ordinary busy day survives intact,
+/// small enough that a pathological one cannot fill a disk. Retention is
+/// otherwise age-based (14 days), which bounds COUNT but not SIZE.
+const MAX_ROLLED_LOG_BYTES: u64 = 64 * 1024 * 1024;
 
 fn init_service_logging() -> std::io::Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_path = config::default_log_path();

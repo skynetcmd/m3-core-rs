@@ -91,12 +91,12 @@ jobs:
       # interpreter's wheel ships and users on the other versions fall back to a
       # slow source build.
       #
-      # ⚠ 3.11 IS A ONE-RELEASE COURTESY — DROP IT AFTER THIS TAG. m3-memory's
-      # floor is >=3.12 (raised 2026-09-13, e43f0a1b) and this crate normally
-      # tracks it. 3.11 is included once more as a final set for users still on
-      # it; pyproject's requires-python is temporarily >=3.11 to match, because
-      # a cp311 wheel whose metadata says >=3.12 is refused by pip even on the
-      # direct --no-deps install path. Both revert together next release.
+      # 3.11 was dropped 2026-10-01, with pyproject's floor restored to >=3.12.
+      # Its one-release courtesy set shipped in v2026.9.20. These three places
+      # move TOGETHER — this list, build_local.py's _PYTHONS, and pyproject's
+      # requires-python — because a wheel built for an interpreter the metadata
+      # rejects is uninstallable everywhere, and a floor without a matching
+      # build just wastes a job.
       #
       # ⚠ Nothing resolves these from an index. m3-memory's
       # rust_core_install.py picks the asset BY FILENAME and runs
@@ -114,12 +114,11 @@ jobs:
       # Keep this list == _PYTHONS in build_local.py == the floor in
       # crates/m3-core-py/pyproject.toml. A wheel built for an interpreter the
       # metadata rejects is uninstallable everywhere.
-      - name: Set up Python (3.11–3.15)
+      - name: Set up Python (3.12–3.15)
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           allow-prereleases: true
           python-version: |
-            3.11
             3.12
             3.13
             3.14
@@ -344,7 +343,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
 
       # ── Build the backend wheel via the canonical script ─────────────────
-      # One wheel per (CPython 3.11–3.15, this job's backend). build_wheel.py
+      # One wheel per (CPython 3.12–3.15, this job's backend). build_wheel.py
       # rewrites [project].name to m3-core-rs-<os>-<backend> and forwards the
       # interpreter list to maturin (everything after the literal `--`).
       # setup-python puts every requested version on PATH as pythonX.Y.
@@ -373,7 +372,7 @@ jobs:
             --backend "${{ matrix.backend }}" \
             --os "${{ matrix.os_tok }}" \
             --out "$GITHUB_WORKSPACE/dist" \
-            -- --interpreter python3.11 python3.12 python3.13 python3.14 python3.15 $extra
+            -- --interpreter python3.12 python3.13 python3.14 python3.15 $extra
 
       # Linux CUDA only: maturin left the wheels tagged linux_x86_64 (auditwheel
       # was skipped). PyPI rejects that tag. Re-tag to manylinux with auditwheel,
@@ -406,7 +405,7 @@ jobs:
         if: matrix.backend == 'cpu'
         shell: bash
         run: |
-          for v in 3.11 3.12 3.13 3.14 3.15; do
+          for v in 3.12 3.13 3.14 3.15; do
             whl=$(ls "$GITHUB_WORKSPACE"/dist/*-cp${v/./}-*.whl)
             if [ -z "$whl" ]; then
               echo "::error::no wheel matching cp${v/./} in dist/"; exit 1

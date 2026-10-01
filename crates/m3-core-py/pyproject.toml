@@ -18,19 +18,19 @@ description = "PyO3-backed Rust core for m3-memory (Project Oxidation)."
 # different Python" (verified 2026-09-16). Declaring the truth turns a confusing
 # ImportError or source-build attempt into that clear message.
 #
-# ⚠ TEMPORARILY >=3.11 FOR ONE RELEASE — REVERT TO >=3.12 IN THE NEXT ONE.
-# This release ships a final courtesy cp311 set for users still on 3.11. Those
-# wheels only INSTALL if the metadata permits 3.11, and the floor is global to
-# the build (build_wheel.py rewrites [project].name only — it has no per-wheel
-# requires-python knob), so the cp312-315 wheels in this release also advertise
-# >=3.11. That is the accepted cost of the courtesy build, NOT a reversal of
-# e43f0a1b: m3-memory itself still requires >=3.12, so nothing supported
-# regresses. Restore ">=3.12" once the cp311 set has shipped.
+# FLOOR RESTORED to >=3.12 (2026-10-01). The one-release cp311 courtesy set
+# shipped in v2026.9.20 — verified: that release carries 7 cp311 wheels, one per
+# backend — so the condition its own note gave ("restore >=3.12 once the cp311
+# set has shipped") is met. The temporary >=3.11 also had to advertise itself on
+# the cp312-315 wheels, because the floor is global to the build
+# (build_wheel.py rewrites [project].name only — there is no per-wheel
+# requires-python knob); restoring it stops those wheels claiming support m3
+# itself does not offer.
 #
-# ONE-TIME EXCEPTION — the floor only moves FORWARD from here (>=3.12, then
-# >=3.13, then >=3.14 as those become the supported set). Do not lower it again
-# for another interpreter; the cp311 set was a single farewell build.
-requires-python = ">=3.11"
+# ONE-TIME EXCEPTION, now closed — the floor only moves FORWARD from here
+# (>=3.12, then >=3.13, then >=3.14 as those become the supported set). Do not
+# lower it again for another interpreter; cp311 was a single farewell build.
+requires-python = ">=3.12"
 license = { text = "MIT" }
 dynamic = ["version"]
 

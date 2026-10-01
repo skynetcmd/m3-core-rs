@@ -70,9 +70,12 @@ _REPO_ROOT = _HERE.parent.parent
 # host that only has stable interpreters will report it MISSING — that is
 # expected, not a broken environment. Use --pythons to build a subset locally;
 # CI is the place the full matrix has to be complete.
-# ⚠ 3.11 is a ONE-RELEASE COURTESY set (see pyproject requires-python,
-# temporarily >=3.11). Drop it, and restore the >=3.12 floor, next release.
-_PYTHONS = ("3.11", "3.12", "3.13", "3.14", "3.15")
+# 3.11 was dropped 2026-10-01: its one-release courtesy set shipped in
+# v2026.9.20 and pyproject's floor is back to >=3.12. Building a cp311 wheel now
+# would produce an asset no supported m3 install can use — m3-memory requires
+# >=3.12, and pip reads Requires-Python from the wheel's own METADATA and
+# refuses, even on the direct --no-deps path.
+_PYTHONS = ("3.12", "3.13", "3.14", "3.15")
 
 # A path is a virtualenv interpreter (never use one to build a wheel) if it sits
 # under a venv layout. uv may return the active project venv from a plain

@@ -125,7 +125,59 @@ def _patched_name(name: str):
         _PYPROJECT.write_text(original, encoding="utf-8")
 
 
+def _set_exec_bit(wheel: pathlib.Path) -> bool:
+    """Give the staged server binary an executable mode INSIDE the wheel.
+
+    maturin stores staged python-source files at mode 0o600, discarding the
+    0755 cargo produced — measured on the shipped 3.9.20 wheels. The copy into
+    python-source is not at fault (`shutil.copy2` preserves mode); the loss is
+    in wheel packaging, so it has to be corrected on the built artifact.
+
+    ⚠ This does NOT remove the need for m3's runtime chmod. The INSTALLER
+    decides whether a stored mode survives:
+        pip 25.1.1 -> 0o664, NOT executable  (pip marks only *.data/scripts/ +x)
+        uv         -> 0o775, executable
+    m3 installs via pipx, which uses pip. So this fixes the uv path and makes
+    the wheel correct for any installer that honours modes, while
+    `_ensure_executable()` / `repair_exec_bit()` on the m3 side stay
+    load-bearing for pip installs.
+
+    Safe to re-run: returns False when the bit is already set, and rewriting a
+    ZIP entry's mode does NOT invalidate RECORD (which carries content hashes
+    and sizes only — verified: 0 mismatches before and after).
+
+    Skipped on Windows: there is no exec bit there, `os.chmod` ignores 0o111,
+    and `os.access(X_OK)` is true for every file.
+    """
+    if sys.platform.startswith("win"):
+        return False
+    names = {_EMBED_SERVER_BIN, _EMBED_SERVER_BIN + ".exe"}
+    with zipfile.ZipFile(wheel) as zin:
+        infos = zin.infolist()
+        needs = [
+            i for i in infos
+            if pathlib.PurePosixPath(i.filename).name in names
+            and not ((i.external_attr >> 16) & 0o111)
+        ]
+        if not needs:
+            return False
+        tmp = wheel.with_name(wheel.name + ".tmp")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+            for i in infos:
+                data = zin.read(i.filename)
+                out = zipfile.ZipInfo(i.filename, date_time=i.date_time)
+                out.compress_type = i.compress_type
+                out.external_attr = i.external_attr
+                if pathlib.PurePosixPath(i.filename).name in names:
+                    mode = (((i.external_attr >> 16) & 0o7777) | 0o755) & 0o7777
+                    out.external_attr = (mode << 16) | (i.external_attr & 0xFFFF)
+                zout.writestr(out, data)
+    tmp.replace(wheel)
+    return True
+
+
 @contextlib.contextmanager
+
 def _staged_embed_server(features: list[str], release: bool):
     """Build the m3-embed-server binary with the SAME backend as this wheel and
     stage it under python/m3_core_rs/ so maturin bundles it into the wheel.
@@ -339,6 +391,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[build_wheel] error: {wheels[-1].name} does not contain "
                   f"{exe_member}", file=sys.stderr)
             return 1
+        # maturin stores it 0o600; correct that on the artifact. verify_wheels.py
+        # asserts the result, so a regression here fails the build rather than
+        # surfacing later as an EACCES the user cannot attribute.
+        if _set_exec_bit(wheels[-1]):
+            print(f"[build_wheel] set the exec bit on {exe_member} "
+                  f"(maturin stored it non-executable)")
         if sys.platform.startswith("win"):
             pdbs = [m for m in members if m.endswith(".pdb")]
             if pdbs:

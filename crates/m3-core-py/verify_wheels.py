@@ -111,6 +111,47 @@ def verify_wheel(path: Path) -> list[str]:
                 problems.append(f"RECORD size {size} != actual {info.file_size}")
             if digest_b64 and digest_b64 != actual:
                 problems.append("RECORD sha256 mismatch (corrupt/edited wheel)")
+
+        # 5. The server binary is stored EXECUTABLE in the wheel.
+        #
+        # Measured 2026-10-01 on the shipped 3.9.20 wheels: maturin stores
+        # staged python-source files at mode 0o600, discarding the 0755 cargo
+        # produced. `shutil.copy2` in build_wheel.py is not the culprit — it
+        # preserves mode; the loss is in wheel packaging.
+        #
+        # ⚠ Read this before concluding the check makes the problem go away.
+        # The INSTALLER decides whether the stored mode survives:
+        #     pip 25.1.1 -> 0o664, NOT executable   (pip only marks
+        #                                            *.data/scripts/ entries +x)
+        #     uv         -> 0o775, executable
+        # m3 installs via pipx, which uses pip. So shipping 0755 fixes the uv
+        # path and leaves the pip path needing m3's runtime chmod
+        # (`_ensure_executable` before exec, `repair_exec_bit` under
+        # `m3 doctor --fix`) — those stay load-bearing.
+        #
+        # This check exists anyway, for two reasons worth the four lines: a
+        # wheel that ships 0755 is correct for every installer that honours it,
+        # and a silent regression back to 0600 would otherwise be invisible
+        # until a user's embed-server failed to start with EACCES — four
+        # downstream symptoms that name no cause.
+        #
+        # Windows has no exec bit (`os.chmod` ignores 0o111 and `os.access`
+        # X_OK is true for every file), so asserting one there would be
+        # vacuously green at best and a false failure at worst.
+        if "win" not in path.name:
+            mode = (info.external_attr >> 16) & 0o7777
+            if mode == 0:
+                problems.append(
+                    f"{target} has NO unix mode recorded in the wheel "
+                    "(external_attr empty) — it cannot be executable on install"
+                )
+            elif not mode & 0o111:
+                problems.append(
+                    f"{target} is stored mode {oct(mode)} — not executable. "
+                    "maturin drops cargo's 0755; set it on the wheel entry after "
+                    "the build. uv honours the stored mode, pip does not, so m3's "
+                    "runtime chmod is still required for pip/pipx installs."
+                )
     return problems
 
 

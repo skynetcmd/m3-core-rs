@@ -155,7 +155,95 @@ def verify_wheel(path: Path) -> list[str]:
     return problems
 
 
+
+def _synthetic_wheel(dirpath: Path, *, mode: int, win: bool = False) -> Path:
+    """A minimal but VALID cpu wheel, so the only variable is the stored mode.
+
+    Padded past the 2 MB cpu floor (`_MIN_BIN_MB`) and given a correct RECORD,
+    because verify_wheel checks those first — a wheel that trips an earlier
+    check would make this prove nothing about the mode check.
+    """
+    import base64 as _b64
+    import hashlib as _hashlib
+    import zipfile as _zip
+
+    plat = "win_amd64" if win else "manylinux_2_38_x86_64"
+    exe = "m3-embed-server.exe" if win else "m3-embed-server"
+    name = f"m3_core_rs_{'windows' if win else 'linux'}_cpu-9.9.9-cp313-cp313-{plat}.whl"
+    whl = dirpath / name
+    binary = b"\0" * (3 * 1024 * 1024)          # clear the 2 MB cpu floor
+    so = b"\0" * 1024
+    members = {
+        f"m3_core_rs/{exe}": binary,
+        "m3_core_rs/m3_core_rs.cpython-313-x86_64-linux-gnu.so": so,
+        "m3_core_rs/__init__.py": b"__version__ = '9.9.9'\n",
+    }
+    rows = []
+    for n, data in members.items():
+        d = _b64.urlsafe_b64encode(_hashlib.sha256(data).digest()).decode().rstrip("=")
+        rows.append(f"{n},sha256={d},{len(data)}")
+    dist = "m3_core_rs_linux_cpu-9.9.9.dist-info"
+    rows.append(f"{dist}/RECORD,,")
+    with _zip.ZipFile(whl, "w", _zip.ZIP_DEFLATED) as z:
+        for n, data in members.items():
+            info = _zip.ZipInfo(n)
+            info.external_attr = (mode << 16)
+            z.writestr(info, data)
+        z.writestr(f"{dist}/WHEEL", "Wheel-Version: 1.0\n")
+        z.writestr(f"{dist}/METADATA", "Metadata-Version: 2.1\nName: m3-core-rs-linux-cpu\nVersion: 9.9.9\n")
+        z.writestr(f"{dist}/RECORD", "\n".join(rows) + "\n")
+    return whl
+
+
+def selftest() -> int:
+    """Prove the exec-bit check fires, and only when it should.
+
+    A check that cannot fail is worth nothing, and this one guards a defect that
+    is invisible until a user's embed-server dies with EACCES. Run with
+    `--selftest`; no network, no build, works on every supported OS.
+    """
+    import tempfile
+
+    failures = []
+
+    def expect(label: str, cond: bool, detail: str = "") -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'}  {label}" + (f" — {detail}" if detail and not cond else ""))
+        if not cond:
+            failures.append(label)
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+
+        (d / "bad").mkdir(parents=True)
+        bad = _synthetic_wheel(d / "bad", mode=0o600)
+        probs = verify_wheel(bad)
+        mode_probs = [p for p in probs if "not executable" in p or "NO unix mode" in p]
+        expect("a 0o600 binary is reported as not executable", bool(mode_probs), f"problems={probs}")
+        expect("and nothing ELSE is wrong with the synthetic wheel",
+               probs == mode_probs, f"unexpected: {[p for p in probs if p not in mode_probs]}")
+
+        (d / "good").mkdir(parents=True)
+        good = _synthetic_wheel(d / "good", mode=0o755)
+        probs = verify_wheel(good)
+        expect("a 0o755 binary passes cleanly", probs == [], f"problems={probs}")
+
+        (d / "win").mkdir(parents=True)
+        w = _synthetic_wheel(d / "win", mode=0o600, win=True)
+        probs = verify_wheel(w)
+        expect("Windows wheels are exempt (no exec bit there)",
+               not [p for p in probs if "not executable" in p], f"problems={probs}")
+
+    print()
+    if failures:
+        print(f"selftest FAILED: {len(failures)} check(s) — {failures}")
+        return 1
+    print("selftest OK")
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--selftest":
+        return selftest()
     dirs = [Path(a) for a in argv] or [Path("ci-wheels")]
     wheels: list[Path] = []
     for d in dirs:

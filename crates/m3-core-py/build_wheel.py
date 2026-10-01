@@ -134,19 +134,22 @@ def _patched_name(name: str):
 def _set_exec_bit(wheel: pathlib.Path) -> bool:
     """Give the staged server binary an executable mode INSIDE the wheel.
 
-    maturin stores staged python-source files at mode 0o600, discarding the
-    0755 cargo produced — measured on the shipped 3.9.20 wheels. The copy into
-    python-source is not at fault (`shutil.copy2` preserves mode); the loss is
-    in wheel packaging, so it has to be corrected on the built artifact.
+    All 35 shipped 3.9.20 wheels store this binary non-executable, so the mode
+    has to be corrected on the built artifact. Current maturin (1.13 macos /
+    1.15 linux) PRESERVES cargo's 0755, so this is normally a silent no-op —
+    which is precisely why the type-bits bug below went unnoticed.
 
-    ⚠ This does NOT remove the need for m3's runtime chmod. The INSTALLER
-    decides whether a stored mode survives:
-        pip 25.1.1 -> 0o664, NOT executable  (pip marks only *.data/scripts/ +x)
-        uv         -> 0o775, executable
-    m3 installs via pipx, which uses pip. So this fixes the uv path and makes
-    the wheel correct for any installer that honours modes, while
-    `_ensure_executable()` / `repair_exec_bit()` on the m3 side stay
-    load-bearing for pip installs.
+    ⚠ The stored value must keep its FILE-TYPE bits. pip honours a stored mode
+    faithfully, but only when the entry looks like a regular file; a
+    permissions-only value reads as "no mode recorded" and pip substitutes a
+    default. Measured on claude-dev, same wheel, only external_attr differing:
+        stored 0o755    -> pip installs -rw-rw-r--   NOT executable
+        stored 0o100755 -> pip installs -rwxrwxr-x   executable
+    An earlier note here read the first row as "pip does not preserve ZIP
+    modes" and concluded m3's runtime chmod was permanently load-bearing. It
+    was a malformed wheel, not an installer limitation: with a well-formed
+    0o100755 entry, pip 25.1.1/25.2/26.0/26.2.1 and uv all install it +x on
+    both Linux and macOS.
 
     Safe to re-run: returns False when the bit is already set, and rewriting a
     ZIP entry's mode does NOT invalidate RECORD (which carries content hashes
@@ -175,7 +178,16 @@ def _set_exec_bit(wheel: pathlib.Path) -> bool:
                 out.compress_type = i.compress_type
                 out.external_attr = i.external_attr
                 if pathlib.PurePosixPath(i.filename).name in names:
-                    mode = (((i.external_attr >> 16) & 0o7777) | 0o755) & 0o7777
+                    # Keep the FILE-TYPE bits (S_IFREG, 0o100000). Masking them
+                    # off with & 0o7777 stores a mode pip treats as absent, so
+                    # it falls back to a default and installs the binary
+                    # NON-EXECUTABLE — the very defect this function exists to
+                    # fix. Measured on claude-dev against a real wheel:
+                    #     stored 0o755    -> pip installs -rw-rw-r--  ❌
+                    #     stored 0o100755 -> pip installs -rwxrwxr-x  ✅
+                    mode = (i.external_attr >> 16) | 0o755
+                    if not mode & 0o170000:
+                        mode |= 0o100000  # S_IFREG
                     out.external_attr = (mode << 16) | (i.external_attr & 0xFFFF)
                 zout.writestr(out, data)
     tmp.replace(wheel)

@@ -124,14 +124,17 @@ def verify_wheel(path: Path) -> list[str]:
         #
         # ⚠ An earlier note here claimed pip 25.1.1 installs the binary
         # non-executable (0o664) and that m3's runtime chmod therefore stays
-        # load-bearing. That was measured against a 0600 wheel and blamed the
-        # installer for the artifact's defect. Re-measured 2026-10-01 against a
-        # correct 0755 wheel, every pip tested preserves it:
-        #     pip 25.1.1 / 25.2 / 26.0 / 26.2.1 -> -rwxr-xr-x
-        #     uv                                 -> -rwxr-xr-x
-        # pip reproduces whatever the wheel stores. Ship 0755 and the installed
-        # binary is executable on every installer tested, which is what makes a
-        # downstream workaround unnecessary rather than merely redundant.
+        # permanently load-bearing. That blamed the installer for a malformed
+        # artifact. What actually decides it is whether the stored mode keeps
+        # its FILE-TYPE bits — measured on claude-dev, one wheel, only
+        # external_attr differing:
+        #     stored 0o755    (no S_IFREG) -> pip installs -rw-rw-r--  ❌
+        #     stored 0o100755 (S_IFREG)    -> pip installs -rwxrwxr-x  ✅
+        # With a well-formed entry, pip 25.1.1/25.2/26.0/26.2.1 and uv all
+        # install it +x, on Linux and macOS. So a correct wheel is sufficient
+        # and no downstream workaround is needed — but a permissions-only mode
+        # passes a naive `mode & 0o111` test while still installing
+        # non-executable, which is why both shapes are checked below.
         # (m3's `_ensure_executable` / `repair_exec_bit` still earn their keep
         # for users who already installed a 3.9.20 wheel.)
         #
@@ -143,11 +146,23 @@ def verify_wheel(path: Path) -> list[str]:
         # X_OK is true for every file), so asserting one there would be
         # vacuously green at best and a false failure at worst.
         if "win" not in path.name:
-            mode = (info.external_attr >> 16) & 0o7777
-            if mode == 0:
+            full = info.external_attr >> 16
+            mode = full & 0o7777
+            if full == 0:
                 problems.append(
                     f"{target} has NO unix mode recorded in the wheel "
                     "(external_attr empty) — it cannot be executable on install"
+                )
+            elif not full & 0o170000:
+                # Permissions without file-type bits. This reads as "executable"
+                # to a naive mode check while pip treats it as no mode at all
+                # and installs the binary non-executable — a wheel that looks
+                # correct and is not. Keep this ABOVE the 0o111 check so it is
+                # not masked by it.
+                problems.append(
+                    f"{target} stores mode {oct(mode)} with no file-type bits "
+                    f"(external_attr>>16 = {oct(full)}); pip reads that as no "
+                    "mode and installs it NOT executable. Store 0o100755."
                 )
             elif not mode & 0o111:
                 problems.append(
@@ -184,7 +199,12 @@ def verify_wheel(path: Path) -> list[str]:
 
 
 def _synthetic_wheel(
-    dirpath: Path, *, mode: int, win: bool = False, sbom_root: str | None = None
+    dirpath: Path,
+    *,
+    mode: int,
+    win: bool = False,
+    sbom_root: str | None = None,
+    type_bits: bool = True,
 ) -> Path:
     """A minimal but VALID cpu wheel, so the only variable is the one under test.
 
@@ -194,6 +214,9 @@ def _synthetic_wheel(
 
     `sbom_root` adds a CycloneDX SBOM whose bom-ref is rooted at that path, to
     exercise check 6 (pass CI's `/home/runner/...` for the clean case).
+
+    `type_bits=False` stores permissions WITHOUT S_IFREG — the malformed shape
+    pip reads as no mode at all and installs non-executable.
     """
     import base64 as _b64
     import hashlib as _hashlib
@@ -235,7 +258,8 @@ def _synthetic_wheel(
     with _zip.ZipFile(whl, "w", _zip.ZIP_DEFLATED) as z:
         for n, data in members.items():
             info = _zip.ZipInfo(n)
-            info.external_attr = (mode << 16)
+            stored = mode | (0o100000 if type_bits else 0)
+            info.external_attr = (stored << 16)
             z.writestr(info, data)
         z.writestr(f"{dist}/WHEEL", "Wheel-Version: 1.0\n")
         z.writestr(f"{dist}/METADATA", "Metadata-Version: 2.1\nName: m3-core-rs-linux-cpu\nVersion: 9.9.9\n")
@@ -274,6 +298,14 @@ def selftest() -> int:
         good = _synthetic_wheel(d / "good", mode=0o755)
         probs = verify_wheel(good)
         expect("a 0o755 binary passes cleanly", probs == [], f"problems={probs}")
+
+        # The shape that fooled a prior investigation: rwx permissions with no
+        # S_IFREG. `mode & 0o111` says executable; pip installs it 0644.
+        (d / "notype").mkdir(parents=True)
+        nt = _synthetic_wheel(d / "notype", mode=0o755, type_bits=False)
+        probs = verify_wheel(nt)
+        expect("a permissions-only mode (no S_IFREG) is rejected",
+               any("file-type bits" in p for p in probs), f"problems={probs}")
 
         (d / "win").mkdir(parents=True)
         w = _synthetic_wheel(d / "win", mode=0o600, win=True)

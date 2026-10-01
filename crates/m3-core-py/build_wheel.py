@@ -41,6 +41,12 @@ import sys
 import zipfile
 from pathlib import Path
 
+# Run as a script by CI and by build_local.py, so this directory is already on
+# sys.path; the insert keeps the import working if it is ever imported from a
+# different cwd instead.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sanitize_sbom  # noqa: E402
+
 _HERE = Path(__file__).resolve().parent
 _PYPROJECT = _HERE / "pyproject.toml"
 _WORKSPACE = _HERE.parent.parent  # crates/m3-core-py -> repo root
@@ -391,12 +397,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[build_wheel] error: {wheels[-1].name} does not contain "
                   f"{exe_member}", file=sys.stderr)
             return 1
-        # maturin stores it 0o600; correct that on the artifact. verify_wheels.py
-        # asserts the result, so a regression here fails the build rather than
-        # surfacing later as an EACCES the user cannot attribute.
+        # Ensure the binary is stored executable. Current maturin (1.13/1.15)
+        # PRESERVES the mode, so this is normally a no-op and silent; it fired
+        # for the toolchain that built v2026.9.20, whose wheels shipped 0600 on
+        # every platform and left users an EACCES they could not attribute.
+        # pip itself is not the problem — it reproduces whatever the wheel
+        # stores faithfully (verified on pip 25.1.1/25.2/26.0/26.2), so getting
+        # this right here is what makes a downstream workaround unnecessary.
+        # verify_wheels.py asserts the result, so a regression fails the build.
         if _set_exec_bit(wheels[-1]):
             print(f"[build_wheel] set the exec bit on {exe_member} "
                   f"(maturin stored it non-executable)")
+        # Scrub the builder's absolute paths out of maturin's SBOM. Done here so
+        # a locally-built wheel cannot reach a public release still carrying the
+        # builder's username — the manual step it replaces was missed once, in
+        # v2026.9.20. No-op for CI wheels, whose paths are already generic.
+        scrubbed = sanitize_sbom.sanitize_wheel(wheels[-1])
+        if scrubbed:
+            print(f"[build_wheel] scrubbed {scrubbed} local path ref(s) from "
+                  f"the SBOM in {wheels[-1].name}")
         if sys.platform.startswith("win"):
             pdbs = [m for m in members if m.endswith(".pdb")]
             if pdbs:

@@ -21,6 +21,7 @@ import base64
 import csv
 import hashlib
 import io
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -114,26 +115,29 @@ def verify_wheel(path: Path) -> list[str]:
 
         # 5. The server binary is stored EXECUTABLE in the wheel.
         #
-        # Measured 2026-10-01 on the shipped 3.9.20 wheels: maturin stores
-        # staged python-source files at mode 0o600, discarding the 0755 cargo
-        # produced. `shutil.copy2` in build_wheel.py is not the culprit — it
-        # preserves mode; the loss is in wheel packaging.
+        # All 35 shipped 3.9.20 wheels store this binary non-executable (0600 on
+        # linux/macos, 0644 on windows). v2026.9.16 and v2026.9.7 are clean
+        # 0755, and the correction below does not fire on any current local
+        # toolchain (maturin 1.13.3 macos / 1.15.0 linux both PRESERVE the
+        # mode) — so this is not "maturin always drops the bit": it is specific
+        # to how v2026.9.20 was built, the one release built through CI.
         #
-        # ⚠ Read this before concluding the check makes the problem go away.
-        # The INSTALLER decides whether the stored mode survives:
-        #     pip 25.1.1 -> 0o664, NOT executable   (pip only marks
-        #                                            *.data/scripts/ entries +x)
-        #     uv         -> 0o775, executable
-        # m3 installs via pipx, which uses pip. So shipping 0755 fixes the uv
-        # path and leaves the pip path needing m3's runtime chmod
-        # (`_ensure_executable` before exec, `repair_exec_bit` under
-        # `m3 doctor --fix`) — those stay load-bearing.
+        # ⚠ An earlier note here claimed pip 25.1.1 installs the binary
+        # non-executable (0o664) and that m3's runtime chmod therefore stays
+        # load-bearing. That was measured against a 0600 wheel and blamed the
+        # installer for the artifact's defect. Re-measured 2026-10-01 against a
+        # correct 0755 wheel, every pip tested preserves it:
+        #     pip 25.1.1 / 25.2 / 26.0 / 26.2.1 -> -rwxr-xr-x
+        #     uv                                 -> -rwxr-xr-x
+        # pip reproduces whatever the wheel stores. Ship 0755 and the installed
+        # binary is executable on every installer tested, which is what makes a
+        # downstream workaround unnecessary rather than merely redundant.
+        # (m3's `_ensure_executable` / `repair_exec_bit` still earn their keep
+        # for users who already installed a 3.9.20 wheel.)
         #
-        # This check exists anyway, for two reasons worth the four lines: a
-        # wheel that ships 0755 is correct for every installer that honours it,
-        # and a silent regression back to 0600 would otherwise be invisible
-        # until a user's embed-server failed to start with EACCES — four
-        # downstream symptoms that name no cause.
+        # A silent regression to 0600 would otherwise stay invisible until a
+        # user's embed-server failed to start with EACCES — a symptom that
+        # names no cause. selftest() proves this check actually fires.
         #
         # Windows has no exec bit (`os.chmod` ignores 0o111 and `os.access`
         # X_OK is true for every file), so asserting one there would be
@@ -148,20 +152,48 @@ def verify_wheel(path: Path) -> list[str]:
             elif not mode & 0o111:
                 problems.append(
                     f"{target} is stored mode {oct(mode)} — not executable. "
-                    "maturin drops cargo's 0755; set it on the wheel entry after "
-                    "the build. uv honours the stored mode, pip does not, so m3's "
-                    "runtime chmod is still required for pip/pipx installs."
+                    "Every installer tested reproduces the stored mode, so "
+                    "this ships as EACCES at first use; set it "
+                    "on the wheel entry after the build (build_wheel.py)."
+                )
+
+        # 6. The SBOM must not carry the builder's absolute paths.
+        #
+        # maturin writes each crate's absolute source path into its bom-ref —
+        # 57 refs per wheel exposing the builder's username and directory
+        # layout in a PUBLIC artifact. v2026.9.20 shipped 10 such wheels
+        # because the scrub was a manual step someone had to remember.
+        # build_wheel.py now does it automatically; this is the assertion that
+        # makes forgetting it impossible rather than merely unlikely.
+        sbom = next((n for n in z.namelist() if n.endswith("cyclonedx.json")), None)
+        if sbom is not None:
+            text = z.read(sbom).decode("utf-8", "replace")
+            leaked = {
+                m.group(0)
+                for m in re.finditer(r"path\+file:///[^\"#]*", text)
+                if not m.group(0).startswith("path+file:///home/runner/")
+            }
+            if leaked:
+                sample = sorted(leaked)[0]
+                problems.append(
+                    f"SBOM leaks {len(leaked)} builder path(s), e.g. {sample} "
+                    "— run sanitize_sbom.py before publishing"
                 )
     return problems
 
 
 
-def _synthetic_wheel(dirpath: Path, *, mode: int, win: bool = False) -> Path:
-    """A minimal but VALID cpu wheel, so the only variable is the stored mode.
+def _synthetic_wheel(
+    dirpath: Path, *, mode: int, win: bool = False, sbom_root: str | None = None
+) -> Path:
+    """A minimal but VALID cpu wheel, so the only variable is the one under test.
 
     Padded past the 2 MB cpu floor (`_MIN_BIN_MB`) and given a correct RECORD,
     because verify_wheel checks those first — a wheel that trips an earlier
     check would make this prove nothing about the mode check.
+
+    `sbom_root` adds a CycloneDX SBOM whose bom-ref is rooted at that path, to
+    exercise check 6 (pass CI's `/home/runner/...` for the clean case).
     """
     import base64 as _b64
     import hashlib as _hashlib
@@ -178,11 +210,27 @@ def _synthetic_wheel(dirpath: Path, *, mode: int, win: bool = False) -> Path:
         "m3_core_rs/m3_core_rs.cpython-313-x86_64-linux-gnu.so": so,
         "m3_core_rs/__init__.py": b"__version__ = '9.9.9'\n",
     }
+    dist = "m3_core_rs_linux_cpu-9.9.9.dist-info"
+    if sbom_root is not None:
+        import json as _json
+
+        members[f"{dist}/sboms/m3-core-py.cyclonedx.json"] = _json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "specVersion": "1.5",
+                "components": [
+                    {
+                        "type": "library",
+                        "name": "m3-error",
+                        "bom-ref": f"path+file://{sbom_root}/crates/m3-error#9.9.9",
+                    }
+                ],
+            }
+        ).encode()
     rows = []
     for n, data in members.items():
         d = _b64.urlsafe_b64encode(_hashlib.sha256(data).digest()).decode().rstrip("=")
         rows.append(f"{n},sha256={d},{len(data)}")
-    dist = "m3_core_rs_linux_cpu-9.9.9.dist-info"
     rows.append(f"{dist}/RECORD,,")
     with _zip.ZipFile(whl, "w", _zip.ZIP_DEFLATED) as z:
         for n, data in members.items():
@@ -232,6 +280,37 @@ def selftest() -> int:
         probs = verify_wheel(w)
         expect("Windows wheels are exempt (no exec bit there)",
                not [p for p in probs if "not executable" in p], f"problems={probs}")
+
+        # Check 6: the SBOM leak guard must fire on a builder path and stay
+        # quiet on CI's generic one, or it is decoration.
+        (d / "leak").mkdir(parents=True)
+        leak = _synthetic_wheel(
+            d / "leak", mode=0o755, sbom_root="/Users/somebody/m3-core-rs"
+        )
+        probs = verify_wheel(leak)
+        expect("an SBOM with a builder path is reported as leaking",
+               any("SBOM leaks" in p for p in probs), f"problems={probs}")
+
+        (d / "noleak").mkdir(parents=True)
+        clean = _synthetic_wheel(
+            d / "noleak",
+            mode=0o755,
+            sbom_root="/home/runner/work/m3-core-rs/m3-core-rs",
+        )
+        probs = verify_wheel(clean)
+        expect("a CI-rooted SBOM passes cleanly", probs == [], f"problems={probs}")
+
+        # And the sanitizer must actually turn the first into the second.
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import sanitize_sbom
+
+        dirty = _synthetic_wheel(
+            d / "leak", mode=0o755, sbom_root="/Users/somebody/m3-core-rs"
+        )
+        scrubbed = sanitize_sbom.sanitize_wheel(dirty)
+        probs = verify_wheel(dirty)
+        expect("sanitize_sbom clears the leak and keeps the wheel valid",
+               scrubbed > 0 and probs == [], f"scrubbed={scrubbed} problems={probs}")
 
     print()
     if failures:

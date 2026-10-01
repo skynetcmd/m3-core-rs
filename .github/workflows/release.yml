@@ -431,6 +431,15 @@ jobs:
             $py -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
           done
 
+      # GATE: nothing in CI verified wheel CONTENTS until now, which is how
+      # v2026.9.20 published 35 wheels whose m3-embed-server was mode 0600 (not
+      # executable) on every platform. Runs AFTER the CUDA repair on purpose:
+      # `auditwheel repair` repacks into a new wheel and can drop the exec bit
+      # that build_wheel.py set. Fail the release here rather than ship it.
+      - name: Verify wheel contents (exec bit, members, tags)
+        shell: bash
+        run: python crates/m3-core-py/verify_wheels.py "$GITHUB_WORKSPACE/dist"
+
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

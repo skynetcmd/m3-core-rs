@@ -40,6 +40,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -88,25 +89,33 @@ def _sanitize_sbom_bytes(raw: bytes) -> tuple[bytes, int]:
 
 def sanitize_wheel(path: Path, *, check_only: bool = False) -> int:
     """Rewrite one wheel in place. Returns the number of paths scrubbed."""
+    # Read everything needed under ONE closed handle: an open ZipFile keeps the
+    # file locked on Windows, which would break the os.replace below.
     with zipfile.ZipFile(path) as z:
-        sbom_name = next(
-            (n for n in z.namelist() if n.endswith("cyclonedx.json")), None
-        )
+        names = z.namelist()
+        sbom_name = next((n for n in names if n.endswith("cyclonedx.json")), None)
         if sbom_name is None:
             return 0
+        record_name = next(
+            (n for n in names if n.endswith(".dist-info/RECORD")), None
+        )
         new_sbom, hits = _sanitize_sbom_bytes(z.read(sbom_name))
 
     if hits == 0 or check_only:
         return hits
+    if record_name is None:
+        raise RuntimeError(f"{path.name}: SBOM present but no dist-info/RECORD")
 
-    record_name = next(
-        n for n in zipfile.ZipFile(path).namelist() if n.endswith(".dist-info/RECORD")
-    )
     new_row = f"{sbom_name},{_record_row(new_sbom)},{len(new_sbom)}"
 
     # Rewrite into a temp file, then atomically replace, so an interrupted run
     # cannot leave a half-written wheel that later steps would happily upload.
-    tmp = Path(tempfile.mkstemp(suffix=".whl", dir=str(path.parent))[1])
+    # mkstemp hands back an OPEN fd; close it before writing through a separate
+    # handle. Windows refuses os.replace on a file that is still open (WinError
+    # 32), where POSIX allows it — so leaving it open fails only on Windows.
+    fd, tmp_name = tempfile.mkstemp(suffix=".whl", dir=str(path.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
         with zipfile.ZipFile(path) as src, zipfile.ZipFile(
             tmp, "w", zipfile.ZIP_DEFLATED

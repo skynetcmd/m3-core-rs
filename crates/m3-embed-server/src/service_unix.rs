@@ -264,11 +264,28 @@ pub mod linux {
         println!("systemd --user unit installed: {}", unit_name());
         println!("unit:     {}", unit.display());
         println!("log:      journalctl --user -u {SERVICE_NAME}");
+        if linger_enabled() {
+            return Ok(());
+        }
         println!();
         println!("Note: a `systemd --user` service stops when you log out. To keep");
         println!("the embedder running across logout / on a headless box, enable lingering:");
         println!("  loginctl enable-linger \"$USER\"");
         Ok(())
+    }
+
+    /// Whether systemd keeps this user's services running after logout. An
+    /// unknown answer reads as no, so the note is shown rather than hidden.
+    fn linger_enabled() -> bool {
+        let user = std::env::var("USER").unwrap_or_default();
+        if user.is_empty() {
+            return false;
+        }
+        std::process::Command::new("loginctl")
+            .args(["show-user", &user, "-p", "Linger", "--value"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+            .unwrap_or(false)
     }
 
     pub fn uninstall() -> Result<(), String> {

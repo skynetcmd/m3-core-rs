@@ -77,6 +77,17 @@ pub async fn run<F>(cfg: ResolvedConfig, shutdown: F) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    run_with_ready(cfg, shutdown, || {}).await
+}
+
+/// `run`, calling `on_ready` once the model is loaded and the port is bound —
+/// the earliest moment the server can actually answer. A supervisor that
+/// reports "running" must wait for this, not for the start request.
+pub async fn run_with_ready<F, R>(cfg: ResolvedConfig, shutdown: F, on_ready: R) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+    R: FnOnce(),
+{
     // n_ctx and streams are the two knobs that decide this process's footprint,
     // so both belong in the startup line. Each stream materialises its own
     // compute graph on first use, sized for a worst-case n_ctx batch, and holds
@@ -172,9 +183,15 @@ where
         .route("/metrics", get(metrics_handler))
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse().map_err(|e| {
+        anyhow::anyhow!("invalid listen address {}:{} (M3_EMBED_SERVER_HOST / _PORT): {e}",
+                        cfg.host, cfg.port)
+    })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?;
     log::info!("listening on http://{addr}");
+    on_ready();
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
@@ -184,20 +201,47 @@ where
     Ok(())
 }
 
+/// The JSON type name of `v`, for error messages that must not echo `v` itself.
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
 async fn embed_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, (StatusCode, String)> {
     let texts: Vec<String> = match req.input {
         serde_json::Value::String(s) => vec![s],
-        serde_json::Value::Array(arr) => arr
-            .into_iter()
-            .map(|v| v.as_str().map(String::from).unwrap_or_default())
-            .collect(),
+        serde_json::Value::Array(arr) => {
+            // Each element must be a string. A number (or an OpenAI-style token
+            // array) used to become "" and be embedded as the empty string.
+            let mut out = Vec::with_capacity(arr.len());
+            for (i, v) in arr.into_iter().enumerate() {
+                match v {
+                    serde_json::Value::String(s) => out.push(s),
+                    other => {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!("input[{i}] must be a string; got {}", json_type(&other)),
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        // Name the type only: the rejected payload can be large, and echoing it
+        // back serves no one.
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("input must be string or [string]; got {other}"),
+                format!("input must be a string or an array of strings; got {}", json_type(&other)),
             ));
         }
     };

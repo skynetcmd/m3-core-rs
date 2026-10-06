@@ -55,11 +55,14 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
         return Ok(g);
     }
     // Fall back to a config.toml that an earlier run may have written.
-    let file_cfg = config::load_file_config(&config::default_config_path()).unwrap_or_default();
+    let path = config::default_config_path();
+    let file_cfg = config::load_file_config(&path).map_err(|e| e.to_string())?;
     file_cfg.embed.gguf.clone().ok_or_else(|| {
-        "M3_EMBED_GGUF is unset and no config.toml has [embed].gguf — \
-         set the env var before `install` so the service can find the model"
-            .to_string()
+        format!(
+            "M3_EMBED_GGUF is unset and {} has no [embed].gguf — set the env var \
+             before `install` so the service can find the model",
+            path.display()
+        )
     })
 }
 
@@ -67,14 +70,10 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
 // macOS — launchd user agent
 // ===========================================================================
 //
-// VERIFICATION STATUS: this module was written and reviewed but, as of
-// 2026-05-22, NEVER COMPILED — the feature was developed on Windows and the
-// Linux/systemd sibling verified on a Debian box, but no macOS host was
-// available and cross-compiling to *-apple-darwin fails at the llama.cpp/ring
-// C build. Before relying on the launchd path, run `cargo build/test/clippy
-// -p m3-embed-server --features embedded` on a real Mac plus a launchctl
-// install/status/stop/uninstall smoke test. Full checklist: m3-memory to-do
-// `c5508907` ("Verify the macOS launchd path in m3-embed-server").
+// Built and exercised on a real Mac (Apple Silicon, launchd gui domain); the
+// release wheels for macOS are built natively there. Cross-compiling to
+// *-apple-darwin still fails at the llama.cpp/ring C build, so a change here
+// needs a Mac to verify.
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;
@@ -136,25 +135,44 @@ pub mod macos {
         // best-effort).
         let domain = gui_domain()?;
         let target = service_target()?;
-        let _ = run_launchctl(&["bootout", &target]);
+        // Re-bootstrap of a loaded label errors, so unload first. Absent is
+        // the expected case here, hence no report.
+        if is_loaded(&target)? {
+            bootout_and_wait(&target)?;
+        }
         run_launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
 
         println!("launchd agent installed: {LAUNCHD_LABEL}");
         println!("plist:    {}", plist.display());
+        println!("config:   {}", config::default_config_path().display());
         println!("log file: {}", log_path.display());
-        println!("It will start now and on every login (RunAtLoad + KeepAlive).");
+        // RunAtLoad starts it now; report whether it actually came up.
+        let state = wait_for("running", 10)?;
+        println!("state:    {state}");
+        if state != "running" {
+            eprintln!("WARN: the agent did not reach running within 10s; see {}", log_path.display());
+        }
         Ok(())
     }
 
     pub fn uninstall() -> Result<(), String> {
         let plist = plist_path()?;
-        // bootout is best-effort — the agent may already be unloaded.
-        if let Ok(target) = service_target() {
-            let _ = run_launchctl(&["bootout", &target]);
+        let target = service_target()?;
+        let loaded = is_loaded(&target)?;
+        if !loaded && !plist.exists() {
+            println!("launchd agent not installed: {LAUNCHD_LABEL}");
+            return Ok(());
+        }
+        if loaded {
+            bootout_and_wait(&target)?;
         }
         if plist.exists() {
             std::fs::remove_file(&plist)
                 .map_err(|e| format!("cannot remove plist {}: {e}", plist.display()))?;
+        }
+        let state = observed_state()?;
+        if state != "not installed" {
+            return Err(format!("{LAUNCHD_LABEL} is still {state} after uninstall"));
         }
         println!("launchd agent removed: {LAUNCHD_LABEL}");
         println!(
@@ -165,45 +183,109 @@ pub mod macos {
     }
 
     pub fn start() -> Result<(), String> {
-        run_launchctl(&["kickstart", &service_target()?])?;
-        println!("start signal sent to {LAUNCHD_LABEL}");
-        Ok(())
+        let plist = plist_path()?;
+        if !plist.exists() {
+            return Err(format!(
+                "launchd agent not installed ({} is missing) — run `m3-embed-server install` first",
+                plist.display()
+            ));
+        }
+        let target = service_target()?;
+        // `stop` unloads the agent, and kickstart cannot reach an unloaded
+        // label; load it first (RunAtLoad then starts it).
+        if !is_loaded(&target)? {
+            run_launchctl(&["bootstrap", &gui_domain()?, &plist.to_string_lossy()])?;
+        }
+        run_launchctl(&["kickstart", &target])?;
+        let state = wait_for("running", 10)?;
+        if state == "running" {
+            println!("{LAUNCHD_LABEL}: running");
+            Ok(())
+        } else {
+            Err(format!(
+                "{LAUNCHD_LABEL} did not reach running within 10s (state: {state}); see {}",
+                config::default_log_path().display()
+            ))
+        }
     }
 
     pub fn stop() -> Result<(), String> {
-        // `kill` sends a signal to the running job without unloading it, so a
-        // later `start`/KeepAlive can bring it back.
-        run_launchctl(&["kill", "SIGTERM", &service_target()?])?;
-        println!("stop signal sent to {LAUNCHD_LABEL}");
+        let target = service_target()?;
+        if !is_loaded(&target)? {
+            println!("{LAUNCHD_LABEL} is already stopped (nothing to do)");
+            return Ok(());
+        }
+        // Unload, not `kill`: the plist sets KeepAlive, so launchd restarts a
+        // killed job at once. The plist stays, so `status` says stopped and
+        // RunAtLoad brings it back at the next login.
+        bootout_and_wait(&target)?;
+        println!("{LAUNCHD_LABEL}: {}", observed_state()?);
         Ok(())
     }
 
-    pub fn status() -> Result<(), String> {
-        // `launchctl print` exits non-zero when the label isn't loaded.
-        match launchctl_output(&["print", &service_target()?]) {
-            Ok(out) => {
-                // `print` dumps a big dict; the `state = running` line is the
-                // signal. Absence of that line ⇒ loaded but not running.
-                if out.lines().any(|l| l.trim_start().starts_with("state =") && l.contains("running")) {
-                    println!("running");
-                } else {
-                    println!("stopped");
-                }
-                Ok(())
+    /// `bootout` returns before launchd has torn the job down (measured: the
+    /// label still prints as loaded right after), so wait for it to go. A
+    /// bootout that fails because the job is already unloading is success.
+    fn bootout_and_wait(target: &str) -> Result<(), String> {
+        let result = run_launchctl(&["bootout", target]);
+        for _ in 0..40 {
+            if !is_loaded(target)? {
+                return Ok(());
             }
-            Err(_) => {
-                // Not loaded is not the same as not installed: `launchctl unload`
-                // (what `m3 stop` does) leaves the plist in place, and `install`
-                // over it is then a re-registration, not a first install. The
-                // plist on disk is the registration.
-                if plist_path().map(|p| p.exists()).unwrap_or(false) {
-                    println!("stopped");
-                } else {
-                    println!("not installed");
-                }
-                Ok(())
-            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        result?;
+        Err(format!("{LAUNCHD_LABEL} is still loaded 10s after bootout"))
+    }
+
+    pub fn status() -> Result<(), String> {
+        println!("{}", observed_state()?);
+        Ok(())
+    }
+
+    /// Whether launchd has the label loaded. `print` exits non-zero for an
+    /// unknown label; failing to spawn launchctl at all is an error, not "no".
+    fn is_loaded(target: &str) -> Result<bool, String> {
+        Ok(launchctl_raw(&["print", target])?.status.success())
+    }
+
+    /// `running` / `stopped` / `not installed` — the words m3 parses.
+    fn observed_state() -> Result<&'static str, String> {
+        let out = launchctl_raw(&["print", &service_target()?])?;
+        if out.status.success() {
+            // `print` dumps a big dict; the `state = running` line is the
+            // signal. Exact match: `state = not running` also contains "running".
+            let text = String::from_utf8_lossy(&out.stdout);
+            return Ok(if text.lines().any(|l| l.trim() == "state = running") {
+                "running"
+            } else {
+                "stopped"
+            });
+        }
+        // Not loaded is not the same as not installed: `launchctl unload` (what
+        // `m3 stop` does) and our own `stop` leave the plist in place, and the
+        // plist on disk is the registration.
+        Ok(if plist_path()?.exists() { "stopped" } else { "not installed" })
+    }
+
+    /// Poll until the agent is `want` or `secs` pass; returns the last state.
+    fn wait_for(want: &str, secs: u64) -> Result<&'static str, String> {
+        let mut state = observed_state()?;
+        for _ in 0..(secs * 4) {
+            if state == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            state = observed_state()?;
+        }
+        Ok(state)
+    }
+
+    fn launchctl_raw(args: &[&str]) -> Result<std::process::Output, String> {
+        std::process::Command::new("launchctl")
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to spawn launchctl: {e}"))
     }
 
     fn run_launchctl(args: &[&str]) -> Result<(), String> {
@@ -215,10 +297,7 @@ pub mod macos {
     }
 
     fn launchctl_output(args: &[&str]) -> Result<String, String> {
-        let output = std::process::Command::new("launchctl")
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to spawn launchctl: {e}"))?;
+        let output = launchctl_raw(args)?;
         if !output.status.success() {
             return Err(format!(
                 "launchctl {} exited {}: {}",
@@ -271,7 +350,14 @@ pub mod linux {
 
         println!("systemd --user unit installed: {}", unit_name());
         println!("unit:     {}", unit.display());
+        println!("config:   {}", config::default_config_path().display());
         println!("log:      journalctl --user -u {SERVICE_NAME}");
+        // `enable --now` returns once the start is queued; report the outcome.
+        let state = wait_for("running", 10);
+        println!("state:    {state}");
+        if state != "running" {
+            eprintln!("WARN: the unit did not reach running within 10s; {}", journal_hint());
+        }
         if linger_enabled() {
             return Ok(());
         }
@@ -298,14 +384,24 @@ pub mod linux {
 
     pub fn uninstall() -> Result<(), String> {
         let unit = unit_path()?;
-        // `disable --now` stops it and removes the auto-start symlink.
-        // Best-effort — the unit may already be gone.
-        let _ = run_systemctl(&["disable", "--now", &unit_name()]);
+        if !unit.exists() && observed_state() == "not installed" {
+            println!("systemd --user unit not installed: {}", unit_name());
+            return Ok(());
+        }
+        // `disable --now` stops it and removes the auto-start symlink. A
+        // failure is reported: the result is re-checked below either way.
+        if let Err(e) = run_systemctl(&["disable", "--now", &unit_name()]) {
+            eprintln!("WARN: {e}");
+        }
         if unit.exists() {
             std::fs::remove_file(&unit)
                 .map_err(|e| format!("cannot remove unit {}: {e}", unit.display()))?;
         }
-        let _ = run_systemctl(&["daemon-reload"]);
+        run_systemctl(&["daemon-reload"])?;
+        let state = observed_state();
+        if state != "not installed" {
+            return Err(format!("{} is still {state} after uninstall", unit_name()));
+        }
         println!("systemd --user unit removed: {}", unit_name());
         println!(
             "config file left in place: {} (delete manually if desired)",
@@ -316,38 +412,96 @@ pub mod linux {
 
     pub fn start() -> Result<(), String> {
         run_systemctl(&["start", &unit_name()])?;
-        println!("start signal sent to {SERVICE_NAME}");
-        Ok(())
+        // `start` returns once the main process is forked (Type=simple), so a
+        // bad GGUF or a busy port still exits 0. Report the outcome.
+        let state = wait_for("running", 10);
+        if state == "running" {
+            println!("{SERVICE_NAME}: running");
+            Ok(())
+        } else {
+            Err(format!(
+                "{SERVICE_NAME} did not reach running within 10s (state: {state}); {}",
+                journal_hint()
+            ))
+        }
     }
 
     pub fn stop() -> Result<(), String> {
+        // `systemctl stop` blocks until the unit has stopped.
         run_systemctl(&["stop", &unit_name()])?;
-        println!("stop signal sent to {SERVICE_NAME}");
+        let state = observed_state();
+        if state == "running" {
+            return Err(format!("{SERVICE_NAME} is still running after stop"));
+        }
+        println!("{SERVICE_NAME}: {state}");
         Ok(())
     }
 
     pub fn status() -> Result<(), String> {
-        // `is-active` prints active/inactive/failed/unknown and sets exit code;
+        println!("{}", observed_state_noted(true));
+        Ok(())
+    }
+
+    fn observed_state() -> String {
+        observed_state_noted(false)
+    }
+
+    fn journal_hint() -> String {
+        format!("see `journalctl --user -u {SERVICE_NAME} -n 50`")
+    }
+
+    /// The state word m3 parses: `running`, `stopped`, `not installed`, or
+    /// systemd's own transitional word (`activating`, `deactivating`, …).
+    /// Detail an operator needs goes to stderr so stdout stays one word.
+    fn observed_state_noted(report: bool) -> String {
+        // `is-active` prints active/inactive/failed/… and sets the exit code;
         // `is-enabled` distinguishes "not installed" from "installed, stopped".
-        let active = systemctl_output(&["is-active", &unit_name()])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let active = match systemctl_output(&["is-active", &unit_name()]) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                // No answer (no user bus, systemctl missing) is not "not
+                // installed"; fall back to the unit file and say why.
+                if report {
+                    eprintln!("cannot query systemd: {e}");
+                }
+                return if unit_path().map(|p| p.exists()).unwrap_or(false) {
+                    "stopped".to_string()
+                } else {
+                    "not installed".to_string()
+                };
+            }
+        };
         match active.as_str() {
-            "active" => println!("running"),
-            "" | "inactive" | "failed" | "unknown" => {
-                // Distinguish stopped-but-installed from never-installed.
+            "active" => "running".to_string(),
+            "inactive" | "failed" | "unknown" => {
                 let enabled = systemctl_output(&["is-enabled", &unit_name()])
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                if enabled.is_empty() || enabled == "not-found" {
-                    println!("not installed");
-                } else {
-                    println!("stopped");
+                let installed = !(enabled.is_empty() || enabled == "not-found")
+                    || unit_path().map(|p| p.exists()).unwrap_or(false);
+                if !installed {
+                    return "not installed".to_string();
                 }
+                if report && active == "failed" {
+                    eprintln!("the unit failed; {}", journal_hint());
+                }
+                "stopped".to_string()
             }
-            other => println!("{other}"),
+            other => other.to_string(),
         }
-        Ok(())
+    }
+
+    /// Poll until the unit is `want` or `secs` pass; returns the last state.
+    fn wait_for(want: &str, secs: u64) -> String {
+        let mut state = observed_state();
+        for _ in 0..(secs * 4) {
+            if state == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            state = observed_state();
+        }
+        state
     }
 
     fn run_systemctl(args: &[&str]) -> Result<(), String> {

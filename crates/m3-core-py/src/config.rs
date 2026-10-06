@@ -8,9 +8,18 @@ use std::env;
 use m3_dispatcher::{BreakerCfg, DispatcherConfig};
 
 /// Parse an `M3_*` env var into `T`, falling back to `default` when unset or
-/// unparseable.
+/// unparseable. Unparseable is reported: a typo must not read as the default.
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    match env::var(key) {
+        Ok(raw) if !raw.is_empty() => match raw.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                log::warn!("ignoring {key}={raw:?}: not a valid value; using the default");
+                default
+            }
+        },
+        _ => default,
+    }
 }
 
 /// `M3_EMBED_STREAMS` — concurrent dispatcher streams.

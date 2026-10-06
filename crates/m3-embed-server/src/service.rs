@@ -151,7 +151,7 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
-    // StartPending while we eager-load the GGUF.
+    // StartPending until the model is loaded and the port bound (see on_ready).
     status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::StartPending,
@@ -162,57 +162,71 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         process_id: None,
     })?;
 
-    // Resolve config from %PROGRAMDATA% file (env vars unlikely to be set
-    // under SYSTEM, but `resolve` honors them when present).
-    let file_cfg = config::load_file_config(&config::default_config_path())
-        .map_err(|e| format!("failed to load config.toml: {e}"))?;
-    let cfg = config::resolve(&file_cfg)
-        .map_err(|e| format!("config resolve failed: {e}"))?;
+    // Everything after StartPending can fail; whatever happens, publish
+    // Stopped with the outcome, or SCM sits in start-pending until its timeout
+    // and `status` reports that instead of the failure.
+    let run_result: Result<(), String> = (|| {
+        // Resolve config from %PROGRAMDATA% file (env vars unlikely to be set
+        // under SYSTEM, but `resolve` honors them when present).
+        let file_cfg = config::load_file_config(&config::default_config_path())
+            .map_err(|e| e.to_string())?;
+        let cfg = config::resolve(&file_cfg).map_err(|e| format!("config resolve failed: {e}"))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("cannot start the async runtime: {e}"))?;
 
-    // Bridge std::sync::mpsc -> tokio oneshot so axum's graceful_shutdown
-    // future can await the SCM stop signal.
-    let (tk_tx, tk_rx) = tokio::sync::oneshot::channel::<()>();
-    std::thread::spawn(move || {
-        let _ = shutdown_rx.recv();
-        let _ = tk_tx.send(());
-    });
+        // Bridge std::sync::mpsc -> tokio oneshot so axum's graceful_shutdown
+        // future can await the SCM stop signal.
+        let (tk_tx, tk_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = shutdown_rx.recv();
+            let _ = tk_tx.send(());
+        });
 
-    // Mark Running once we're about to call serve(). The first request can't
-    // actually arrive until bind() completes inside run(), but SCM only
-    // needs an upper bound on start latency, which `wait_hint` already gave.
-    status_handle.set_service_status(ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-        exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
-    })?;
+        // Running only once the model is loaded and the port is bound: a bad
+        // GGUF or a port already in use must never read as "running".
+        let on_ready = move || {
+            if let Err(e) = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Running,
+                controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+                exit_code: ServiceExitCode::Win32(0),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            }) {
+                log::error!("serving, but could not report Running to SCM: {e}");
+            }
+        };
+        runtime
+            .block_on(crate::server::run_with_ready(cfg, async move {
+                let _ = tk_rx.await;
+            }, on_ready))
+            .map_err(|e| e.to_string())
+    })();
 
-    let run_result = runtime.block_on(async move {
-        crate::server::run(cfg, async move {
-            let _ = tk_rx.await;
-        })
-        .await
-    });
-
-    // Always publish Stopped, even on error.
-    let _ = status_handle.set_service_status(ServiceStatus {
+    // Always publish Stopped. ERROR_SERVICE_SPECIFIC_ERROR (1066) + code 1 is
+    // how a service reports its own failure; `sc query` then shows it.
+    let exit_code = if run_result.is_ok() {
+        ServiceExitCode::Win32(0)
+    } else {
+        ServiceExitCode::ServiceSpecific(1)
+    };
+    if let Err(e) = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(if run_result.is_ok() { 0 } else { 1 }),
+        exit_code,
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
-    });
+    }) {
+        log::error!("could not report Stopped to SCM: {e}");
+    }
 
-    run_result.map_err(|e| Box::<dyn std::error::Error>::from(e.to_string()))
+    run_result.map_err(Box::<dyn std::error::Error>::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +261,10 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         println!("service already installed: {SERVICE_NAME}");
         match state {
             Some(ServiceState::Running) => println!("state: running (nothing to do)"),
-            Some(_) => println!("state: stopped — start it with `m3-embed-server start`"),
+            Some(ServiceState::Stopped) => {
+                println!("state: stopped — start it with `m3-embed-server start`")
+            }
+            Some(s) => println!("state: {}", state_word(s)),
             None => println!("state: unknown (could not query SCM)"),
         }
         println!("to re-register from scratch: `m3-embed-server uninstall` then `install`");
@@ -373,39 +390,41 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let service = match service_manager.open_service(SERVICE_NAME, service_access) {
         Ok(s) => s,
         Err(windows_service::Error::Winapi(e))
-            if e.raw_os_error() == Some(1060) =>
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
         {
             println!("service not installed: {SERVICE_NAME}");
             return Ok(());
         }
-        Err(e) => {
-            return Err(Box::<dyn std::error::Error>::from(format!(
-                "cannot remove the service: {e}\n  \
-                 Removing a Windows Service requires Administrator rights.\n  \
-                 Open an *Administrator* terminal and run: m3-embed-server uninstall\n  \
-                 (The service IS currently registered — `m3-embed-server status` \
-                 shows its state.)"
-            )))
-        }
+        Err(e) => return Err(open_failure("uninstall", e)),
     };
 
-    // Best-effort stop.
+    // Stop first. A failed stop is reported, not swallowed: deleting a running
+    // service only marks it, and it lingers until the process exits.
     if let Ok(status) = service.query_status() {
         if status.current_state != ServiceState::Stopped {
-            let _ = service.stop();
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(500));
-                if let Ok(s) = service.query_status() {
-                    if s.current_state == ServiceState::Stopped {
-                        break;
-                    }
+            if let Err(e) = service.stop() {
+                eprintln!("WARN: could not stop {SERVICE_NAME} before removing it: {e}");
+            }
+            if let Some(s) = wait_for(&service, ServiceState::Stopped, 10) {
+                if s != ServiceState::Stopped {
+                    eprintln!("WARN: {SERVICE_NAME} still {} after 10s", state_word(s));
                 }
             }
         }
     }
 
-    service.delete()?;
-    println!("service removed: {SERVICE_NAME}");
+    service.delete().map_err(|e| open_failure("uninstall", e))?;
+    drop(service);
+
+    // Report what SCM now says, not that the delete call returned.
+    if service_exists(&service_manager) {
+        println!(
+            "{SERVICE_NAME} marked for deletion; SCM removes it once the process exits \
+             (or at the next reboot). `m3-embed-server status` shows when it is gone."
+        );
+    } else {
+        println!("service removed: {SERVICE_NAME}");
+    }
     println!(
         "config file left in place: {} (delete manually if desired)",
         config::default_config_path().display()
@@ -446,6 +465,62 @@ const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
 // ask for a right you lack, which is what makes the check-before-escalate order
 // mandatory here and merely tidy elsewhere. (Audited across all three OSes,
 // 2026-07-27.)
+
+/// ERROR_SERVICE_DOES_NOT_EXIST.
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+/// ERROR_ACCESS_DENIED.
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// One message per CONDITION for a failed privileged `open_service`. These
+/// used to share one "requires Administrator rights" text, which told an
+/// operator to elevate for a service that simply was not installed.
+fn open_failure(verb: &str, e: windows_service::Error) -> Box<dyn std::error::Error> {
+    let code = match &e {
+        windows_service::Error::Winapi(io) => io.raw_os_error(),
+        _ => None,
+    };
+    Box::<dyn std::error::Error>::from(match code {
+        Some(ERROR_SERVICE_DOES_NOT_EXIST) => format!(
+            "service not installed: {SERVICE_NAME} — run `m3-embed-server install` first"
+        ),
+        Some(ERROR_ACCESS_DENIED) => format!(
+            "cannot {verb} the service: access denied. Changing a Windows Service needs \
+             Administrator rights; open an *Administrator* terminal and run: \
+             m3-embed-server {verb}"
+        ),
+        Some(c) => format!("cannot {verb} the service: Windows error {c} ({e})"),
+        None => format!("cannot {verb} the service: {e}"),
+    })
+}
+
+/// The service's current state as `status` words it, or None if unreadable.
+fn state_word(state: ServiceState) -> &'static str {
+    match state {
+        ServiceState::Stopped => "stopped",
+        ServiceState::StartPending => "start-pending",
+        ServiceState::StopPending => "stop-pending",
+        ServiceState::Running => "running",
+        ServiceState::ContinuePending => "continue-pending",
+        ServiceState::PausePending => "pause-pending",
+        ServiceState::Paused => "paused",
+    }
+}
+
+/// Poll until the service reaches `want` or `secs` pass; returns the last
+/// observed state. A start or stop REQUEST is not its outcome.
+fn wait_for(service: &windows_service::service::Service, want: ServiceState, secs: u64)
+    -> Option<ServiceState>
+{
+    let mut last = None;
+    for _ in 0..(secs * 4) {
+        last = service.query_status().ok().map(|s| s.current_state);
+        if last == Some(want) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    last
+}
 
 /// True when the service is registered at all. QUERY_STATUS only, so it works
 /// unelevated — unlike an open that asks for DELETE.
@@ -488,25 +563,36 @@ pub fn start() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = service_manager
         .open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
-        .map_err(|e| {
-            Box::<dyn std::error::Error>::from(format!(
-                "cannot start the service: {e}\n  \
-                 Starting a Windows Service requires Administrator rights.\n  \
-                 Open an *Administrator* terminal and run: m3-embed-server start\n  \
-                 (It is not already running — `m3-embed-server status` shows the \
-                 current state.)"
-            ))
-        })?;
+        .map_err(|e| open_failure("start", e))?;
 
     // Belt-and-braces: it could have started between the check and here.
     match service.start::<&str>(&[]) {
-        Ok(()) => println!("start signal sent to {SERVICE_NAME}"),
+        Ok(()) => {}
         Err(windows_service::Error::Winapi(e))
             if e.raw_os_error() == Some(ERROR_SERVICE_ALREADY_RUNNING) =>
         {
             println!("{SERVICE_NAME} is already running (nothing to do)");
+            return Ok(());
         }
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(open_failure("start", e)),
+    }
+
+    // Report what the service DID, not that a request was sent: SCM accepts
+    // the request before the model loads, so a bad GGUF still "started".
+    match wait_for(&service, ServiceState::Running, 10) {
+        Some(ServiceState::Running) => println!("{SERVICE_NAME}: running"),
+        Some(ServiceState::Stopped) => {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "{SERVICE_NAME} started and then stopped. The reason is in the service \
+                 log: {}",
+                config::default_log_path().display()
+            )))
+        }
+        Some(other) => println!(
+            "{SERVICE_NAME}: {} (still loading; `m3-embed-server status` shows when it is running)",
+            state_word(other)
+        ),
+        None => println!("{SERVICE_NAME}: start requested; state could not be read"),
     }
     Ok(())
 }
@@ -524,24 +610,30 @@ pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = service_manager
         .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
-        .map_err(|e| {
-            Box::<dyn std::error::Error>::from(format!(
-                "cannot stop the service: {e}\n  \
-                 Stopping a Windows Service requires Administrator rights.\n  \
-                 Open an *Administrator* terminal and run: m3-embed-server stop\n  \
-                 (It is not already stopped — `m3-embed-server status` shows the \
-                 current state.)"
-            ))
-        })?;
+        .map_err(|e| open_failure("stop", e))?;
 
     match service.stop() {
-        Ok(_) => println!("stop signal sent to {SERVICE_NAME}"),
+        Ok(_) => {}
         Err(windows_service::Error::Winapi(e))
             if e.raw_os_error() == Some(ERROR_SERVICE_NOT_ACTIVE) =>
         {
             println!("{SERVICE_NAME} is already stopped (nothing to do)");
+            return Ok(());
         }
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(open_failure("stop", e)),
+    }
+
+    // The server drains in-flight requests before exiting; report the outcome.
+    match wait_for(&service, ServiceState::Stopped, 20) {
+        Some(ServiceState::Stopped) => println!("{SERVICE_NAME}: stopped"),
+        Some(other) => {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "{SERVICE_NAME} did not stop within 20s (state: {}); see {}",
+                state_word(other),
+                config::default_log_path().display()
+            )))
+        }
+        None => println!("{SERVICE_NAME}: stop requested; state could not be read"),
     }
     Ok(())
 }
@@ -552,23 +644,16 @@ pub fn status() -> Result<(), Box<dyn std::error::Error>> {
     let service = match service_manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         Ok(s) => s,
         Err(windows_service::Error::Winapi(e))
-            if e.raw_os_error() == Some(1060) =>
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) =>
         {
             println!("not installed");
             return Ok(());
         }
-        Err(e) => return Err(Box::new(e)),
+        Err(e) => return Err(open_failure("query", e)),
     };
-    let st = service.query_status()?;
-    let label = match st.current_state {
-        ServiceState::Stopped => "stopped",
-        ServiceState::StartPending => "start-pending",
-        ServiceState::StopPending => "stop-pending",
-        ServiceState::Running => "running",
-        ServiceState::ContinuePending => "continue-pending",
-        ServiceState::PausePending => "pause-pending",
-        ServiceState::Paused => "paused",
-    };
-    println!("{label}");
+    let st = service
+        .query_status()
+        .map_err(|e| open_failure("query", e))?;
+    println!("{}", state_word(st.current_state));
     Ok(())
 }

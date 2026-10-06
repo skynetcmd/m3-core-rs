@@ -750,7 +750,7 @@ pub mod embedded {
     /// thread — that is what makes a `!Send` context safe to "pool".
     #[allow(clippy::too_many_arguments)]
     fn worker_loop(
-        _id: usize,
+        id: usize,
         backend: &'static LlamaBackend,
         model: Arc<LlamaModel>,
         rx: Receiver<Job>,
@@ -784,8 +784,13 @@ pub mod embedded {
         let mut ctx = match model.new_context(backend, ctx_params) {
             Ok(c) => c,
             Err(e) => {
+                // The usual cause is the KV cache not fitting: every worker
+                // allocates its own n_ctx-sized context, so name the knobs.
                 let _ = ready_tx.send(Err(M3Error::Backend(format!(
-                    "llama context create failed: {e}"
+                    "llama context create failed for worker {id} \
+                     (n_ctx={n_ctx}, seq_max={seq_max}, n_batch={n_batch}, \
+                     n_ubatch={n_ubatch}): {e}. If memory ran out, lower \
+                     M3_EMBED_STREAMS or M3_EMBED_CTX"
                 ))));
                 return;
             }

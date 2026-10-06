@@ -961,7 +961,10 @@ fn platform_from_str(p: &str) -> PyResult<m3_ner_ort::Platform> {
         "macos_apple_silicon" => m3_ner_ort::Platform::MacOsAppleSilicon,
         "cpu_only" => m3_ner_ort::Platform::CpuOnly,
         other => {
-            return Err(PyValueError::new_err(format!("unknown platform: {other}")));
+            return Err(PyValueError::new_err(format!(
+                "unknown platform: {other:?}; expected one of linux_nvidia, linux_amd, \
+                 linux_intel_gpu, windows, macos_apple_silicon, cpu_only"
+            )));
         }
     })
 }

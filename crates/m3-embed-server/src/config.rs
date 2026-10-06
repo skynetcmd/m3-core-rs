@@ -132,8 +132,10 @@ pub fn load_file_config(path: &Path) -> anyhow::Result<FileConfig> {
     if !path.exists() {
         return Ok(FileConfig::default());
     }
-    let raw = std::fs::read_to_string(path)?;
-    let cfg: FileConfig = toml::from_str(&raw)?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("cannot read config file {}: {e}", path.display()))?;
+    let cfg: FileConfig = toml::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("cannot parse config file {}: {e}", path.display()))?;
     Ok(cfg)
 }
 
@@ -141,8 +143,17 @@ fn env_str(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
+/// A set but unparseable value is NOT the same as an unset one: say so, then
+/// fall back, so a typo (`M3_EMBED_STREAMS=2x`) is not silently the default.
 fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
-    env_str(key).and_then(|v| v.parse().ok())
+    let raw = env_str(key)?;
+    match raw.parse() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            log::warn!("ignoring {key}={raw:?}: not a valid value; using the configured or default value");
+            None
+        }
+    }
 }
 
 /// Default worker-context count, chosen by the COMPILED backend.
@@ -193,17 +204,20 @@ const fn default_streams() -> usize {
 /// Resolve config with priority: env var > file value > default.
 /// Returns an error only if `gguf` is unresolved (it has no default).
 pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
-    let gguf = env_str("M3_EMBED_GGUF")
-        .or_else(|| file.embed.gguf.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "M3_EMBED_GGUF is unset and config.toml has no [embed].gguf — \
-                 set the env var or run `m3-embed-server install` with the env set."
-            )
-        })?;
+    let (gguf, source) = match env_str("M3_EMBED_GGUF") {
+        Some(g) => (g, "M3_EMBED_GGUF".to_string()),
+        None => match file.embed.gguf.clone() {
+            Some(g) => (g, format!("[embed].gguf in {}", default_config_path().display())),
+            None => anyhow::bail!(
+                "M3_EMBED_GGUF is unset and {} has no [embed].gguf — set the env \
+                 var, or run `m3-embed-server install` with it set",
+                default_config_path().display()
+            ),
+        },
+    };
 
     if !Path::new(&gguf).exists() {
-        anyhow::bail!("GGUF path does not exist: {gguf}");
+        anyhow::bail!("GGUF path does not exist: {gguf} (from {source})");
     }
 
     Ok(ResolvedConfig {

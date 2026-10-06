@@ -109,7 +109,8 @@ fn run_foreground() -> anyhow::Result<()> {
 
     // Foreground reads env first, but will still pick up a config.toml if
     // present (handy for testing the service config without installing).
-    let file_cfg = config::load_file_config(&config::default_config_path()).unwrap_or_default();
+    // A missing file is the empty default; a broken one is an error, not that.
+    let file_cfg = config::load_file_config(&config::default_config_path())?;
     let cfg = config::resolve(&file_cfg)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -186,6 +187,25 @@ async fn shutdown_signal() {
     }
 }
 
+/// Render an error with its whole `source()` chain. `windows-service` displays
+/// every Win32 failure as "IO error in winapi call" and keeps the OS error code
+/// in the source, so printing the top error alone drops the one fact that
+/// tells access-denied from not-installed.
+#[cfg(all(windows, feature = "embedded"))]
+fn with_causes(e: Box<dyn std::error::Error>) -> anyhow::Error {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        let s_txt = s.to_string();
+        if !msg.contains(&s_txt) {
+            msg.push_str(": ");
+            msg.push_str(&s_txt);
+        }
+        src = s.source();
+    }
+    anyhow::anyhow!(msg)
+}
+
 // ---------------------------------------------------------------------------
 // Subcommand routing — Windows-specific paths gated, others print a friendly
 // "Windows-only" error.
@@ -193,32 +213,32 @@ async fn shutdown_signal() {
 
 #[cfg(all(windows, feature = "embedded"))]
 fn run_as_service() -> anyhow::Result<()> {
-    service::run_dispatcher().map_err(|e| anyhow::anyhow!("{e}"))
+    service::run_dispatcher().map_err(with_causes)
 }
 
 #[cfg(all(windows, feature = "embedded"))]
 fn run_install() -> anyhow::Result<()> {
-    service::install().map_err(|e| anyhow::anyhow!("{e}"))
+    service::install().map_err(with_causes)
 }
 
 #[cfg(all(windows, feature = "embedded"))]
 fn run_uninstall() -> anyhow::Result<()> {
-    service::uninstall().map_err(|e| anyhow::anyhow!("{e}"))
+    service::uninstall().map_err(with_causes)
 }
 
 #[cfg(all(windows, feature = "embedded"))]
 fn run_start() -> anyhow::Result<()> {
-    service::start().map_err(|e| anyhow::anyhow!("{e}"))
+    service::start().map_err(with_causes)
 }
 
 #[cfg(all(windows, feature = "embedded"))]
 fn run_stop() -> anyhow::Result<()> {
-    service::stop().map_err(|e| anyhow::anyhow!("{e}"))
+    service::stop().map_err(with_causes)
 }
 
 #[cfg(all(windows, feature = "embedded"))]
 fn run_status() -> anyhow::Result<()> {
-    service::status().map_err(|e| anyhow::anyhow!("{e}"))
+    service::status().map_err(with_causes)
 }
 
 // On Unix the OS service manager (launchd / systemd) runs the binary in
@@ -234,21 +254,21 @@ fn run_as_service() -> anyhow::Result<()> {
 
 #[cfg(all(not(windows), feature = "embedded"))]
 fn run_install() -> anyhow::Result<()> {
-    service_unix::install().map_err(|e| anyhow::anyhow!("{e}"))
+    service_unix::install().map_err(anyhow::Error::msg)
 }
 #[cfg(all(not(windows), feature = "embedded"))]
 fn run_uninstall() -> anyhow::Result<()> {
-    service_unix::uninstall().map_err(|e| anyhow::anyhow!("{e}"))
+    service_unix::uninstall().map_err(anyhow::Error::msg)
 }
 #[cfg(all(not(windows), feature = "embedded"))]
 fn run_start() -> anyhow::Result<()> {
-    service_unix::start().map_err(|e| anyhow::anyhow!("{e}"))
+    service_unix::start().map_err(anyhow::Error::msg)
 }
 #[cfg(all(not(windows), feature = "embedded"))]
 fn run_stop() -> anyhow::Result<()> {
-    service_unix::stop().map_err(|e| anyhow::anyhow!("{e}"))
+    service_unix::stop().map_err(anyhow::Error::msg)
 }
 #[cfg(all(not(windows), feature = "embedded"))]
 fn run_status() -> anyhow::Result<()> {
-    service_unix::status().map_err(|e| anyhow::anyhow!("{e}"))
+    service_unix::status().map_err(anyhow::Error::msg)
 }

@@ -38,6 +38,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -382,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
     # Build + stage the shared-embedder binary FIRST (fails loud if it can't
     # build), then build the wheel with the binary present in python-source so
     # maturin bundles it. Both happen under the patched package name.
+    started = time.time()
     with _patched_name(name), _staged_embed_server(features, args.release):
         proc = subprocess.run(cmd, cwd=_HERE, env=os.environ.copy())
     if proc.returncode != 0:
@@ -398,15 +400,22 @@ def main(argv: list[str] | None = None) -> int:
     #
     # That is the failure this check exists to prevent: a quieter log is not a
     # fixed problem. Assert against the wheel's actual member list.
-    wheels = sorted(pathlib.Path(out_dir).glob("*.whl"),
-                    key=lambda p: p.stat().st_mtime)
-    if wheels:
-        with zipfile.ZipFile(wheels[-1]) as z:
+    # Every wheel THIS run wrote: build_local hands all interpreters to one
+    # maturin call, and post-processing only the newest left the others with
+    # the builder's paths in their SBOM (caught by verify_wheels.py, 3.10.6).
+    wheels = sorted(w for w in pathlib.Path(out_dir).glob("*.whl")
+                    if w.stat().st_mtime >= started - 1)
+    if not wheels:
+        print(f"[build_wheel] error: maturin exited 0 but wrote no wheel to "
+              f"{out_dir}", file=sys.stderr)
+        return 1
+    for wheel in wheels:
+        with zipfile.ZipFile(wheel) as z:
             members = set(z.namelist())
         exe_member = f"m3_core_rs/{_EMBED_SERVER_BIN}" + (
             ".exe" if sys.platform.startswith("win") else "")
         if exe_member not in members:
-            print(f"[build_wheel] error: {wheels[-1].name} does not contain "
+            print(f"[build_wheel] error: {wheel.name} does not contain "
                   f"{exe_member}", file=sys.stderr)
             return 1
         # Ensure the binary is stored executable. Current maturin (1.13/1.15)
@@ -417,17 +426,17 @@ def main(argv: list[str] | None = None) -> int:
         # stores faithfully (verified on pip 25.1.1/25.2/26.0/26.2), so getting
         # this right here is what makes a downstream workaround unnecessary.
         # verify_wheels.py asserts the result, so a regression fails the build.
-        if _set_exec_bit(wheels[-1]):
+        if _set_exec_bit(wheel):
             print(f"[build_wheel] set the exec bit on {exe_member} "
                   f"(maturin stored it non-executable)")
         # Scrub the builder's absolute paths out of maturin's SBOM. Done here so
         # a locally-built wheel cannot reach a public release still carrying the
         # builder's username — the manual step it replaces was missed once, in
         # v2026.9.20. No-op for CI wheels, whose paths are already generic.
-        scrubbed = sanitize_sbom.sanitize_wheel(wheels[-1])
+        scrubbed = sanitize_sbom.sanitize_wheel(wheel)
         if scrubbed:
             print(f"[build_wheel] scrubbed {scrubbed} local path ref(s) from "
-                  f"the SBOM in {wheels[-1].name}")
+                  f"the SBOM in {wheel.name}")
         if sys.platform.startswith("win"):
             pdbs = [m for m in members if m.endswith(".pdb")]
             if pdbs:

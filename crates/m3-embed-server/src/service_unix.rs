@@ -192,7 +192,15 @@ pub mod macos {
                 Ok(())
             }
             Err(_) => {
-                println!("not installed");
+                // Not loaded is not the same as not installed: `launchctl unload`
+                // (what `m3 stop` does) leaves the plist in place, and `install`
+                // over it is then a re-registration, not a first install. The
+                // plist on disk is the registration.
+                if plist_path().map(|p| p.exists()).unwrap_or(false) {
+                    println!("stopped");
+                } else {
+                    println!("not installed");
+                }
                 Ok(())
             }
         }

@@ -407,10 +407,17 @@ pub mod linux {
         std::fs::write(&unit, body)
             .map_err(|e| format!("cannot write unit {}: {e}", unit.display()))?;
 
-        let answered_before = observed_state() != "running" && serving_now();
+        let was_running = observed_state() == "running";
+        let answered_before = !was_running && serving_now();
         run_systemctl(&["daemon-reload"])?;
-        // `enable --now` registers it for auto-start AND starts it immediately.
+        // `enable --now` registers it for auto-start AND starts it immediately,
+        // but leaves a unit that is already running on its previous binary
+        // and environment. Re-registering is how a new core reaches it, so
+        // restart a running unit (macOS gets this from bootout + bootstrap).
         run_systemctl(&["enable", "--now", &unit_name()])?;
+        if was_running {
+            run_systemctl(&["restart", &unit_name()])?;
+        }
 
         println!("systemd --user unit installed: {}", unit_name());
         println!("unit:     {}", unit.display());

@@ -66,6 +66,63 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
     })
 }
 
+/// True when the service's `/health` answers ok. The server binds only after
+/// the model is loaded, so this is "serving", which a supervisor's "running"
+/// (the process exists) is not.
+fn health_ok(host: &str, port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    let Some(addr) = (host, port).to_socket_addrs().ok().and_then(|mut a| a.next()) else {
+        return false;
+    };
+    let timeout = std::time::Duration::from_secs(2);
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let req = format!("GET /health HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut body = String::new();
+    let _ = stream.read_to_string(&mut body);
+    body.contains("\"status\":\"ok\"")
+}
+
+/// After the supervisor reports the process running, wait for it to serve and
+/// say which it is. `answered_before` is whether the address already answered
+/// before this start: then a later ok may be another process, not this one.
+fn report_serving(label: &str, answered_before: bool, secs: u64, log_hint: &str) {
+    let (host, port) = config::service_addr();
+    if answered_before {
+        eprintln!(
+            "WARN: {host}:{port} was already answering before this start; another \
+             process may hold the port, so this service may not be the one serving"
+        );
+    }
+    for _ in 0..(secs * 2) {
+        if health_ok(&host, port) {
+            if answered_before {
+                println!("{label}: running; {host}:{port} answers, but it did before this start too");
+            } else {
+                println!("{label}: running, serving on {host}:{port}");
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    println!(
+        "{label}: running, not yet serving on {host}:{port} after {secs}s (still \
+         loading the model?); {log_hint}"
+    );
+}
+
+/// Whether the service's address answers right now.
+fn serving_now() -> bool {
+    let (host, port) = config::service_addr();
+    health_ok(&host, port)
+}
+
 // ===========================================================================
 // macOS — launchd user agent
 // ===========================================================================
@@ -140,6 +197,7 @@ pub mod macos {
         if is_loaded(&target)? {
             bootout_and_wait(&target)?;
         }
+        let answered_before = serving_now();
         run_launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
 
         println!("launchd agent installed: {LAUNCHD_LABEL}");
@@ -148,8 +206,11 @@ pub mod macos {
         println!("log file: {}", log_path.display());
         // RunAtLoad starts it now; report whether it actually came up.
         let state = wait_for("running", 10)?;
-        println!("state:    {state}");
-        if state != "running" {
+        if state == "running" {
+            let hint = format!("see {}", log_path.display());
+            report_serving(LAUNCHD_LABEL, answered_before, 30, &hint);
+        } else {
+            println!("state:    {state}");
             eprintln!("WARN: the agent did not reach running within 10s; see {}", log_path.display());
         }
         Ok(())
@@ -191,6 +252,7 @@ pub mod macos {
             ));
         }
         let target = service_target()?;
+        let answered_before = observed_state()? != "running" && serving_now();
         // `stop` unloads the agent, and kickstart cannot reach an unloaded
         // label; load it first (RunAtLoad then starts it).
         if !is_loaded(&target)? {
@@ -199,7 +261,8 @@ pub mod macos {
         run_launchctl(&["kickstart", &target])?;
         let state = wait_for("running", 10)?;
         if state == "running" {
-            println!("{LAUNCHD_LABEL}: running");
+            let hint = format!("see {}", config::default_log_path().display());
+            report_serving(LAUNCHD_LABEL, answered_before, 30, &hint);
             Ok(())
         } else {
             Err(format!(
@@ -344,6 +407,7 @@ pub mod linux {
         std::fs::write(&unit, body)
             .map_err(|e| format!("cannot write unit {}: {e}", unit.display()))?;
 
+        let answered_before = observed_state() != "running" && serving_now();
         run_systemctl(&["daemon-reload"])?;
         // `enable --now` registers it for auto-start AND starts it immediately.
         run_systemctl(&["enable", "--now", &unit_name()])?;
@@ -354,8 +418,10 @@ pub mod linux {
         println!("log:      journalctl --user -u {SERVICE_NAME}");
         // `enable --now` returns once the start is queued; report the outcome.
         let state = wait_for("running", 10);
-        println!("state:    {state}");
-        if state != "running" {
+        if state == "running" {
+            report_serving(SERVICE_NAME, answered_before, 30, &journal_hint());
+        } else {
+            println!("state:    {state}");
             eprintln!("WARN: the unit did not reach running within 10s; {}", journal_hint());
         }
         if linger_enabled() {
@@ -411,12 +477,13 @@ pub mod linux {
     }
 
     pub fn start() -> Result<(), String> {
+        let answered_before = observed_state() != "running" && serving_now();
         run_systemctl(&["start", &unit_name()])?;
         // `start` returns once the main process is forked (Type=simple), so a
         // bad GGUF or a busy port still exits 0. Report the outcome.
         let state = wait_for("running", 10);
         if state == "running" {
-            println!("{SERVICE_NAME}: running");
+            report_serving(SERVICE_NAME, answered_before, 30, &journal_hint());
             Ok(())
         } else {
             Err(format!(

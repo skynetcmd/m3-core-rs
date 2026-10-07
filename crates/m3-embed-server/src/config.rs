@@ -27,6 +27,21 @@ pub struct FileConfig {
     pub embed: EmbedSection,
 }
 
+pub const DEFAULT_PORT: u16 = 8082;
+pub const DEFAULT_HOST: &str = "127.0.0.1";
+
+/// Where the SUPERVISED service listens. launchd/systemd start it with only
+/// `M3_EMBED_GGUF` in its environment, so it binds from config.toml or the
+/// defaults; the calling shell's `M3_EMBED_SERVER_*` are not the service's.
+#[cfg(not(windows))]
+pub fn service_addr() -> (String, u16) {
+    let file = load_file_config(&default_config_path()).unwrap_or_default();
+    let host = file.embed.host.unwrap_or_else(|| DEFAULT_HOST.into());
+    // A wildcard bind is reached on loopback.
+    let host = if host == "0.0.0.0" { DEFAULT_HOST.into() } else { host };
+    (host, file.embed.port.unwrap_or(DEFAULT_PORT))
+}
+
 /// Fully-resolved runtime config (after env/toml/default merge).
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -224,10 +239,10 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
         gguf,
         port: env_parse("M3_EMBED_SERVER_PORT")
             .or(file.embed.port)
-            .unwrap_or(8082),
+            .unwrap_or(DEFAULT_PORT),
         host: env_str("M3_EMBED_SERVER_HOST")
             .or_else(|| file.embed.host.clone())
-            .unwrap_or_else(|| "127.0.0.1".into()),
+            .unwrap_or_else(|| DEFAULT_HOST.into()),
         streams: env_parse("M3_EMBED_STREAMS")
             .or(file.embed.streams)
             .unwrap_or_else(default_streams),

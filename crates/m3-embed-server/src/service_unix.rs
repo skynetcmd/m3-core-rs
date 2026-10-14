@@ -66,48 +66,93 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
     })
 }
 
-/// True when the service's `/health` answers ok. The server binds only after
-/// the model is loaded, so this is "serving", which a supervisor's "running"
-/// (the process exists) is not.
-fn health_ok(host: &str, port: u16) -> bool {
+/// What `/health` said. `None`: it did not answer ok. `Some(Some(pid))`: it
+/// answered ok and named its process (3.10.14+). `Some(None)`: an older server
+/// that answers ok without a pid. `/health` answers only once the model is
+/// loaded, so this is "serving", which a supervisor's "running" (the process
+/// exists) is not.
+fn health(host: &str, port: u16) -> Option<Option<u32>> {
     use std::io::{Read, Write};
     use std::net::ToSocketAddrs;
-    let Some(addr) = (host, port).to_socket_addrs().ok().and_then(|mut a| a.next()) else {
-        return false;
-    };
+    let addr = (host, port).to_socket_addrs().ok().and_then(|mut a| a.next())?;
     let timeout = std::time::Duration::from_secs(2);
-    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else {
-        return false;
-    };
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
     let _ = stream.set_read_timeout(Some(timeout));
     let req = format!("GET /health HTTP/1.0\r\nHost: {host}\r\n\r\n");
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    parse_health(&response)
+}
+
+/// The body half of [`health`], split out so it is testable without a socket.
+fn parse_health(response: &str) -> Option<Option<u32>> {
+    if !response.contains("\"status\":\"ok\"") {
+        return None;
     }
-    let mut body = String::new();
-    let _ = stream.read_to_string(&mut body);
-    body.contains("\"status\":\"ok\"")
+    let body = response.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(response);
+    let pid = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        .and_then(|p| u32::try_from(p).ok());
+    Some(pid)
+}
+
+/// Whose server answered, given `/health`'s pid and the supervisor's main pid.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    /// The service manager's own process answered.
+    Ours,
+    /// Another process answered (`pid`), not the one the service manager runs.
+    Foreign(u32),
+    /// Cannot tell: an older server without a pid, or no main pid to compare.
+    Unknown,
+}
+
+fn whose(health_pid: Option<u32>, main_pid: Option<u32>) -> Answer {
+    match (health_pid, main_pid) {
+        (Some(h), Some(m)) if h == m => Answer::Ours,
+        (Some(h), _) => Answer::Foreign(h),
+        (None, _) => Answer::Unknown,
+    }
+}
+
+fn foreign_message(label: &str, host: &str, port: u16, pid: u32) -> String {
+    format!(
+        "{label}: {host}:{port} is answered by another process (pid {pid}), not this \
+         service, which cannot use the port while it is taken. On a shared computer \
+         this is often another account's m3. Choose a free port: \
+         m3 config set embed.server.port <port>"
+    )
 }
 
 /// After the supervisor reports the process running, wait for it to serve and
 /// say which it is. `answered_before` is whether the address already answered
-/// before this start: then a later ok may be another process, not this one.
-fn report_serving(label: &str, answered_before: bool, secs: u64, log_hint: &str) {
+/// before this start: then an ok from a server without a pid may be another
+/// process. `main_pid` asks the supervisor which process it runs now.
+fn report_serving(
+    label: &str,
+    answered_before: bool,
+    secs: u64,
+    log_hint: &str,
+    main_pid: &dyn Fn() -> Option<u32>,
+) -> Result<(), String> {
     let (host, port) = config::service_addr();
-    if answered_before {
-        eprintln!(
-            "WARN: {host}:{port} was already answering before this start; another \
-             process may hold the port, so this service may not be the one serving"
-        );
-    }
     for _ in 0..(secs * 2) {
-        if health_ok(&host, port) {
-            if answered_before {
-                println!("{label}: running; {host}:{port} answers, but it did before this start too");
-            } else {
-                println!("{label}: running, serving on {host}:{port}");
+        if let Some(pid) = health(&host, port) {
+            match whose(pid, main_pid()) {
+                Answer::Ours => println!("{label}: running, serving on {host}:{port}"),
+                Answer::Foreign(other) => return Err(foreign_message(label, &host, port, other)),
+                Answer::Unknown if answered_before => {
+                    eprintln!(
+                        "WARN: {host}:{port} was already answering before this start; another \
+                         process may hold the port, so this service may not be the one serving"
+                    );
+                    println!("{label}: running; {host}:{port} answers, but it did before this start too");
+                }
+                Answer::Unknown => println!("{label}: running, serving on {host}:{port}"),
             }
-            return;
+            return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
@@ -115,12 +160,59 @@ fn report_serving(label: &str, answered_before: bool, secs: u64, log_hint: &str)
         "{label}: running, not yet serving on {host}:{port} after {secs}s (still \
          loading the model?); {log_hint}"
     );
+    Ok(())
+}
+
+/// For `status`: a note when the port answers from a process other than the
+/// service's own. stdout stays the one state word m3 parses.
+fn note_foreign_answer(label: &str, main_pid: Option<u32>) {
+    let (host, port) = config::service_addr();
+    if let Some(Some(pid)) = health(&host, port) {
+        if let Answer::Foreign(other) = whose(Some(pid), main_pid) {
+            eprintln!("{}", foreign_message(label, &host, port, other));
+        }
+    }
 }
 
 /// Whether the service's address answers right now.
 fn serving_now() -> bool {
     let (host, port) = config::service_addr();
-    health_ok(&host, port)
+    health(&host, port).is_some()
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    const OK_WITH_PID: &str =
+        "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\n\r\n{\"status\":\"ok\",\"model\":\"bge-m3.gguf\",\"pid\":4242}";
+
+    #[test]
+    fn a_new_server_names_its_pid() {
+        assert_eq!(parse_health(OK_WITH_PID), Some(Some(4242)));
+    }
+
+    #[test]
+    fn an_older_server_answers_without_a_pid() {
+        let r = "HTTP/1.0 200 OK\r\n\r\n{\"status\":\"ok\",\"model\":\"bge-m3.gguf\"}";
+        assert_eq!(parse_health(r), Some(None));
+    }
+
+    #[test]
+    fn a_loading_or_wrong_server_is_not_ok() {
+        assert_eq!(parse_health("HTTP/1.0 503\r\n\r\n{\"status\":\"loading model\"}"), None);
+        assert_eq!(parse_health(""), None);
+    }
+
+    #[test]
+    fn the_answer_is_ours_only_when_the_pids_match() {
+        assert_eq!(whose(Some(7), Some(7)), Answer::Ours);
+        assert_eq!(whose(Some(7), Some(8)), Answer::Foreign(7));
+        // Our process is gone (it exited because the port was taken) and
+        // something still answers: that is another process.
+        assert_eq!(whose(Some(7), None), Answer::Foreign(7));
+        assert_eq!(whose(None, Some(7)), Answer::Unknown);
+    }
 }
 
 // ===========================================================================
@@ -208,7 +300,10 @@ pub mod macos {
         let state = wait_for("running", 10)?;
         if state == "running" {
             let hint = format!("see {}", log_path.display());
-            report_serving(LAUNCHD_LABEL, answered_before, 30, &hint);
+            // Registered either way; a taken port is reported, not fatal here.
+            if let Err(e) = report_serving(LAUNCHD_LABEL, answered_before, 30, &hint, &main_pid) {
+                eprintln!("WARN: {e}");
+            }
         } else {
             println!("state:    {state}");
             eprintln!("WARN: the agent did not reach running within 10s; see {}", log_path.display());
@@ -262,8 +357,7 @@ pub mod macos {
         let state = wait_for("running", 10)?;
         if state == "running" {
             let hint = format!("see {}", config::default_log_path().display());
-            report_serving(LAUNCHD_LABEL, answered_before, 30, &hint);
-            Ok(())
+            report_serving(LAUNCHD_LABEL, answered_before, 30, &hint, &main_pid)
         } else {
             Err(format!(
                 "{LAUNCHD_LABEL} did not reach running within 10s (state: {state}); see {}",
@@ -302,8 +396,24 @@ pub mod macos {
     }
 
     pub fn status() -> Result<(), String> {
-        println!("{}", observed_state()?);
+        let state = observed_state()?;
+        println!("{state}");
+        if state == "running" {
+            note_foreign_answer(LAUNCHD_LABEL, main_pid());
+        }
         Ok(())
+    }
+
+    /// The agent's process id, from `launchctl print` (`pid = N`); `None` when
+    /// it has no running process or launchd cannot be asked.
+    fn main_pid() -> Option<u32> {
+        let out = launchctl_raw(&["print", &service_target().ok()?]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pid = ")?.trim().parse().ok())
     }
 
     /// Whether launchd has the label loaded. `print` exits non-zero for an
@@ -426,7 +536,10 @@ pub mod linux {
         // `enable --now` returns once the start is queued; report the outcome.
         let state = wait_for("running", 10);
         if state == "running" {
-            report_serving(SERVICE_NAME, answered_before, 30, &journal_hint());
+            // Registered either way; a taken port is reported, not fatal here.
+            if let Err(e) = report_serving(SERVICE_NAME, answered_before, 30, &journal_hint(), &main_pid) {
+                eprintln!("WARN: {e}");
+            }
         } else {
             println!("state:    {state}");
             eprintln!("WARN: the unit did not reach running within 10s; {}", journal_hint());
@@ -490,8 +603,7 @@ pub mod linux {
         // bad GGUF or a busy port still exits 0. Report the outcome.
         let state = wait_for("running", 10);
         if state == "running" {
-            report_serving(SERVICE_NAME, answered_before, 30, &journal_hint());
-            Ok(())
+            report_serving(SERVICE_NAME, answered_before, 30, &journal_hint(), &main_pid)
         } else {
             Err(format!(
                 "{SERVICE_NAME} did not reach running within 10s (state: {state}); {}",
@@ -512,8 +624,19 @@ pub mod linux {
     }
 
     pub fn status() -> Result<(), String> {
-        println!("{}", observed_state_noted(true));
+        let state = observed_state_noted(true);
+        println!("{state}");
+        if state == "running" {
+            note_foreign_answer(SERVICE_NAME, main_pid());
+        }
         Ok(())
+    }
+
+    /// The unit's main process id; `None` when it has none (systemd reports 0)
+    /// or systemd cannot be asked.
+    fn main_pid() -> Option<u32> {
+        let out = systemctl_output(&["show", "-p", "MainPID", "--value", &unit_name()]).ok()?;
+        out.trim().parse::<u32>().ok().filter(|&p| p != 0)
     }
 
     fn observed_state() -> String {

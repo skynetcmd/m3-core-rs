@@ -117,9 +117,16 @@ fn run_foreground() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         server::run(cfg, shutdown_signal()).await
-    })
+    });
+    if let Err(e) = &result {
+        if e.downcast_ref::<server::PortInUse>().is_some() {
+            log::error!("{e}");
+            std::process::exit(server::EXIT_PORT_IN_USE);
+        }
+    }
+    result
 }
 
 /// Future that resolves on the first stop signal. Ctrl-C everywhere; on Unix

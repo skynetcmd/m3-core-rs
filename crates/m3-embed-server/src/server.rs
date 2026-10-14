@@ -66,6 +66,33 @@ struct EmbedResponse {
     model: String,
 }
 
+/// Exit status when the listen address is already taken (EX_UNAVAILABLE).
+/// Distinct from the generic 1 so a supervisor can stop retrying: a restart
+/// cannot free a port another process holds. The systemd unit names it in
+/// `RestartPreventExitStatus=`.
+pub const EXIT_PORT_IN_USE: i32 = 69;
+
+/// The listen address is held by another process (often another account's
+/// m3 on a shared machine).
+#[derive(Debug)]
+pub struct PortInUse {
+    pub addr: SocketAddr,
+}
+
+impl std::fmt::Display for PortInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot listen on {}: another program is already using this port \
+             (on a shared computer, often another account's m3). Choose a free \
+             port with `m3 config set embed.server.port <port>`",
+            self.addr
+        )
+    }
+}
+
+impl std::error::Error for PortInUse {}
+
 struct AppState {
     dispatcher: Arc<Dispatcher<EmbeddedBackend>>,
     model_label: String,
@@ -143,6 +170,22 @@ where
         cfg.streams,
     );
 
+    // Bind BEFORE loading the model. Loading first meant a taken port cost a
+    // full model load (417 MB for bge-m3) on every failed start, and the
+    // supervisor's restart loop repeated it every few seconds. A connection
+    // that arrives during the load waits in the listen backlog until serving.
+    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse().map_err(|e| {
+        anyhow::anyhow!("invalid listen address {}:{} (M3_EMBED_SERVER_HOST / _PORT): {e}",
+                        cfg.host, cfg.port)
+    })?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(anyhow::Error::new(PortInUse { addr }));
+        }
+        Err(e) => return Err(anyhow::anyhow!("cannot listen on {addr}: {e}")),
+    };
+
     let backend = EmbeddedBackend::with_streams_ctx_seqmax_batch(
         cfg.gguf.clone(),
         cfg.streams,
@@ -183,13 +226,6 @@ where
         .route("/metrics", get(metrics_handler))
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse().map_err(|e| {
-        anyhow::anyhow!("invalid listen address {}:{} (M3_EMBED_SERVER_HOST / _PORT): {e}",
-                        cfg.host, cfg.port)
-    })?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot listen on {addr}: {e}"))?;
     log::info!("listening on http://{addr}");
     on_ready();
 
@@ -311,10 +347,13 @@ async fn embed_handler(
 /// so a caller doing a naive string match keeps working. `model` is included so
 /// a probe can tell WHICH embedder answered without a second request -- an
 /// identity check that matters when several servers can bind this port.
+/// `pid` lets `start` confirm the answer came from the process the service
+/// manager started, not from another account's server on the same port.
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "model": state.model_label,
+        "pid": std::process::id(),
     }))
 }
 

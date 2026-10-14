@@ -165,6 +165,7 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     // Everything after StartPending can fail; whatever happens, publish
     // Stopped with the outcome, or SCM sits in start-pending until its timeout
     // and `status` reports that instead of the failure.
+    let port_in_use = std::cell::Cell::new(false);
     let run_result: Result<(), String> = (|| {
         // Resolve config from %PROGRAMDATA% file (env vars unlikely to be set
         // under SYSTEM, but `resolve` honors them when present).
@@ -204,15 +205,21 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             .block_on(crate::server::run_with_ready(cfg, async move {
                 let _ = tk_rx.await;
             }, on_ready))
-            .map_err(|e| e.to_string())
+            .map_err(|e| {
+                port_in_use.set(e.downcast_ref::<crate::server::PortInUse>().is_some());
+                e.to_string()
+            })
     })();
 
-    // Always publish Stopped. ERROR_SERVICE_SPECIFIC_ERROR (1066) + code 1 is
-    // how a service reports its own failure; `sc query` then shows it.
-    let exit_code = if run_result.is_ok() {
-        ServiceExitCode::Win32(0)
-    } else {
-        ServiceExitCode::ServiceSpecific(1)
+    // Always publish Stopped. ERROR_SERVICE_SPECIFIC_ERROR (1066) + a code is
+    // how a service reports its own failure; `sc query` then shows it. A taken
+    // port gets its own code, as on Unix.
+    let exit_code = match &run_result {
+        Ok(()) => ServiceExitCode::Win32(0),
+        Err(_) if port_in_use.get() => {
+            ServiceExitCode::ServiceSpecific(crate::server::EXIT_PORT_IN_USE as u32)
+        }
+        Err(_) => ServiceExitCode::ServiceSpecific(1),
     };
     if let Err(e) = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,

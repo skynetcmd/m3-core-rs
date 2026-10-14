@@ -81,11 +81,15 @@ pub fn render_unit(exe: &str, gguf: &str) -> String {
          Environment=\"M3_EMBED_GGUF={env_val}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         RestartPreventExitStatus={port_in_use}\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
         exe = exe,
         env_val = env_val,
+        // A taken port is not cured by a restart: without this the unit
+        // retried every 5 s for as long as another program held the port.
+        port_in_use = crate::server::EXIT_PORT_IN_USE,
     )
 }
 
@@ -128,6 +132,10 @@ mod tests {
         assert!(u.contains("ExecStart=/usr/local/bin/m3-embed-server"));
         assert!(u.contains("Environment=\"M3_EMBED_GGUF=/models/bge-m3.gguf\""));
         assert!(u.contains("Restart=on-failure"));
+        assert!(u.contains(&format!(
+            "RestartPreventExitStatus={}",
+            crate::server::EXIT_PORT_IN_USE
+        )));
         assert!(u.contains("[Install]"));
         assert!(u.contains("WantedBy=default.target"));
     }

@@ -701,6 +701,98 @@ fn decide_route(query: &str, signals: &PyRouteSignals) -> PyRouteDecision {
 }
 
 // ---------------------------------------------------------------------------
+// m3-vector: resident index
+// ---------------------------------------------------------------------------
+
+/// Resident int8 vector index (see `m3_vector::index`). Thread-safe: searches
+/// run concurrently without the GIL; an upsert or remove waits for them.
+#[pyclass(name = "VectorIndex", frozen)]
+struct PyVectorIndex {
+    inner: std::sync::RwLock<m3_vector::VectorIndex>,
+}
+
+impl PyVectorIndex {
+    fn read(&self) -> PyResult<std::sync::RwLockReadGuard<'_, m3_vector::VectorIndex>> {
+        self.inner.read().map_err(|_| PyOSError::new_err("vector index lock poisoned"))
+    }
+    fn write(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, m3_vector::VectorIndex>> {
+        self.inner.write().map_err(|_| PyOSError::new_err("vector index lock poisoned"))
+    }
+}
+
+#[pymethods]
+impl PyVectorIndex {
+    #[new]
+    fn new(dim: usize) -> PyResult<Self> {
+        Ok(PyVectorIndex { inner: std::sync::RwLock::new(map_err(m3_vector::VectorIndex::new(dim))?) })
+    }
+
+    /// Insert or replace one vector per key from one contiguous `bytes` buffer
+    /// of little-endian f32s, `len(keys) * dim * 4` bytes long (a SQLite
+    /// embedding blob is exactly one row of it).
+    fn upsert_packed(&self, py: Python<'_>, keys: Vec<i64>, blobs: &[u8]) -> PyResult<()> {
+        // The lock is taken inside the GIL-free closure: a guard cannot cross threads.
+        py.detach(|| {
+            let mut idx = self.inner.write().map_err(|_| "vector index lock poisoned".to_string())?;
+            let row = idx.dim() * 4;
+            if blobs.len() != keys.len() * row {
+                return Err(format!(
+                    "{} bytes for {} keys of dimension {}; expected {}",
+                    blobs.len(),
+                    keys.len(),
+                    idx.dim(),
+                    keys.len() * row
+                ));
+            }
+            let mut v = vec![0f32; idx.dim()];
+            for (key, chunk) in keys.iter().zip(blobs.chunks_exact(row)) {
+                for (x, b) in v.iter_mut().zip(chunk.chunks_exact(4)) {
+                    *x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                }
+                idx.upsert(*key, &v).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .map_err(PyValueError::new_err)
+    }
+
+    /// Remove keys; returns how many were present.
+    fn remove(&self, keys: Vec<i64>) -> PyResult<usize> {
+        let mut idx = self.write()?;
+        Ok(keys.into_iter().filter(|k| idx.remove(*k)).count())
+    }
+
+    /// The `k` best `(key, approximate_cosine)` pairs, best first, optionally
+    /// only among `allowed` keys. Re-score them exactly before trusting the order.
+    #[pyo3(signature = (query, k, allowed=None))]
+    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize, allowed: Option<Vec<i64>>) -> PyResult<Vec<(i64, f32)>> {
+        let out = py.detach(|| match self.inner.read() {
+            Ok(idx) => idx.search(&query, k, allowed.as_deref()),
+            Err(_) => Err(m3_error::M3Error::Other("vector index lock poisoned".into())),
+        });
+        map_err(out)
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self.read()?.len())
+    }
+
+    fn __contains__(&self, key: i64) -> PyResult<bool> {
+        Ok(self.read()?.contains(key))
+    }
+
+    /// Resident bytes held by the vectors.
+    fn nbytes(&self) -> PyResult<usize> {
+        Ok(self.read()?.bytes())
+    }
+
+    #[getter]
+    fn dim(&self) -> PyResult<usize> {
+        Ok(self.read()?.dim())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // m3-graph
 // ---------------------------------------------------------------------------
 
@@ -1497,6 +1589,7 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRouteSignals>()?;
     m.add_class::<PyRouteDecision>()?;
     m.add_class::<PyGraphIndex>()?;
+    m.add_class::<PyVectorIndex>()?;
     m.add_class::<PyCircuitBreaker>()?;
     m.add_class::<PyRetryPolicy>()?;
     m.add_class::<PyGovernor>()?;

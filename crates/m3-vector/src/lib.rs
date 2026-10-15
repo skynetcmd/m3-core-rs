@@ -5,6 +5,8 @@ use rayon::prelude::*;
 use wide::f32x8;
 
 mod displacement;
+pub mod index;
+pub use index::VectorIndex;
 pub use displacement::{
     displacement_permutation, enforce_displacement_guard, DisplacementRow,
 };

@@ -269,11 +269,8 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
 /// config.toml. Called by the Windows `install` subcommand so the SYSTEM-account
 /// service inherits the operator's intended settings.
 ///
-/// `allow(dead_code)`: Windows-service-only. The Unix installers
-/// (`service_unix`) pin `M3_EMBED_GGUF` directly into the launchd plist /
-/// systemd unit's `Environment=`, so they need no config.toml snapshot — this
-/// function is legitimately unused on a Unix build.
-#[allow(dead_code)]
+/// Windows writes it whole; the Unix installers merge it into the file
+/// (`merge_env_into_file`), since their unit pins only `M3_EMBED_GGUF`.
 pub fn snapshot_env_to_file() -> FileConfig {
     FileConfig {
         embed: EmbedSection {
@@ -291,9 +288,29 @@ pub fn snapshot_env_to_file() -> FileConfig {
     }
 }
 
-/// `allow(dead_code)`: paired with `snapshot_env_to_file` — Windows-service-only
-/// (the Unix installers pin config into the unit file instead).
-#[allow(dead_code)]
+/// Record the settings given to `install` in config.toml, keeping any value the
+/// file already has that the environment does not set. The Unix installers pin
+/// only M3_EMBED_GGUF into the unit, and a supervised service starts without the
+/// caller's environment, so a port (or host, streams...) handed to `install` was
+/// dropped and the service bound the default.
+#[cfg_attr(windows, allow(dead_code))] // the Unix installers call it
+pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
+    let mut file = load_file_config(path).unwrap_or_default();
+    let env = snapshot_env_to_file().embed;
+    let e = &mut file.embed;
+    e.gguf = env.gguf.or(e.gguf.take());
+    e.port = env.port.or(e.port);
+    e.host = env.host.or(e.host.take());
+    e.streams = env.streams.or(e.streams);
+    e.ctx = env.ctx.or(e.ctx);
+    e.seq_max = env.seq_max.or(e.seq_max);
+    e.n_batch = env.n_batch.or(e.n_batch);
+    e.n_ubatch = env.n_ubatch.or(e.n_ubatch);
+    e.coalesce_ms = env.coalesce_ms.or(e.coalesce_ms);
+    e.max_batch_tokens = env.max_batch_tokens.or(e.max_batch_tokens);
+    write_config_file(path, &file)
+}
+
 pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -388,6 +405,36 @@ mod tests {
     ///
     /// Tests share a process, so a stray env var from the developer's shell
     /// would make these pass or fail for the wrong reason.
+    /// A port given to `install` reaches config.toml, where the supervised
+    /// service reads it; values already in the file and not in the env stay.
+    #[test]
+    fn install_records_a_given_port_and_keeps_file_values() {
+        let dir = std::env::temp_dir().join(format!("m3-embed-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[embed]\ngguf = \"/m/bge.gguf\"\nstreams = 3\n").unwrap();
+        let saved: Vec<(&str, Option<String>)> = ["M3_EMBED_SERVER_PORT", "M3_EMBED_GGUF", "M3_EMBED_STREAMS"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("M3_EMBED_SERVER_PORT", "8083");
+        merge_env_into_file(&path).unwrap();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let cfg = load_file_config(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(cfg.embed.port, Some(8083));
+        assert_eq!(cfg.embed.gguf.as_deref(), Some("/m/bge.gguf"));
+        assert_eq!(cfg.embed.streams, Some(3));
+    }
+
     fn temp_env_without_streams<T>(f: impl FnOnce() -> T) -> T {
         let saved = std::env::var("M3_EMBED_STREAMS").ok();
         std::env::remove_var("M3_EMBED_STREAMS");

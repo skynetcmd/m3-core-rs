@@ -66,6 +66,15 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
     })
 }
 
+/// Record the settings `install` was given (port, host, streams...) in
+/// config.toml, where the supervised service reads them: the unit pins only
+/// the model, so a port handed to `install` used to be dropped.
+#[allow(dead_code)] // each Unix target calls it from its own install
+fn record_settings() -> Result<(), String> {
+    let path = config::default_config_path();
+    config::merge_env_into_file(&path).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 /// What `/health` said. `None`: it did not answer ok. `Some(Some(pid))`: it
 /// answered ok and named its process (3.10.14+). `Some(None)`: an older server
 /// that answers ok without a pid. `/health` answers only once the model is
@@ -260,6 +269,7 @@ pub mod macos {
     pub fn install() -> Result<(), String> {
         let exe = current_exe()?;
         let gguf = resolve_gguf_for_unit()?;
+        record_settings()?;
         let log_path = config::default_log_path();
         if let Some(dir) = log_path.parent() {
             std::fs::create_dir_all(dir)
@@ -508,6 +518,7 @@ pub mod linux {
     pub fn install() -> Result<(), String> {
         let exe = current_exe()?;
         let gguf = resolve_gguf_for_unit()?;
+        record_settings()?;
         let unit = unit_path()?;
         if let Some(dir) = unit.parent() {
             std::fs::create_dir_all(dir)

@@ -20,7 +20,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use m3_dispatcher::{BreakerCfg, Dispatcher, DispatcherConfig};
-use m3_embed_llamacpp::EmbeddedBackend;
+use m3_embed_llamacpp::{EmbeddedBackend, Tokenizer};
 
 use crate::config::{self, ResolvedConfig};
 
@@ -96,6 +96,9 @@ impl std::error::Error for PortInUse {}
 struct AppState {
     dispatcher: Arc<Dispatcher<EmbeddedBackend>>,
     model_label: String,
+    /// The same model, for `/tokenize/*`: counts and windows match what
+    /// `/embedding` measures against n_ctx, and never queue behind a batch.
+    tokenizer: Tokenizer,
 }
 
 /// Build the dispatcher (eager GGUF load), bind the listener, and serve until
@@ -198,6 +201,9 @@ where
         .embedding_dim()
         .map_err(|e| anyhow::anyhow!("eager GGUF load failed: {e}"))?;
     log::info!("model loaded, embedding dim = {dim}");
+    let tokenizer = backend
+        .tokenizer()
+        .map_err(|e| anyhow::anyhow!("tokenizer unavailable after GGUF load: {e}"))?;
 
     let dcfg = DispatcherConfig {
         streams: cfg.streams,
@@ -217,11 +223,14 @@ where
     let state = Arc::new(AppState {
         dispatcher,
         model_label,
+        tokenizer,
     });
 
     let app = Router::new()
         .route("/embedding", post(embed_handler))
         .route("/v1/embeddings", post(embed_handler))
+        .route("/tokenize/count", post(tokenize_count_handler))
+        .route("/tokenize/windows", post(tokenize_windows_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .with_state(state);
@@ -249,11 +258,10 @@ fn json_type(v: &serde_json::Value) -> &'static str {
     }
 }
 
-async fn embed_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EmbedRequest>,
-) -> Result<Json<EmbedResponse>, (StatusCode, String)> {
-    let texts: Vec<String> = match req.input {
+/// The `input` of a request as texts: a string, or an array of strings.
+/// Shared by `/embedding` and `/tokenize/count` so both reject the same shapes.
+fn texts_from(input: serde_json::Value) -> Result<Vec<String>, (StatusCode, String)> {
+    let texts: Vec<String> = match input {
         serde_json::Value::String(s) => vec![s],
         serde_json::Value::Array(arr) => {
             // Each element must be a string. A number (or an OpenAI-style token
@@ -281,6 +289,14 @@ async fn embed_handler(
             ));
         }
     };
+    Ok(texts)
+}
+
+async fn embed_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Json<EmbedResponse>, (StatusCode, String)> {
+    let texts = texts_from(req.input)?;
     if texts.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "input is empty".into()));
     }
@@ -349,6 +365,66 @@ async fn embed_handler(
 /// identity check that matters when several servers can bind this port.
 /// `pid` lets `start` confirm the answer came from the process the service
 /// manager started, not from another account's server on the same port.
+#[derive(Deserialize)]
+struct CountRequest {
+    input: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct CountResponse {
+    counts: Vec<usize>,
+}
+
+/// Exact token counts, BOS/EOS included: the numbers `/embedding` checks
+/// against n_ctx. Lets a client size its chunks to the model instead of to an
+/// estimate that over-counts prose ~3x.
+async fn tokenize_count_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CountRequest>,
+) -> Result<Json<CountResponse>, (StatusCode, String)> {
+    let texts = texts_from(req.input)?;
+    let tok = state.tokenizer.clone();
+    let counts = tokio::task::spawn_blocking(move || tok.count_tokens(&texts))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokenize task failed: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(CountResponse { counts }))
+}
+
+#[derive(Deserialize)]
+struct WindowsRequest {
+    input: String,
+    budget: usize,
+    #[serde(default)]
+    overlap: usize,
+}
+
+#[derive(Serialize)]
+struct WindowsResponse {
+    /// `[start, end]` pairs in CHARACTER offsets (Unicode scalar values).
+    windows: Vec<(usize, usize)>,
+}
+
+/// Token-exact windows over one text: each at most `budget` tokens (BOS/EOS
+/// included), overlapping by about `overlap`. Offsets are characters, which is
+/// what a Python `str` index is.
+async fn tokenize_windows_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<WindowsRequest>,
+) -> Result<Json<WindowsResponse>, (StatusCode, String)> {
+    // A budget no window can meet (BOS + EOS alone are 2 tokens) would cut the
+    // text into one window per character.
+    if req.budget < 3 {
+        return Err((StatusCode::BAD_REQUEST, format!("budget must be at least 3 tokens; got {}", req.budget)));
+    }
+    let tok = state.tokenizer.clone();
+    let windows = tokio::task::spawn_blocking(move || tok.token_windows(&req.input, req.budget, req.overlap))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tokenize task failed: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(WindowsResponse { windows }))
+}
+
 async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",

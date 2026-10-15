@@ -60,6 +60,8 @@ pub fn active_backend() -> &'static str {
     }
 }
 
+pub mod windows;
+
 use m3_dispatcher::{Batch, BatchOutput, ModelBackend};
 use m3_error::{M3Error, Result};
 use serde::{Deserialize, Serialize};
@@ -314,6 +316,27 @@ pub struct EmbeddedBackend {
     state: std::sync::OnceLock<std::sync::Arc<embedded::ContextPool>>,
 }
 
+/// Tokenizes with a loaded model, independently of the backend that loaded it.
+/// Cheap to clone; tokenization never queues behind an embed batch.
+#[cfg(feature = "embedded")]
+#[derive(Clone)]
+pub struct Tokenizer {
+    pool: std::sync::Arc<embedded::ContextPool>,
+}
+
+#[cfg(feature = "embedded")]
+impl Tokenizer {
+    /// Exact token counts, BOS/EOS included. See [`EmbeddedBackend::count_tokens`].
+    pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
+        self.pool.count_tokens(texts)
+    }
+
+    /// Token-exact windows (character offsets). See [`windows::plan_windows`].
+    pub fn token_windows(&self, text: &str, budget: usize, overlap: usize) -> Result<Vec<(usize, usize)>> {
+        self.pool.token_windows(text, budget, overlap)
+    }
+}
+
 impl EmbeddedBackend {
     /// Construct with the default pool size (4 streams), default ctx (8192), and default seq_max (32).
     /// Default n_batch = n_ubatch = n_ctx (the encoder-safe value; see `with_streams_ctx_seqmax`).
@@ -426,6 +449,21 @@ impl EmbeddedBackend {
     pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
         let pool = self.pool()?;
         pool.count_tokens(texts)
+    }
+
+    /// Token-exact windows over `text` (character offsets). See
+    /// [`windows::plan_windows`]. Forces the GGUF load, performs no decode.
+    #[cfg(feature = "embedded")]
+    pub fn token_windows(&self, text: &str, budget: usize, overlap: usize) -> Result<Vec<(usize, usize)>> {
+        self.pool()?.token_windows(text, budget, overlap)
+    }
+
+    /// A handle that tokenizes with this backend's model after the backend
+    /// itself has been moved into a dispatcher (the embed server keeps one for
+    /// its `/tokenize/*` routes). Forces the GGUF load.
+    #[cfg(feature = "embedded")]
+    pub fn tokenizer(&self) -> Result<Tokenizer> {
+        Ok(Tokenizer { pool: self.pool()? })
     }
 
     /// Test-only: peek at the cached `Arc<ContextPool>` without forcing a
@@ -690,6 +728,24 @@ pub mod embedded {
                 out.push(tokens.len());
             }
             Ok(out)
+        }
+
+        /// Token-exact windows over `text`: `[(start, end), ...]` in CHARACTER
+        /// offsets, each holding at most `budget` tokens (BOS/EOS included, as
+        /// `count_tokens` counts them) and overlapping by about `overlap`. See
+        /// [`crate::windows::plan_windows`].
+        pub fn token_windows(&self, text: &str, budget: usize, overlap: usize) -> Result<Vec<(usize, usize)>> {
+            // Byte offset of every character boundary, so a character slice
+            // maps onto `text` without re-encoding.
+            let bounds: Vec<usize> = text.char_indices().map(|(b, _)| b).chain(std::iter::once(text.len())).collect();
+            let n_chars = bounds.len() - 1;
+            let mut count = |s: usize, e: usize| -> Result<usize> {
+                self.model
+                    .str_to_token(&text[bounds[s]..bounds[e]], AddBos::Always)
+                    .map(|t| t.len())
+                    .map_err(|e| M3Error::Backend(format!("tokenize failed: {e}")))
+            };
+            crate::windows::plan_windows(n_chars, budget, overlap, &mut count)
         }
 
         /// Embedding dimension reported by the model.
@@ -1229,6 +1285,44 @@ mod tests {
             "6 concurrent run() calls over a 3-stream pool finished in {:?}",
             started.elapsed()
         );
+    }
+
+    /// Real-tokenizer windows: every window fits by an exact count of its own
+    /// slice, the text is covered, offsets survive multi-byte characters, and
+    /// prose needs far fewer windows than the estimator's (`max(bytes/3,
+    /// chars) + 2`) plan. Opt-in via `M3_TEST_GGUF`.
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn embedded_token_windows_fit_and_beat_the_estimate() {
+        let Ok(model_path) = std::env::var("M3_TEST_GGUF") else {
+            eprintln!("M3_TEST_GGUF unset — skipping token-window test");
+            return;
+        };
+        let b = EmbeddedBackend::new(model_path);
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!("Memory {i} records that the embedder moved to a free port. "));
+            if i % 97 == 0 {
+                text.push_str("記憶は共有コンピュータで別のポートを使う 🚀 ");
+            }
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let (budget, overlap) = (512usize, 64usize);
+        let w = b.token_windows(&text, budget, overlap).expect("windows");
+        assert_eq!(w.first().unwrap().0, 0);
+        assert_eq!(w.last().unwrap().1, chars.len());
+        let slices: Vec<String> = w.iter().map(|&(s, e)| chars[s..e].iter().collect()).collect();
+        let counts = b.count_tokens(&slices).expect("counts");
+        for (i, c) in counts.iter().enumerate() {
+            assert!(*c <= budget, "window {i} {:?} has {c} tokens > {budget}", w[i]);
+        }
+        let estimate = |s: usize, e: usize| -> Result<usize> {
+            let slice: String = chars[s..e].iter().collect();
+            Ok((slice.len() / 3).max(e - s) + 2)
+        };
+        let est = crate::windows::plan_windows(chars.len(), budget, overlap, &mut { estimate }).unwrap();
+        eprintln!("{} chars: {} exact windows vs {} estimated", chars.len(), w.len(), est.len());
+        assert!(w.len() * 2 < est.len(), "exact {} vs estimated {}", w.len(), est.len());
     }
 
     /// Wave 9.1: confirm the compute-cap detector returns without panicking,

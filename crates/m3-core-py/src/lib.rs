@@ -1366,6 +1366,22 @@ impl PyEmbeddedEmbedder {
         map_err(out)
     }
 
+    /// Token-exact windows over `text`: `[(start, end), ...]` as `str` indices,
+    /// each at most `budget` tokens (BOS/EOS included, as `count_tokens`
+    /// counts) and overlapping by about `overlap` tokens. A text that fits is
+    /// one window `(0, len(text))`.
+    ///
+    /// Each window's end is found by binary search on exact counts of that very
+    /// slice, so every window provably fits; boundaries are offsets into the
+    /// original text, never text rebuilt from tokens. Replaces the estimator's
+    /// windows, which over-count prose ~3x (192 vs 112 windows on 110 long
+    /// memories, measured 2026-10-15). Releases the GIL.
+    #[pyo3(signature = (text, budget, overlap))]
+    fn token_windows(&self, py: Python<'_>, text: String, budget: usize, overlap: usize) -> PyResult<Vec<(usize, usize)>> {
+        let out = py.detach(|| self.backend.token_windows(&text, budget, overlap));
+        map_err(out)
+    }
+
     /// Embedding dimension reported by the model. Forces the lazy GGUF
     /// load on first call (no full inference needed).
     fn embedding_dim(&self) -> PyResult<i32> {

@@ -95,8 +95,6 @@ pub const DEFAULT_PORT: u16 = 8082;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_CTX: u32 = 8192;
 const DEFAULT_SEQ_MAX: u32 = 32;
-const DEFAULT_N_BATCH: u32 = 2048;
-const DEFAULT_N_UBATCH: u32 = 512;
 const DEFAULT_COALESCE_MS: u64 = 3;
 const DEFAULT_MAX_BATCH_TOKENS: usize = 2048;
 
@@ -108,8 +106,9 @@ fn default_of(key: &Key) -> Option<Value> {
         "embed.ctx" => Value::Int(DEFAULT_CTX.into()),
         "embed.server.streams" => Value::Int(default_streams() as i64),
         "embed.server.seq_max" => Value::Int(DEFAULT_SEQ_MAX.into()),
-        "embed.server.n_batch" => Value::Int(DEFAULT_N_BATCH.into()),
-        "embed.server.n_ubatch" => Value::Int(DEFAULT_N_UBATCH.into()),
+        // n_batch / n_ubatch follow embed.ctx (resolved in load), as in the
+        // in-process core: a fixed default below ctx was raised at the FFI and
+        // warned about on every start although nothing had been set.
         "embed.server.coalesce_ms" => Value::Int(DEFAULT_COALESCE_MS as i64),
         "embed.server.max_batch_tokens" => Value::Int(DEFAULT_MAX_BATCH_TOKENS as i64),
         "crypto.fips_mode" | "crypto.fips_strict" => Value::Bool(false),
@@ -318,8 +317,8 @@ pub fn resolve(cfg: &Config) -> anyhow::Result<ResolvedConfig> {
     let streams = int(cfg, &STREAMS, default_streams(), &mut sources)?;
     let n_ctx = int(cfg, &CTX, DEFAULT_CTX, &mut sources)?;
     let seq_max = int(cfg, &SEQ_MAX, DEFAULT_SEQ_MAX, &mut sources)?;
-    let n_batch = int(cfg, &N_BATCH, DEFAULT_N_BATCH, &mut sources)?;
-    let n_ubatch = int(cfg, &N_UBATCH, DEFAULT_N_UBATCH, &mut sources)?;
+    let n_batch = int(cfg, &N_BATCH, n_ctx, &mut sources)?;
+    let n_ubatch = int(cfg, &N_UBATCH, n_ctx, &mut sources)?;
     let coalesce_ms = int(cfg, &COALESCE_MS, DEFAULT_COALESCE_MS, &mut sources)?;
     let max_batch_tokens = int(
         cfg,
@@ -636,6 +635,30 @@ mod tests {
             "{}",
             r.security.fips_strict_from
         );
+    }
+
+    /// Fixed batch defaults (2048 / 512) sat below the default ctx (8192), so
+    /// every start raised them at the FFI and warned although nothing was set.
+    #[test]
+    fn batch_sizes_follow_ctx_unless_set() {
+        let f = Fixture::new();
+        let r = resolve(&f.config(
+            &format!("[embed]\ngguf = {}\n", f.gguf_toml()),
+            MapEnv::new(),
+            None,
+        ))
+        .unwrap();
+        assert_eq!((r.n_batch, r.n_ubatch), (r.n_ctx, r.n_ctx));
+        let r = resolve(&f.config(
+            &format!(
+                "[embed]\ngguf = {}\nctx = 4096\n[embed.server]\nn_batch = 16384\n",
+                f.gguf_toml()
+            ),
+            MapEnv::new(),
+            None,
+        ))
+        .unwrap();
+        assert_eq!((r.n_ctx, r.n_batch, r.n_ubatch), (4096, 16384, 4096));
     }
 
     #[test]

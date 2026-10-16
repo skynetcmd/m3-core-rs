@@ -155,7 +155,7 @@ where
     // real incident and was absent from the log at the time:
     //   * gguf   — the server ran for months against a model under a THIRD-PARTY
     //              app's directory; nothing said so until the path was printed.
-    //   * config — which file those values came from, since env > file > default
+    //   * config — which file those values came from, since --set > file > env > default
     //              and the wrong file looks identical to no file.
     //   * backend— a `-cuda` wheel silently falling back to CPU presents only as
     //              "embedding got slow"; the compiled feature is the only proof.

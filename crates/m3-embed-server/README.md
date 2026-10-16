@@ -33,8 +33,8 @@ where every non-default value came from.
 | `[embed.server] port` | `M3_EMBED_SERVER_PORT` | 8082 |
 | `[embed.server] streams` | `M3_EMBED_STREAMS` | 1 (CPU) / 2 (GPU builds) |
 | `[embed.server] seq_max` | `M3_EMBED_SEQ_MAX` | 32 |
-| `[embed.server] n_batch` | `M3_EMBED_N_BATCH` | 2048 |
-| `[embed.server] n_ubatch` | `M3_EMBED_N_UBATCH` | 512 |
+| `[embed.server] n_batch` | `M3_EMBED_N_BATCH` | `embed.ctx` |
+| `[embed.server] n_ubatch` | `M3_EMBED_N_UBATCH` | `embed.ctx` |
 | `[embed.server] coalesce_ms` | `M3_EMBED_COALESCE_MS` | 3 |
 | `[embed.server] max_batch_tokens` | `M3_EMBED_MAX_BATCH_TOKENS` | 2048 |
 | `[embed.server] remote_listen`, `tls_cert`, `tls_key` | none | unset |

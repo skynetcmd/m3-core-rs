@@ -623,15 +623,23 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
     if not wheels:
         print(f"[smoke] {os_tok}/{backend}: no wheel to test", file=sys.stderr)
         return False
-    # Prefer a 3.13 wheel; otherwise the first available.
-    wheel = next((w for w in wheels if "cp313" in w.name), wheels[0])
+    # Test with the interpreter the wheel was built for, read from its tag
+    # (cp314 -> 3.14). A fixed 3.13 failed every `--pythons` build without 3.13.
+    wheel = wheels[0]
+    tag = re.search(r"-cp3(\d+)-", wheel.name)
+    if not tag:
+        print(f"[smoke] {os_tok}/{backend}: cannot read the Python tag from {wheel.name}", file=sys.stderr)
+        return False
+    pyver = f"3.{tag.group(1)}"
     uv = _uv()
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         venv = Path(tmp) / "venv"
-        if subprocess.run([uv, "venv", "--python", "3.13", str(venv)],
-                          capture_output=True).returncode != 0:
-            subprocess.run([uv, "venv", str(venv)], capture_output=True)
+        made = subprocess.run([uv, "venv", "--python", pyver, str(venv)], capture_output=True, text=True)
+        if made.returncode != 0:
+            print(f"[smoke] {os_tok}/{backend}: cannot create a Python {pyver} venv for {wheel.name} "
+                  f"(uv exit {made.returncode}): {made.stderr.strip()}", file=sys.stderr)
+            return False
         py = venv / ("Scripts" if os_tok == "windows" else "bin") / (
             "python.exe" if os_tok == "windows" else "python")
         inst = subprocess.run([uv, "pip", "install", "--python", str(py), str(wheel)],

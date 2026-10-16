@@ -39,6 +39,27 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
+  # Cargo.toml rust-version is a promise to anyone building from source; the
+  # wheels are built with a newer compiler, so nothing else would notice a
+  # change that needs a newer one. Check every feature set the wheels use.
+  msrv:
+    name: Minimum Rust (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - name: Install the minimum Rust toolchain
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+        echo "MSRV=$msrv" >> "$GITHUB_ENV"
+        rustup toolchain install "$msrv" --profile minimal --no-self-update
+    - name: cargo check (workspace, embed-server embedded, core-py embedded+onnx)
+      run: |
+        cargo "+$MSRV" check --workspace --all-targets --locked
+        cargo "+$MSRV" check -p m3-embed-server --features embedded --all-targets --locked
+        cargo "+$MSRV" check -p m3-core-py --features embedded,onnx --all-targets --locked
+
   check:
     name: Check + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

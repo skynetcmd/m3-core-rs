@@ -124,10 +124,13 @@ jobs:
             3.14
             3.15
 
+      # The published wheels are built with a pinned, current stable (the local
+      # builds use the same). The minimum source-build version is
+      # Cargo.toml rust-version, checked by ci.yml's msrv job.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - name: Cache cargo + target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.4

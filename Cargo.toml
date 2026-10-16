@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/m3-error",
+    "crates/m3-config",
     "crates/m3-resilience",
     "crates/m3-hash",
     "crates/m3-vector",
@@ -29,6 +30,7 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 m3-error = { path = "crates/m3-error" }
+m3-config = { path = "crates/m3-config" }
 m3-resilience = { path = "crates/m3-resilience" }
 m3-hash = { path = "crates/m3-hash" }
 m3-vector = { path = "crates/m3-vector" }

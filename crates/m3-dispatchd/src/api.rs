@@ -1,0 +1,72 @@
+//! HTTP routes, served only over the local IPC endpoint (see `ipc`).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+
+use crate::hub::{Hub, Wake};
+
+/// Longest a single wait may block. A waiter re-waits after a timeout.
+pub const MAX_WAIT: Duration = Duration::from_secs(3600);
+/// Most recipients one ring may carry.
+pub const MAX_RECIPIENTS: usize = 1000;
+
+#[derive(Deserialize)]
+struct RingRequest {
+    recipients: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct WaitRequest {
+    readers: Vec<String>,
+    #[serde(default = "default_timeout")]
+    timeout_s: f64,
+}
+
+fn default_timeout() -> f64 {
+    300.0
+}
+
+pub fn router(hub: Arc<Hub>) -> Router {
+    Router::new()
+        .route("/ring", post(ring))
+        .route("/wait", post(wait))
+        .route("/status", get(status))
+        .route("/health", get(|| async { Json(serde_json::json!({ "status": "ok", "pid": std::process::id() })) }))
+        .with_state(hub)
+}
+
+/// An error reply, always JSON so a client parses one shape.
+type ApiError = (StatusCode, Json<serde_json::Value>);
+
+fn bad(msg: String) -> ApiError {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })))
+}
+
+async fn ring(State(hub): State<Arc<Hub>>, Json(req): Json<RingRequest>) -> Result<StatusCode, ApiError> {
+    if req.recipients.is_empty() || req.recipients.len() > MAX_RECIPIENTS {
+        return Err(bad(format!("recipients: 1..={MAX_RECIPIENTS} required; got {}", req.recipients.len())));
+    }
+    hub.ring(req.recipients);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn wait(State(hub): State<Arc<Hub>>, Json(req): Json<WaitRequest>) -> Result<Json<Wake>, ApiError> {
+    if req.readers.iter().all(|r| r.is_empty()) {
+        return Err(bad("readers: at least one non-empty agent id required".into()));
+    }
+    if !(req.timeout_s.is_finite() && req.timeout_s >= 0.0) {
+        return Err(bad(format!("timeout_s must be a non-negative number; got {}", req.timeout_s)));
+    }
+    let timeout = Duration::from_secs_f64(req.timeout_s).min(MAX_WAIT);
+    Ok(Json(hub.wait(&req.readers, timeout).await))
+}
+
+async fn status(State(hub): State<Arc<Hub>>) -> Json<serde_json::Value> {
+    Json(hub.status())
+}

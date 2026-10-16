@@ -31,7 +31,7 @@ production Python paths. This document covers the **Milestone-4 additions**:
 The staleness/re-ingest sweep hashes every file whose mtime changed since the
 last ingest. The Python path (`file_content_sha256`) is a serial per-file
 streaming SHA-256 loop. `m3_ingest::hash_files` reads + hashes the whole batch
-in parallel with `rayon`, releasing the GIL, reusing the FIPS-aware `m3-hash`
+in parallel with `rayon`, releasing the GIL, reusing the `m3-hash`
 provider so digests are byte-identical.
 
 Speedup = Python serial median ÷ native median. Parity verified (native digest

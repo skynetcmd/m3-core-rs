@@ -75,7 +75,7 @@ fn sha256_hex_bytes(data: &[u8]) -> String {
     m3_hash::sha256_hex(data)
 }
 
-/// Active hash provider string; surfaced in `m3:health` for FIPS drift detection.
+/// Active content-hash provider: `ring`, or `sha2` in a dev build.
 #[pyfunction]
 fn hash_provider() -> &'static str {
     m3_hash::active_provider()

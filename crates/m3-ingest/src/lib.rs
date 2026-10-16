@@ -152,7 +152,7 @@ fn recurse(
 ///
 /// The digest is byte-identical to Python's `file_content_sha256`
 /// (streaming SHA-256, hex) because both go through the same SHA-256 over the
-/// raw file bytes; here via `m3_hash::sha256_hex` (FIPS-aware `ring` provider).
+/// raw file bytes; here via `m3_hash::sha256_hex` (a content key, outside the FIPS boundary).
 pub fn hash_files(paths: &[String]) -> Vec<(String, Result<String, String>)> {
     paths
         .par_iter()

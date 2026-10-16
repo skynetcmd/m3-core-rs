@@ -8,7 +8,7 @@ independently-useful crates plus a PyO3 binding crate (`m3-core-py`) consumed by
 | Crate | Phase | Purpose |
 |---|---|---|
 | `m3-error` | 1.2 | Shared `M3Error` type with Python exception mapping |
-| `m3-hash` | 1.3 / 3d | FIPS-preserving SHA-256 hashing (`ring`-backed) |
+| `m3-hash` | 1.3 / 3d | SHA-256 content keys for dedup and change detection (not a security use) |
 | `m3-vector` | 2 | SIMD cosine similarity, MMR reranker |
 | `m3-dispatcher` | 3b/3c | Generic `ModelBackend` coalescer (length bucketing, backpressure) |
 | `m3-embed-llamacpp` | 3b | llama.cpp embedding backend |

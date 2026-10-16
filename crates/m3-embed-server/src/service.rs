@@ -166,6 +166,7 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     // Stopped with the outcome, or SCM sits in start-pending until its timeout
     // and `status` reports that instead of the failure.
     let port_in_use = std::cell::Cell::new(false);
+    let refused = std::cell::Cell::new(false);
     let run_result: Result<(), String> = (|| {
         // Resolve config from %PROGRAMDATA% file (env vars unlikely to be set
         // under SYSTEM, but `resolve` honors them when present).
@@ -207,17 +208,21 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             }, on_ready))
             .map_err(|e| {
                 port_in_use.set(e.downcast_ref::<crate::server::PortInUse>().is_some());
+                refused.set(e.downcast_ref::<crate::security::ConfigRefused>().is_some());
                 e.to_string()
             })
     })();
 
     // Always publish Stopped. ERROR_SERVICE_SPECIFIC_ERROR (1066) + a code is
     // how a service reports its own failure; `sc query` then shows it. A taken
-    // port gets its own code, as on Unix.
+    // port and a refused configuration get their own codes, as on Unix.
     let exit_code = match &run_result {
         Ok(()) => ServiceExitCode::Win32(0),
         Err(_) if port_in_use.get() => {
             ServiceExitCode::ServiceSpecific(crate::server::EXIT_PORT_IN_USE as u32)
+        }
+        Err(_) if refused.get() => {
+            ServiceExitCode::ServiceSpecific(crate::security::EXIT_CONFIG_REFUSED as u32)
         }
         Err(_) => ServiceExitCode::ServiceSpecific(1),
     };

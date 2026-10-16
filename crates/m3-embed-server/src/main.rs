@@ -16,6 +16,10 @@
 
 #[cfg(feature = "embedded")]
 mod config;
+// Transport security compiles without `embedded` so its tests (a real TLS
+// listener included) run without building llama.cpp.
+#[cfg_attr(not(feature = "embedded"), allow(dead_code))]
+mod security;
 #[cfg(feature = "embedded")]
 mod server;
 #[cfg(all(windows, feature = "embedded"))]
@@ -43,7 +47,18 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(feature = "embedded")]
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--config") {
+        let Some(path) = args.get(2).cloned() else {
+            anyhow::bail!("--config needs a path");
+        };
+        args.drain(1..3);
+        // The service subcommands act on the installed service's own file.
+        if !matches!(args.get(1).map(String::as_str), None | Some("secure")) {
+            anyhow::bail!("--config applies to foreground mode and `secure` only");
+        }
+        config::set_config_override(std::path::PathBuf::from(path));
+    }
     let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match sub {
@@ -54,6 +69,7 @@ fn main() -> anyhow::Result<()> {
         "start" => run_start(),
         "stop" => run_stop(),
         "status" => run_status(),
+        "secure" => run_secure(&args[2..]),
         "-h" | "--help" | "help" => {
             print_help();
             Ok(())
@@ -83,7 +99,9 @@ fn print_help() {
         "m3-embed-server — OpenAI-compatible CPU embed server (port 8082 by default)\n\
          \n\
          USAGE:\n  \
-           m3-embed-server [SUBCOMMAND]\n\
+           m3-embed-server [--config <path>] [SUBCOMMAND]\n\
+         \n\
+         --config uses that config.toml instead of the service's (foreground and secure only).\n\
          \n\
          SUBCOMMANDS:\n  \
            (none)        run in foreground (dev mode); Ctrl-C to stop \
@@ -93,8 +111,70 @@ fn print_help() {
            start         start the installed service\n  \
            stop          stop the installed service\n  \
            status        running / stopped / not installed\n  \
+           secure        --cert <pem> --key <pem> --token-sha256 <hex>: require TLS and a \
+bearer token (needed for any address but loopback); --off removes them\n  \
            help          show this message\n"
     );
+}
+
+/// `secure --cert PEM --key PEM --token-sha256 HEX` records TLS and the token
+/// digest in config.toml after checking them exactly as the server will at
+/// startup (FIPS flags included); `secure --off` removes them, after which the
+/// server serves loopback only. `m3 embedder secure` drives this.
+#[cfg(feature = "embedded")]
+fn run_secure(args: &[String]) -> anyhow::Result<()> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let usage = "usage: m3-embed-server secure --cert <pem> --key <pem> --token-sha256 <hex> | --off";
+    let path = config::default_config_path();
+    let file = config::load_file_config(&path)?;
+    let write = |cert: Option<&str>, key: Option<&str>, token: Option<&str>| {
+        config::write_security_keys(&path, cert, key, token).map_err(|e| {
+            let hint = if cfg!(windows) { " (the file is under %PROGRAMDATA%: use an elevated prompt)" } else { "" };
+            anyhow::anyhow!("cannot write {}: {e}{hint}", path.display())
+        })
+    };
+    if args.iter().any(|a| a == "--off") {
+        write(None, None, None)?;
+        println!(
+            "removed TLS and the bearer token from {}; the server now serves loopback only. \
+             Restart it to apply.",
+            path.display()
+        );
+        return Ok(());
+    }
+    let (mut cert, mut key, mut token) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let slot = match a.as_str() {
+            "--cert" => &mut cert,
+            "--key" => &mut key,
+            "--token-sha256" => &mut token,
+            other => anyhow::bail!("unknown option {other:?}\n{usage}"),
+        };
+        *slot = Some(it.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value\n{usage}"))?.clone());
+    }
+    let (Some(cert), Some(key), Some(token)) = (cert, key, token) else {
+        anyhow::bail!("{usage}");
+    };
+    // Absolute, because the service does not start in this directory.
+    let cert = std::path::absolute(&cert)?;
+    let key = std::path::absolute(&key)?;
+    let mut sec = config::security_config(&file.embed);
+    sec.tls_cert = Some(cert.clone());
+    sec.tls_key = Some(key.clone());
+    sec.token_sha256 = Some(token.trim().to_ascii_lowercase());
+    security::plan(IpAddr::V4(Ipv4Addr::LOCALHOST), &sec)?;
+    write(
+        Some(&cert.display().to_string()),
+        Some(&key.display().to_string()),
+        sec.token_sha256.as_deref(),
+    )?;
+    println!(
+        "TLS ({}) and a bearer token are now required; recorded in {}. Restart the server to apply.",
+        cert.display(),
+        path.display()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +204,10 @@ fn run_foreground() -> anyhow::Result<()> {
         if e.downcast_ref::<server::PortInUse>().is_some() {
             log::error!("{e}");
             std::process::exit(server::EXIT_PORT_IN_USE);
+        }
+        if e.downcast_ref::<security::ConfigRefused>().is_some() {
+            log::error!("{e}");
+            std::process::exit(security::EXIT_CONFIG_REFUSED);
         }
     }
     result

@@ -19,6 +19,15 @@ pub struct EmbedSection {
     pub n_ubatch: Option<u32>,
     pub coalesce_ms: Option<u64>,
     pub max_batch_tokens: Option<usize>,
+    // Transport security (src/security.rs). File-only, written by
+    // `m3-embed-server secure`: no environment variable can switch TLS off.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub token_sha256: Option<String>,
+    // m3's crypto.fips_mode / fips_strict, for a service that starts without
+    // the caller's environment (captured from M3_FIPS_MODE / M3_FIPS_STRICT).
+    pub fips_mode: Option<bool>,
+    pub fips_strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -55,6 +64,7 @@ pub struct ResolvedConfig {
     pub n_ubatch: u32,
     pub coalesce_ms: u64,
     pub max_batch_tokens: usize,
+    pub security: crate::security::SecurityConfig,
 }
 
 /// Per-user base directory for config (`$XDG_CONFIG_HOME` or `~/.config` on
@@ -105,12 +115,57 @@ fn home() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+static CONFIG_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--config <path>`: use this file instead of the default. Foreground and
+/// `secure` only (main.rs refuses it elsewhere), so a test or a second instance
+/// never reads or rewrites the installed service's file.
+pub fn set_config_override(path: PathBuf) {
+    let _ = CONFIG_OVERRIDE.set(path);
+}
+
+/// Set (`Some`) or remove (`None`) the transport-security keys in `[embed]`,
+/// editing the file in place so every comment and other key survives.
+pub fn write_security_keys(
+    path: &Path,
+    tls_cert: Option<&str>,
+    tls_key: Option<&str>,
+    token_sha256: Option<&str>,
+) -> anyhow::Result<()> {
+    let raw = if path.exists() { std::fs::read_to_string(path)? } else { String::new() };
+    let mut doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|e| anyhow::anyhow!("cannot parse config file {}: {e}", path.display()))?;
+    if !doc.contains_table("embed") {
+        doc["embed"] = toml_edit::table();
+    }
+    let embed = doc["embed"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("[embed] in {} is not a table", path.display()))?;
+    for (k, v) in [("tls_cert", tls_cert), ("tls_key", tls_key), ("token_sha256", token_sha256)] {
+        match v {
+            Some(v) => embed[k] = toml_edit::value(v),
+            None => {
+                embed.remove(k);
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 /// Default location for the service config file. The Unix service runs as a
 /// *per-user* agent (launchd / systemd --user), so config lives under the
 /// user's config dir — `%PROGRAMDATA%\m3-embed-server\config.toml` on Windows,
 /// `~/.config/m3-embed-server/config.toml` (Linux) or
 /// `~/Library/Application Support/m3-embed-server/config.toml` (macOS).
 pub fn default_config_path() -> PathBuf {
+    if let Some(p) = CONFIG_OVERRIDE.get() {
+        return p.clone();
+    }
     #[cfg(windows)]
     {
         let base = std::env::var("PROGRAMDATA")
@@ -262,7 +317,34 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
         max_batch_tokens: env_parse("M3_EMBED_MAX_BATCH_TOKENS")
             .or(file.embed.max_batch_tokens)
             .unwrap_or(2048),
+        security: security_config(&file.embed),
     })
+}
+
+/// The transport-security settings: TLS and token from the file only, the FIPS
+/// flags from m3's environment variables first, then the file.
+pub fn security_config(e: &EmbedSection) -> crate::security::SecurityConfig {
+    crate::security::SecurityConfig {
+        tls_cert: e.tls_cert.clone().map(PathBuf::from),
+        tls_key: e.tls_key.clone().map(PathBuf::from),
+        token_sha256: e.token_sha256.clone(),
+        fips_mode: env_flag("M3_FIPS_MODE").or(e.fips_mode).unwrap_or(false),
+        fips_strict: env_flag("M3_FIPS_STRICT").or(e.fips_strict).unwrap_or(false),
+    }
+}
+
+/// m3's boolean spelling (1/true/yes/on, 0/false/no/off). A set value that is
+/// neither is said, then treated as unset.
+fn env_flag(key: &str) -> Option<bool> {
+    let raw = env_str(key)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            log::warn!("ignoring {key}={raw:?}: not a boolean; using the configured or default value");
+            None
+        }
+    }
 }
 
 /// Capture the current shell's env vars and serialize them as a starter
@@ -284,6 +366,11 @@ pub fn snapshot_env_to_file() -> FileConfig {
             n_ubatch: env_parse("M3_EMBED_N_UBATCH"),
             coalesce_ms: env_parse("M3_EMBED_COALESCE_MS"),
             max_batch_tokens: env_parse("M3_EMBED_MAX_BATCH_TOKENS"),
+            tls_cert: None,
+            tls_key: None,
+            token_sha256: None,
+            fips_mode: env_flag("M3_FIPS_MODE"),
+            fips_strict: env_flag("M3_FIPS_STRICT"),
         },
     }
 }
@@ -308,6 +395,8 @@ pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
     e.n_ubatch = env.n_ubatch.or(e.n_ubatch);
     e.coalesce_ms = env.coalesce_ms.or(e.coalesce_ms);
     e.max_batch_tokens = env.max_batch_tokens.or(e.max_batch_tokens);
+    e.fips_mode = env.fips_mode.or(e.fips_mode);
+    e.fips_strict = env.fips_strict.or(e.fips_strict);
     write_config_file(path, &file)
 }
 
@@ -433,6 +522,29 @@ mod tests {
         assert_eq!(cfg.embed.port, Some(8083));
         assert_eq!(cfg.embed.gguf.as_deref(), Some("/m/bge.gguf"));
         assert_eq!(cfg.embed.streams, Some(3));
+    }
+
+    /// `secure` edits the operator's file: comments and other keys survive,
+    /// Windows paths round-trip, and `--off` removes exactly the three keys.
+    #[test]
+    fn security_keys_are_edited_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "[embed]\n# why one stream: measured\nstreams = 1\nport = 8082\n";
+        std::fs::write(&path, original).unwrap();
+        let cert = r"C:\Users\x\.m3\config\tls\cert.pem";
+        write_security_keys(&path, Some(cert), Some("/k.pem"), Some(&"a".repeat(64))).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# why one stream: measured"), "{text}");
+        let cfg = load_file_config(&path).unwrap();
+        assert_eq!(cfg.embed.tls_cert.as_deref(), Some(cert));
+        assert_eq!(cfg.embed.streams, Some(1));
+        assert_eq!(cfg.embed.token_sha256.as_deref(), Some("a".repeat(64).as_str()));
+
+        write_security_keys(&path, None, None, None).unwrap();
+        let cfg = load_file_config(&path).unwrap();
+        assert!(cfg.embed.tls_cert.is_none() && cfg.embed.tls_key.is_none() && cfg.embed.token_sha256.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
     fn temp_env_without_streams<T>(f: impl FnOnce() -> T) -> T {

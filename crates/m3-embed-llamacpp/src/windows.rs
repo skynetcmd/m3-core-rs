@@ -163,7 +163,7 @@ mod tests {
         let w = plan_windows(100_000, 7000, 2000, &mut c).unwrap();
         let (a, b) = (w[0], w[1]);
         let shared = c(b.0, a.1).unwrap();
-        assert!(shared <= 2000 && shared >= 1990, "overlap {shared} tokens");
+        assert!((1990..=2000).contains(&shared), "overlap {shared} tokens");
     }
 
     #[test]

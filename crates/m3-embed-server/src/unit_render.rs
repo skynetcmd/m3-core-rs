@@ -81,7 +81,7 @@ pub fn render_unit(exe: &str, gguf: &str) -> String {
          Environment=\"M3_EMBED_GGUF={env_val}\"\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         RestartPreventExitStatus={port_in_use}\n\
+         RestartPreventExitStatus={port_in_use} {refused}\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -90,6 +90,8 @@ pub fn render_unit(exe: &str, gguf: &str) -> String {
         // A taken port is not cured by a restart: without this the unit
         // retried every 5 s for as long as another program held the port.
         port_in_use = crate::server::EXIT_PORT_IN_USE,
+        // Nor is a refused configuration (TLS/token rules, src/security.rs).
+        refused = crate::security::EXIT_CONFIG_REFUSED,
     )
 }
 
@@ -133,8 +135,9 @@ mod tests {
         assert!(u.contains("Environment=\"M3_EMBED_GGUF=/models/bge-m3.gguf\""));
         assert!(u.contains("Restart=on-failure"));
         assert!(u.contains(&format!(
-            "RestartPreventExitStatus={}",
-            crate::server::EXIT_PORT_IN_USE
+            "RestartPreventExitStatus={} {}",
+            crate::server::EXIT_PORT_IN_USE,
+            crate::security::EXIT_CONFIG_REFUSED
         )));
         assert!(u.contains("[Install]"));
         assert!(u.contains("WantedBy=default.target"));

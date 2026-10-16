@@ -23,6 +23,7 @@ use m3_dispatcher::{BreakerCfg, Dispatcher, DispatcherConfig};
 use m3_embed_llamacpp::{EmbeddedBackend, Tokenizer};
 
 use crate::config::{self, ResolvedConfig};
+use crate::security;
 
 /// Which GPU backend this binary was COMPILED with.
 ///
@@ -181,6 +182,11 @@ where
         anyhow::anyhow!("invalid listen address {}:{} (M3_EMBED_SERVER_HOST / _PORT): {e}",
                         cfg.host, cfg.port)
     })?;
+    // Decide transport security before binding, so a refused configuration
+    // never holds the port or loads the model.
+    let sec = security::plan(addr.ip(), &cfg.security)
+        .map_err(|e| anyhow::Error::new(security::ConfigRefused(format!("{e:#}"))))?;
+    log::info!("transport: {}", sec.describe());
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -234,13 +240,25 @@ where
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .with_state(state);
+    let app = match sec.token_digest {
+        Some(d) => app.layer(axum::middleware::from_fn_with_state(Arc::new(d), security::require_bearer)),
+        None => app,
+    };
 
-    log::info!("listening on http://{addr}");
-    on_ready();
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    match sec.tls {
+        Some(tls) => {
+            log::info!("listening on https://{addr}");
+            on_ready();
+            security::serve_tls(listener, app, tls, shutdown).await?;
+        }
+        None => {
+            log::info!("listening on http://{addr}");
+            on_ready();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await?;
+        }
+    }
 
     log::info!("shutdown complete");
     Ok(())

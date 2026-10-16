@@ -19,6 +19,7 @@ pub use m3_hash;
 pub use m3_ner_ort;
 pub use m3_rank;
 pub use m3_redact;
+pub use m3_resilience;
 pub use m3_route;
 pub use m3_vector;
 
@@ -910,10 +911,12 @@ impl PyGraphIndex {
     }
 }
 
-/// Circuit breaker: N consecutive failures trip it open for `reset_after_secs`.
+/// Circuit breaker: N consecutive failures trip it open for `reset_after_secs`;
+/// then one probe is admitted, and a probe that never reports is presumed lost
+/// after another `reset_after_secs`. The state machine is `m3_resilience`'s.
 #[pyclass(name = "CircuitBreaker")]
 struct PyCircuitBreaker {
-    inner: m3_graph::CircuitBreaker,
+    inner: m3_resilience::CircuitBreaker,
 }
 
 #[pymethods]
@@ -921,36 +924,53 @@ impl PyCircuitBreaker {
     #[new]
     fn new(threshold: u32, reset_after_secs: f64) -> PyResult<Self> {
         Ok(PyCircuitBreaker {
-            inner: m3_graph::CircuitBreaker::new(threshold, duration_arg("reset_after_secs", reset_after_secs)?),
+            inner: m3_resilience::CircuitBreaker::new(threshold, duration_arg("reset_after_secs", reset_after_secs)?),
         })
     }
 
     /// One of `"closed"`, `"open"`, `"half_open"`.
     fn state(&self) -> &'static str {
         match self.inner.state() {
-            m3_graph::BreakerState::Closed => "closed",
-            m3_graph::BreakerState::Open => "open",
-            m3_graph::BreakerState::HalfOpen => "half_open",
+            m3_resilience::BreakerState::Closed => "closed",
+            m3_resilience::BreakerState::Open => "open",
+            m3_resilience::BreakerState::HalfOpen => "half_open",
         }
     }
 
+    /// Admit a call. Past the cooldown this caller becomes the half-open probe
+    /// and must report through `record_success` / `record_failure`.
     fn allow_request(&mut self) -> bool {
         self.inner.allow_request()
+    }
+
+    /// Whether `allow_request` would admit a call now, without claiming the probe.
+    fn peek(&self) -> bool {
+        self.inner.peek()
     }
 
     fn record_success(&mut self) {
         self.inner.record_success();
     }
 
-    fn record_failure(&mut self) {
-        self.inner.record_failure();
+    /// Count a failure; `message`, when given, is kept as the last failure.
+    #[pyo3(signature = (message=None))]
+    fn record_failure(&mut self, message: Option<String>) {
+        match message {
+            Some(m) => self.inner.record_failure_with(m),
+            None => self.inner.record_failure(),
+        }
+    }
+
+    /// The most recent failure message recorded since the last success.
+    fn last_error(&self) -> Option<String> {
+        self.inner.last_error().map(str::to_owned)
     }
 }
 
 /// Exponential-backoff retry policy. `delay_for_attempt` is pure math.
 #[pyclass(name = "RetryPolicy")]
 struct PyRetryPolicy {
-    inner: m3_graph::RetryPolicy,
+    inner: m3_resilience::RetryPolicy,
 }
 
 #[pymethods]
@@ -958,7 +978,7 @@ impl PyRetryPolicy {
     #[new]
     fn new(max_attempts: u32, base_delay_secs: f64, max_delay_secs: f64) -> PyResult<Self> {
         Ok(PyRetryPolicy {
-            inner: m3_graph::RetryPolicy::new(
+            inner: m3_resilience::RetryPolicy::new(
                 max_attempts,
                 duration_arg("base_delay_secs", base_delay_secs)?,
                 duration_arg("max_delay_secs", max_delay_secs)?,

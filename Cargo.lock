@@ -1185,6 +1185,7 @@ dependencies = [
  "m3-ner-ort",
  "m3-rank",
  "m3-redact",
+ "m3-resilience",
  "m3-route",
  "m3-vector",
  "pyo3",
@@ -1216,6 +1217,7 @@ dependencies = [
  "criterion",
  "log",
  "m3-error",
+ "m3-resilience",
  "tokio",
 ]
 
@@ -1246,6 +1248,7 @@ dependencies = [
  "m3-dispatcher",
  "m3-embed-llamacpp",
  "m3-error",
+ "m3-resilience",
  "rcgen",
  "rustls",
  "serde",
@@ -1283,6 +1286,7 @@ name = "m3-graph"
 version = "3.10.16"
 dependencies = [
  "m3-error",
+ "m3-resilience",
  "petgraph",
 ]
 
@@ -1338,6 +1342,10 @@ dependencies = [
  "m3-error",
  "regex",
 ]
+
+[[package]]
+name = "m3-resilience"
+version = "3.10.16"
 
 [[package]]
 name = "m3-route"

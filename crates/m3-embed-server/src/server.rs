@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use m3_dispatcher::{BreakerCfg, BreakerStatus, Dispatcher, DispatcherConfig};
 use m3_embed_llamacpp::{EmbeddedBackend, Tokenizer};
+use m3_resilience::ceil_secs;
 
 use crate::config::{self, ResolvedConfig};
 use crate::security;
@@ -377,10 +378,6 @@ fn describe_breaker(b: &BreakerStatus) -> String {
         _ if b.consecutive_failures > 0 => format!("closed, {} consecutive failure(s)", b.consecutive_failures),
         _ => "closed".into(),
     }
-}
-
-fn ceil_secs(d: std::time::Duration) -> u64 {
-    d.as_secs() + u64::from(d.subsec_nanos() > 0)
 }
 
 /// The reply for a failed backend call: 503 with Retry-After while the

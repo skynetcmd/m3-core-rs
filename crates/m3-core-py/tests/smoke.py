@@ -114,6 +114,24 @@ def test_resilience() -> None:
     cb.record_success()
     assert cb.state() == "closed"
 
+    # peek() never claims the half-open probe; a probe that never reports is
+    # presumed lost after another reset window.
+    import time
+
+    cb = m.CircuitBreaker(1, 0.2)
+    cb.record_failure("connection refused")
+    assert cb.last_error() == "connection refused"
+    assert not cb.peek() and not cb.allow_request()
+    time.sleep(0.25)
+    assert cb.state() == "half_open"
+    assert cb.peek() and cb.peek()
+    assert cb.allow_request()  # the probe, which never reports
+    assert not cb.peek() and not cb.allow_request()
+    time.sleep(0.25)
+    assert cb.allow_request(), "a lost probe must not refuse every call forever"
+    cb.record_success()
+    assert cb.state() == "closed" and cb.last_error() is None
+
     rp = m.RetryPolicy(5, 0.1, 2.0)
     assert rp.max_attempts == 5
     assert abs(rp.delay_for_attempt(1) - 0.1) < 1e-6

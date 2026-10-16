@@ -30,6 +30,7 @@ fips = ["rustls/fips", "aws-lc-rs/fips"]
 m3-embed-llamacpp = { workspace = true, features = [] }
 m3-dispatcher = { workspace = true }
 m3-error = { workspace = true }
+m3-resilience = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time"] }
 # Transport security (src/security.rs): rustls on aws-lc-rs, never ring.

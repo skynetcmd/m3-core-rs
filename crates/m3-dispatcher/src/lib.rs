@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use m3_error::{M3Error, Result};
+use m3_resilience::{ceil_secs, Admission, BreakerState, CircuitBreaker as SharedBreaker};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
 /// A unit of work flowing through the dispatcher: a set of texts to run
@@ -192,29 +193,19 @@ fn pct(sorted_us: &[u64], q: f64) -> f64 {
     sorted_us[idx] as f64 / 1000.0
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum BreakerState {
-    Closed,
-    Open,
-    HalfOpen,
-}
+pub use m3_resilience::BreakerStatus;
 
 // Encoded breaker states for the lock-free fast path.
 const BREAKER_CLOSED: u8 = 0;
 const BREAKER_OPEN: u8 = 1;
 const BREAKER_HALF_OPEN: u8 = 2;
 
-/// What the circuit breaker is doing, for a health probe or an error reply.
-#[derive(Debug, Clone, Default)]
-pub struct BreakerStatus {
-    /// Calls are being refused: open, and the cooldown has not elapsed.
-    pub open: bool,
-    /// Backend failures since the last success.
-    pub consecutive_failures: usize,
-    /// Cooldown left before a half-open probe is allowed; `None` unless `open`.
-    pub retry_after: Option<Duration>,
-    /// The most recent backend failure since the last success.
-    pub last_error: Option<String>,
+fn encode_state(s: BreakerState) -> u8 {
+    match s {
+        BreakerState::Closed => BREAKER_CLOSED,
+        BreakerState::Open => BREAKER_OPEN,
+        BreakerState::HalfOpen => BREAKER_HALF_OPEN,
+    }
 }
 
 /// A client error, not a backend fault: it must not open the breaker, or a
@@ -262,19 +253,19 @@ fn checked_rows(rows: Vec<Vec<f32>>, sent: usize) -> Result<Vec<Vec<f32>>> {
     }
 }
 
-/// N consecutive failures open the breaker; after `open_secs` exactly one
-/// half-open probe is admitted, and its success closes the breaker again (its
-/// failure re-opens it). A probe that never reports — its caller was
+/// The async face of `m3_resilience::CircuitBreaker`, which owns the state
+/// machine: N consecutive failures open the breaker; after `open_secs` exactly
+/// one half-open probe is admitted, and its success closes the breaker again
+/// (its failure re-opens it). A probe that never reports — its caller was
 /// cancelled, or it failed with a client error that records nothing — is
 /// presumed lost after another `open_secs`, and the next caller probes.
+///
+/// This type adds the async lock, a lock-free Closed fast path, and refusals
+/// worded as `M3Error`s. It makes no transition decisions of its own.
 pub struct CircuitBreaker {
-    cfg: BreakerCfg,
-    /// (state, consecutive failures, time of the last transition: opened at
-    /// when Open, probe admitted at when HalfOpen).
-    state: Mutex<(BreakerState, usize, Option<Instant>)>,
-    /// The latest failure's message, cleared on success. Locked after `state`.
-    last_error: std::sync::Mutex<Option<String>>,
-    /// Lock-free copy of the state for the Closed fast path.
+    core: Mutex<SharedBreaker>,
+    /// Lock-free copy of the recorded state for the Closed fast path, published
+    /// under the lock after every transition.
     state_fast: AtomicU8,
     /// Test-only count of `check()` calls answered by the lock-free path.
     #[cfg(test)]
@@ -283,10 +274,12 @@ pub struct CircuitBreaker {
 
 impl CircuitBreaker {
     pub fn new(cfg: BreakerCfg) -> Self {
+        // A threshold beyond u32 cannot be reached in practice; saturate rather
+        // than wrap to a small one.
+        let threshold = u32::try_from(cfg.failure_threshold).unwrap_or(u32::MAX);
+        let cooldown = Duration::from_secs(cfg.open_secs);
         Self {
-            cfg,
-            state: Mutex::new((BreakerState::Closed, 0, None)),
-            last_error: std::sync::Mutex::new(None),
+            core: Mutex::new(SharedBreaker::new(threshold, cooldown)),
             state_fast: AtomicU8::new(BREAKER_CLOSED),
             #[cfg(test)]
             fast_path_hits: AtomicUsize::new(0),
@@ -317,60 +310,44 @@ impl CircuitBreaker {
             self.fast_path_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
-        let mut g = self.state.lock().await;
-        let cooldown = Duration::from_secs(self.cfg.open_secs);
-        let elapsed = g.2.map(|t| t.elapsed()).unwrap_or(cooldown);
-        match g.0 {
-            BreakerState::Closed => Ok(()),
-            BreakerState::Open | BreakerState::HalfOpen if elapsed >= cooldown => {
-                if admit {
-                    g.0 = BreakerState::HalfOpen;
-                    g.2 = Some(Instant::now());
-                    self.state_fast.store(BREAKER_HALF_OPEN, Ordering::Release);
-                }
-                Ok(())
-            }
-            BreakerState::HalfOpen => Err(M3Error::Backend(format!(
+        let mut core = self.core.lock().await;
+        let admission = if admit { core.admit() } else { core.check() };
+        self.publish(&core);
+        let last = core.last_error().unwrap_or("(not recorded)");
+        match admission {
+            Admission::Allowed => Ok(()),
+            Admission::ProbeOutstanding { retry_after } => Err(M3Error::Backend(format!(
                 "circuit breaker half-open: a probe call is testing the backend after {} consecutive \
-                 failures; refusing other calls for up to {}s until it reports; last failure: {}",
-                g.1,
-                (cooldown - elapsed).as_secs() + 1,
-                self.last_error().as_deref().unwrap_or("(not recorded)"),
+                 failures; refusing other calls for up to {}s until it reports; last failure: {last}",
+                core.consecutive_failures(),
+                ceil_secs(retry_after),
             ))),
-            BreakerState::Open => {
-                // The refusal names why and for how long; "circuit breaker
-                // open" alone hid the failure that opened it.
-                let last = self.last_error();
-                Err(M3Error::Backend(format!(
-                    "circuit breaker open after {} consecutive backend failures; refusing calls for \
-                     another {}s; last failure: {}",
-                    g.1,
-                    (cooldown - elapsed).as_secs() + 1,
-                    last.as_deref().unwrap_or("(not recorded)"),
-                )))
-            }
+            // The refusal names why and for how long; "circuit breaker open"
+            // alone hid the failure that opened it.
+            Admission::Open { retry_after } => Err(M3Error::Backend(format!(
+                "circuit breaker open after {} consecutive backend failures; refusing calls for \
+                 another {}s; last failure: {last}",
+                core.consecutive_failures(),
+                ceil_secs(retry_after),
+            ))),
         }
     }
 
-    fn last_error(&self) -> Option<String> {
-        self.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    fn publish(&self, core: &SharedBreaker) {
+        let encoded = encode_state(core.recorded_state());
+        self.state_fast.store(encoded, Ordering::Release);
     }
 
     pub async fn record_success(&self) {
-        let mut g = self.state.lock().await;
-        *g = (BreakerState::Closed, 0, None);
-        *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        self.state_fast.store(BREAKER_CLOSED, Ordering::Release);
+        let mut core = self.core.lock().await;
+        core.record_success();
+        self.publish(&core);
     }
 
     pub async fn record_failure(&self) {
-        let mut g = self.state.lock().await;
-        g.1 += 1;
-        if g.1 >= self.cfg.failure_threshold || g.0 == BreakerState::HalfOpen {
-            g.0 = BreakerState::Open;
-            g.2 = Some(Instant::now());
-            self.state_fast.store(BREAKER_OPEN, Ordering::Release);
-        }
+        let mut core = self.core.lock().await;
+        core.record_failure();
+        self.publish(&core);
     }
 
     /// `record_failure`, keeping `why` for the refusal message and `status`.
@@ -379,28 +356,16 @@ impl CircuitBreaker {
             M3Error::Backend(m) => m.clone(),
             other => other.to_string(),
         };
-        *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
-        self.record_failure().await;
+        let mut core = self.core.lock().await;
+        core.record_failure_with(why);
+        self.publish(&core);
     }
 
     /// The breaker as a caller would meet it now. Open past its cooldown reads
     /// as not open: the next call is let through as the half-open probe. While
     /// a probe is outstanding other calls are refused, so that reads as open.
     pub async fn status(&self) -> BreakerStatus {
-        let g = self.state.lock().await;
-        let left = match (g.0, g.2) {
-            (BreakerState::Open | BreakerState::HalfOpen, Some(t)) => {
-                Duration::from_secs(self.cfg.open_secs).checked_sub(t.elapsed())
-            }
-            _ => None,
-        }
-        .filter(|d| !d.is_zero());
-        BreakerStatus {
-            open: left.is_some(),
-            consecutive_failures: g.1,
-            retry_after: left,
-            last_error: self.last_error(),
-        }
+        self.core.lock().await.status()
     }
 }
 
@@ -1017,35 +982,68 @@ mod tests {
         assert_eq!(cb.fast_path_hits.load(Ordering::Relaxed), before + 1);
     }
 
+    /// An instant `secs` ago, to put the breaker past its cooldown without
+    /// sleeping through it. The state machine itself is tested in
+    /// m3-resilience with injected instants; these tests cover the wrapper.
+    fn ago(secs: u64) -> Instant {
+        Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .expect("the monotonic clock reaches back far enough for a test")
+    }
+
+    /// The refusal names the consecutive failures, the seconds left and the
+    /// last failure; `peek` refuses with the same words.
+    #[tokio::test]
+    async fn refusal_names_failures_cooldown_and_last_error() {
+        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 2, open_secs: 60 });
+        let why = M3Error::Backend("connection refused".to_string());
+        cb.record_failure_because(&why).await;
+        cb.record_failure_because(&why).await;
+        let e = cb.check().await.unwrap_err().to_string();
+        assert!(e.contains("circuit breaker open after 2 consecutive backend failures"), "{e}");
+        assert!(e.contains("another 60s"), "{e}");
+        assert!(e.contains("last failure: connection refused"), "{e}");
+        assert_eq!(cb.peek().await.unwrap_err().to_string(), e);
+        let st = cb.status().await;
+        assert!(st.open);
+        assert_eq!(st.consecutive_failures, 2);
+        assert_eq!(st.last_error.as_deref(), Some("connection refused"));
+        cb.record_success().await;
+        assert_eq!(cb.status().await, BreakerStatus::default());
+    }
+
     /// Half-open admits ONE probe; `peek` never claims it; the probe's result
-    /// decides. Every caller used to be let through half-open.
+    /// decides.
     #[tokio::test]
     async fn half_open_admits_a_single_probe() {
-        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 1, open_secs: 1 });
+        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 1, open_secs: 60 });
         cb.record_failure().await;
         assert!(cb.check().await.is_err(), "open inside the cooldown");
-        tokio::time::sleep(Duration::from_millis(1050)).await;
-        assert!(cb.peek().await.is_ok(), "peek sees a probe would be admitted");
-        assert!(cb.peek().await.is_ok(), "and peeking did not claim it");
+        cb.core.lock().await.record_failure_at(ago(61));
+        assert!(cb.peek().await.is_ok(), "peek: a probe would go");
+        assert!(cb.peek().await.is_ok(), "and peek did not claim it");
         assert!(cb.check().await.is_ok(), "the first check is the probe");
         let e = cb.check().await.unwrap_err().to_string();
         assert!(e.contains("half-open"), "a second caller is refused: {e}");
+        assert!(e.contains("up to 60s"), "{e}");
         assert!(cb.peek().await.is_err());
         assert!(cb.status().await.open, "refusing others reads as open");
         cb.record_success().await;
+        assert_eq!(cb.state_fast.load(Ordering::Acquire), BREAKER_CLOSED);
         assert!(cb.check().await.is_ok() && cb.check().await.is_ok(), "closed again");
     }
 
     /// A failed probe re-opens the breaker for a fresh cooldown.
     #[tokio::test]
     async fn a_failed_probe_reopens() {
-        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 3, open_secs: 1 });
+        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 3, open_secs: 60 });
         for _ in 0..3 {
-            cb.record_failure().await;
+            cb.core.lock().await.record_failure_at(ago(61));
         }
-        tokio::time::sleep(Duration::from_millis(1050)).await;
+        cb.publish(&*cb.core.lock().await);
         assert!(cb.check().await.is_ok());
         cb.record_failure().await;
+        assert_eq!(cb.state_fast.load(Ordering::Acquire), BREAKER_OPEN);
         let e = cb.check().await.unwrap_err().to_string();
         assert!(e.contains("circuit breaker open"), "{e}");
     }

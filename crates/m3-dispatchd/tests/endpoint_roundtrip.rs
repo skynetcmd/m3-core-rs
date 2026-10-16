@@ -95,3 +95,65 @@ async fn no_endpoint_is_no_daemon() {
         .unwrap_err();
     assert!(matches!(err, ClientError::NoDaemon(_)), "{err}");
 }
+
+#[tokio::test]
+async fn m3_wait_exits_when_its_parent_closes_stdin() {
+    let ep = endpoint("stdin");
+    let hub = Arc::new(Hub::new(Duration::from_millis(20), Duration::from_secs(60)));
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = {
+        let ep = ep.clone();
+        tokio::spawn(async move {
+            ipc::serve(&ep, api::router(hub), async {
+                let _ = stop_rx.await;
+            })
+            .await
+        })
+    };
+    for _ in 0..100 {
+        if post(
+            &ep,
+            "/wait",
+            &serde_json::json!({ "readers": ["r"], "timeout_s": 0 }),
+        )
+        .await
+        .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_m3-wait"))
+        .args([
+            "--endpoint",
+            &ep,
+            "--reader",
+            "r",
+            "--timeout",
+            "60",
+            "--exit-when-stdin-closes",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "m3-wait should be blocked on the wait"
+    );
+    drop(child.stdin.take()); // the parent "dies"
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "m3-wait outlived its parent"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status.code(), Some(4));
+    let _ = stop_tx.send(());
+    server.await.unwrap().unwrap();
+}

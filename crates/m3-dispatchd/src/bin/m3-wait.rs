@@ -7,7 +7,12 @@
 //! again, and any other code is passed through. CMD is how m3 confirms and
 //! stamps receipt in its store: the daemon issues no SQL.
 //!
-//! Exit: 0 woke, 1 error, 2 timed out, 3 no daemon (the caller polls instead).
+//! `--exit-when-stdin-closes`: exit (code 4) when stdin reaches end of file. A
+//! parent that holds the pipe open ends this process by dying, however it dies,
+//! so a killed parent leaves no waiter behind running confirm commands.
+//!
+//! Exit: 0 woke, 1 error, 2 timed out, 3 no daemon (the caller polls instead),
+//! 4 stdin closed.
 
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -15,6 +20,7 @@ use std::time::{Duration, Instant};
 use m3_dispatchd::client::{post, ClientError};
 
 const KEEP_WAITING: i32 = 75;
+const STDIN_CLOSED: i32 = 4;
 /// The daemon caps one wait at an hour (api::MAX_WAIT); longer waits re-wait.
 const ONE_WAIT_S: f64 = 3600.0;
 
@@ -24,10 +30,11 @@ struct Args {
     readers: Vec<String>,
     timeout: Duration,
     then: Vec<String>,
+    exit_when_stdin_closes: bool,
 }
 
 fn usage() -> &'static str {
-    "usage: m3-wait --endpoint PATH --reader ID [--reader ID ...] [--timeout SECONDS] [-- CMD ARGS...]"
+    "usage: m3-wait --endpoint PATH --reader ID [--reader ID ...] [--timeout SECONDS] [--exit-when-stdin-closes] [-- CMD ARGS...]"
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -36,6 +43,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         None => (argv, Vec::new()),
     };
     let (mut endpoint, mut readers, mut timeout) = (None, Vec::new(), 3600.0_f64);
+    let mut exit_when_stdin_closes = false;
     let mut it = own.iter();
     while let Some(a) = it.next() {
         let mut val = || {
@@ -46,6 +54,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         match a.as_str() {
             "--endpoint" => endpoint = Some(val()?),
             "--reader" => readers.push(val()?),
+            "--exit-when-stdin-closes" => exit_when_stdin_closes = true,
             "--timeout" => {
                 timeout = val()?.parse().map_err(|e| format!("--timeout: {e}"))?;
                 if !(timeout.is_finite() && timeout >= 0.0) {
@@ -67,6 +76,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         readers,
         timeout: Duration::from_secs_f64(timeout),
         then,
+        exit_when_stdin_closes,
     })
 }
 
@@ -75,6 +85,8 @@ fn run_then(then: &[String], wake: &str) -> Result<i32, String> {
     let status = std::process::Command::new(&then[0])
         .args(&then[1..])
         .env("M3_WAKE", wake)
+        // Not this process's stdin: that may be the parent's liveness pipe.
+        .stdin(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("cannot run {}: {e}", then[0]))?;
     // A child killed by a signal has no code; treat it as an error.
@@ -152,6 +164,16 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if args.exit_when_stdin_closes {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut sink = [0u8; 256];
+            let mut stdin = std::io::stdin();
+            // Bytes are ignored; end of file or an error means the parent is gone.
+            while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+            std::process::exit(STDIN_CLOSED);
+        });
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -214,5 +236,21 @@ mod tests {
         ]))
         .is_err());
         assert!(parse(&v(&["--endpoint", "/s", "--reader", "a", "--bogus"])).is_err());
+        assert!(
+            !parse(&v(&["--endpoint", "/s", "--reader", "a"]))
+                .unwrap()
+                .exit_when_stdin_closes
+        );
+        assert!(
+            parse(&v(&[
+                "--endpoint",
+                "/s",
+                "--reader",
+                "a",
+                "--exit-when-stdin-closes"
+            ]))
+            .unwrap()
+            .exit_when_stdin_closes
+        );
     }
 }

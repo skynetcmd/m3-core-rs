@@ -30,11 +30,11 @@ mod service;
 // render_unit/SERVICE_NAME → Linux), so *every* single-platform build leaves
 // some of them unused. `allow(dead_code)` module-wide is correct here — the
 // `#[cfg(test)]` render tests exercise all of them regardless of host.
+#[cfg(all(not(windows), feature = "embedded"))]
+mod service_unix;
 #[cfg(feature = "embedded")]
 #[allow(dead_code)]
 mod unit_render;
-#[cfg(all(not(windows), feature = "embedded"))]
-mod service_unix;
 
 #[cfg(not(feature = "embedded"))]
 fn main() -> anyhow::Result<()> {
@@ -168,13 +168,22 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
             "--token-sha256" => &mut token,
             other => anyhow::bail!("unknown option {other:?}\n{usage}"),
         };
-        *slot = Some(it.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value\n{usage}"))?.clone());
+        *slot = Some(
+            it.next()
+                .ok_or_else(|| anyhow::anyhow!("{a} needs a value\n{usage}"))?
+                .clone(),
+        );
     }
-    let missing: Vec<&str> = [("--listen", &listen), ("--cert", &cert), ("--key", &key), ("--token-sha256", &token)]
-        .into_iter()
-        .filter(|(_, v)| v.is_none())
-        .map(|(name, _)| name)
-        .collect();
+    let missing: Vec<&str> = [
+        ("--listen", &listen),
+        ("--cert", &cert),
+        ("--key", &key),
+        ("--token-sha256", &token),
+    ]
+    .into_iter()
+    .filter(|(_, v)| v.is_none())
+    .map(|(name, _)| name)
+    .collect();
     let (Some(listen), Some(cert), Some(key), Some(token)) = (listen, cert, key, token) else {
         anyhow::bail!("secure is missing {}\n{usage}", missing.join(", "));
     };
@@ -186,7 +195,10 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
     sec.tls_cert = Some(cert.clone());
     sec.tls_key = Some(key.clone());
     sec.token_sha256 = Some(token.trim().to_ascii_lowercase());
-    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), file.embed.port.unwrap_or(config::DEFAULT_PORT));
+    let local = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        file.embed.port.unwrap_or(config::DEFAULT_PORT),
+    );
     let remote = security::plan(local, &sec)?.remote.map(|r| r.addr);
     write(&config::SecurityKeys {
         remote_listen: sec.remote_listen.as_deref(),
@@ -227,9 +239,7 @@ fn run_foreground() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let result = runtime.block_on(async move {
-        server::run(cfg, shutdown_signal()).await
-    });
+    let result = runtime.block_on(async move { server::run(cfg, shutdown_signal()).await });
     if let Err(e) = &result {
         if e.downcast_ref::<server::PortInUse>().is_some() {
             log::error!("{e}");

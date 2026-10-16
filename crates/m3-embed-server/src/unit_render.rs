@@ -101,7 +101,11 @@ mod tests {
 
     #[test]
     fn plist_has_label_exe_gguf_and_log() {
-        let p = render_plist("/usr/local/bin/m3-embed-server", "/models/bge-m3.gguf", "/tmp/svc.log");
+        let p = render_plist(
+            "/usr/local/bin/m3-embed-server",
+            "/models/bge-m3.gguf",
+            "/tmp/svc.log",
+        );
         assert!(p.contains(&format!("<string>{LAUNCHD_LABEL}</string>")));
         assert!(p.contains("<string>/usr/local/bin/m3-embed-server</string>"));
         // GGUF is pinned in EnvironmentVariables, keyed M3_EMBED_GGUF.
@@ -145,7 +149,10 @@ mod tests {
 
     #[test]
     fn unit_quotes_and_escapes_gguf_with_spaces_and_backslashes() {
-        let u = render_unit("/bin/m3-embed-server", r#"/m/with space/and"quote/bge.gguf"#);
+        let u = render_unit(
+            "/bin/m3-embed-server",
+            r#"/m/with space/and"quote/bge.gguf"#,
+        );
         // Backslash-escaped quote inside the double-quoted Environment= value.
         assert!(u.contains(r#"Environment="M3_EMBED_GGUF=/m/with space/and\"quote/bge.gguf""#));
     }

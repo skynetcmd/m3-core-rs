@@ -74,7 +74,9 @@ pub fn decode_spans(
     threshold: f32,
 ) -> Result<Vec<Span>> {
     let (max_spans, span_width, num_labels) = shape;
-    let expected = max_spans.checked_mul(span_width).and_then(|n| n.checked_mul(num_labels));
+    let expected = max_spans
+        .checked_mul(span_width)
+        .and_then(|n| n.checked_mul(num_labels));
     if expected != Some(scores.len()) {
         return Err(M3Error::Config(format!(
             "decode_spans: {} scores do not fit shape ({max_spans}, {span_width}, {num_labels}) = {}",
@@ -88,7 +90,12 @@ pub fn decode_spans(
             for l in 0..num_labels {
                 let score = scores[(s * span_width + w) * num_labels + l];
                 if score >= threshold {
-                    candidates.push(Span { start: s, end: s + w + 1, label: l, score });
+                    candidates.push(Span {
+                        start: s,
+                        end: s + w + 1,
+                        label: l,
+                        score,
+                    });
                 }
             }
         }
@@ -112,9 +119,9 @@ pub fn decode_spans(
             continue;
         }
         // Dedup identical span+label (different widths could collide post-filter).
-        let dup = accepted.iter().any(|a| {
-            a.start == cand.start && a.end == cand.end && a.label == cand.label
-        });
+        let dup = accepted
+            .iter()
+            .any(|a| a.start == cand.start && a.end == cand.end && a.label == cand.label);
         if !dup {
             accepted.push(cand);
         }
@@ -188,9 +195,9 @@ impl ModelBackend for OrtNer {
 #[cfg(feature = "onnx")]
 mod onnx_backend {
     use super::{decode_spans, ep_priority, Platform, Quant};
-    use ort::ep::ExecutionProvider;
     use m3_dispatcher::{Batch, BatchOutput, ModelBackend};
     use m3_error::{M3Error, Result};
+    use ort::ep::ExecutionProvider;
     use std::sync::Mutex;
     use tokenizers::Tokenizer;
 
@@ -273,12 +280,15 @@ mod onnx_backend {
             let mut builder = ort::session::Session::builder()
                 .map_err(|e| M3Error::Backend(format!("ort session builder: {e}")))?;
             register_execution_providers(&mut builder, &ep_order);
-            let session = builder
-                .commit_from_file(model_path)
-                .map_err(|e| M3Error::Backend(format!("ort could not load NER model '{model_path}': {e}")))?;
+            let session = builder.commit_from_file(model_path).map_err(|e| {
+                M3Error::Backend(format!("ort could not load NER model '{model_path}': {e}"))
+            })?;
 
-            let tokenizer = Tokenizer::from_file(tokenizer_path)
-                .map_err(|e| M3Error::Backend(format!("could not load NER tokenizer '{tokenizer_path}': {e}")))?;
+            let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
+                M3Error::Backend(format!(
+                    "could not load NER tokenizer '{tokenizer_path}': {e}"
+                ))
+            })?;
 
             Ok(Self {
                 session: Mutex::new(session),
@@ -341,7 +351,9 @@ mod onnx_backend {
                  {:?} registered",
                 &order[..order.len() - 1]
             ),
-            None => log::warn!("NER: no execution provider registered; ONNX Runtime will use its default (CPU)"),
+            None => log::warn!(
+                "NER: no execution provider registered; ONNX Runtime will use its default (CPU)"
+            ),
             _ => {}
         }
         first
@@ -445,7 +457,10 @@ mod tests {
 
     #[test]
     fn ep_priority_tables() {
-        assert_eq!(ep_priority(Platform::LinuxNvidia), ["CUDA", "TensorRT", "CPU"]);
+        assert_eq!(
+            ep_priority(Platform::LinuxNvidia),
+            ["CUDA", "TensorRT", "CPU"]
+        );
         assert_eq!(ep_priority(Platform::LinuxAmd), ["ROCm", "CPU"]);
         assert_eq!(ep_priority(Platform::LinuxIntelGpu), ["OpenVINO", "CPU"]);
         assert_eq!(ep_priority(Platform::Windows), ["DirectML", "CPU"]);
@@ -470,8 +485,24 @@ mod tests {
         let scores = vec![0.9, 0.1, 0.2, 0.8];
         let spans = decode_spans(&scores, (2, 1, 2), 0.5).unwrap();
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0], Span { start: 0, end: 1, label: 0, score: 0.9 });
-        assert_eq!(spans[1], Span { start: 1, end: 2, label: 1, score: 0.8 });
+        assert_eq!(
+            spans[0],
+            Span {
+                start: 0,
+                end: 1,
+                label: 0,
+                score: 0.9
+            }
+        );
+        assert_eq!(
+            spans[1],
+            Span {
+                start: 1,
+                end: 2,
+                label: 1,
+                score: 0.8
+            }
+        );
     }
 
     #[test]
@@ -497,8 +528,24 @@ mod tests {
         scores[idx(2, 0, 0)] = 0.7; // start 2, width idx 0 -> [2,3)
         let spans = decode_spans(&scores, (3, 2, 1), 0.5).unwrap();
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0], Span { start: 0, end: 2, label: 0, score: 0.95 });
-        assert_eq!(spans[1], Span { start: 2, end: 3, label: 0, score: 0.7 });
+        assert_eq!(
+            spans[0],
+            Span {
+                start: 0,
+                end: 2,
+                label: 0,
+                score: 0.95
+            }
+        );
+        assert_eq!(
+            spans[1],
+            Span {
+                start: 2,
+                end: 3,
+                label: 0,
+                score: 0.7
+            }
+        );
     }
 
     #[test]
@@ -509,9 +556,14 @@ mod tests {
 
     #[test]
     fn decode_spans_rejects_a_shape_that_does_not_fit() {
-        let e = decode_spans(&[0.9, 0.1, 0.2], (2, 1, 2), 0.5).unwrap_err().to_string();
+        let e = decode_spans(&[0.9, 0.1, 0.2], (2, 1, 2), 0.5)
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("3 scores") && e.contains("4 scores"), "{e}");
-        assert!(decode_spans(&[], (usize::MAX, 2, 2), 0.5).is_err(), "overflow is an error, not a panic");
+        assert!(
+            decode_spans(&[], (usize::MAX, 2, 2), 0.5).is_err(),
+            "overflow is an error, not a panic"
+        );
     }
 
     #[cfg(not(feature = "onnx"))]
@@ -541,8 +593,8 @@ mod tests {
         // `init_from` loads the dylib explicitly; `init` would read
         // ORT_DYLIB_PATH. Either way, building a SessionBuilder forces the
         // dylib to be resolved and its API table bound.
-        let path = std::env::var("ORT_DYLIB_PATH")
-            .expect("set ORT_DYLIB_PATH to the onnxruntime DLL");
+        let path =
+            std::env::var("ORT_DYLIB_PATH").expect("set ORT_DYLIB_PATH to the onnxruntime DLL");
         ort::init_from(&path)
             .expect("ort::init_from failed to load the onnxruntime DLL")
             .with_name("m3-ner-ort-test")

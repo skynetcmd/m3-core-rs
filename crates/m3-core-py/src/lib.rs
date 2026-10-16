@@ -8,7 +8,7 @@
 use pyo3::exceptions::{PyException, PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyTuple, PyString, PyType};
+use pyo3::types::{PyDict, PyString, PyTuple, PyType};
 
 pub use m3_dispatcher;
 pub use m3_embed_llamacpp;
@@ -60,14 +60,38 @@ static EXC_TYPES: PyOnceLock<ExcTypes> = PyOnceLock::new();
 
 /// (Python name, builtin base is OSError, docstring) for each typed exception.
 const EXC_SPECS: [(&str, bool, &str); 8] = [
-    ("InputTooLong", false, "An input exceeds the model's context window (attributes: tokens, n_ctx, index)."),
-    ("VectorDimMismatch", false, "A vector has the wrong dimension (attributes: expected, got, index)."),
-    ("ConfigError", false, "An argument or configuration value is invalid."),
-    ("BackendError", true, "The model backend failed (a load, a worker, the circuit breaker)."),
-    ("IoError", true, "A filesystem or OS operation failed (errno set when the OS reported one)."),
+    (
+        "InputTooLong",
+        false,
+        "An input exceeds the model's context window (attributes: tokens, n_ctx, index).",
+    ),
+    (
+        "VectorDimMismatch",
+        false,
+        "A vector has the wrong dimension (attributes: expected, got, index).",
+    ),
+    (
+        "ConfigError",
+        false,
+        "An argument or configuration value is invalid.",
+    ),
+    (
+        "BackendError",
+        true,
+        "The model backend failed (a load, a worker, the circuit breaker).",
+    ),
+    (
+        "IoError",
+        true,
+        "A filesystem or OS operation failed (errno set when the OS reported one).",
+    ),
     ("DatabaseLockedError", true, "The database is locked."),
     ("ParityError", false, "A Rust/Python parity check failed."),
-    ("M3ValueError", false, "Any other invalid value reported by the Rust core."),
+    (
+        "M3ValueError",
+        false,
+        "Any other invalid value reported by the Rust core.",
+    ),
 ];
 
 fn exc_types(py: Python<'_>) -> PyResult<&ExcTypes> {
@@ -77,7 +101,10 @@ fn exc_types(py: Python<'_>) -> PyResult<&ExcTypes> {
             let ns = PyDict::new(py);
             ns.set_item("__module__", "m3_core_rs")?;
             ns.set_item("__doc__", doc)?;
-            Ok(type_.call1((name, bases, ns))?.cast_into::<PyType>()?.unbind())
+            Ok(type_
+                .call1((name, bases, ns))?
+                .cast_into::<PyType>()?
+                .unbind())
         };
         let base = make(
             "M3Error",
@@ -86,8 +113,16 @@ fn exc_types(py: Python<'_>) -> PyResult<&ExcTypes> {
         )?;
         let mut sub = Vec::with_capacity(EXC_SPECS.len());
         for (name, os, doc) in EXC_SPECS {
-            let builtin = if os { py.get_type::<PyOSError>() } else { py.get_type::<PyValueError>() };
-            sub.push(make(name, PyTuple::new(py, [base.bind(py).clone(), builtin])?, doc)?);
+            let builtin = if os {
+                py.get_type::<PyOSError>()
+            } else {
+                py.get_type::<PyValueError>()
+            };
+            sub.push(make(
+                name,
+                PyTuple::new(py, [base.bind(py).clone(), builtin])?,
+                doc,
+            )?);
         }
         let mut it = sub.into_iter();
         let mut next = || it.next().expect("one type per EXC_SPECS entry");
@@ -115,14 +150,22 @@ fn to_pyerr(py: Python<'_>, e: M3Error) -> PyErr {
     let msg = e.to_string();
     let build = || -> PyResult<Bound<'_, PyAny>> {
         Ok(match &e {
-            M3Error::InputTooLong { tokens, n_ctx, index } => {
+            M3Error::InputTooLong {
+                tokens,
+                n_ctx,
+                index,
+            } => {
                 let x = t.input_too_long.bind(py).call1((msg.as_str(),))?;
                 x.setattr("tokens", *tokens)?;
                 x.setattr("n_ctx", *n_ctx)?;
                 x.setattr("index", *index)?;
                 x
             }
-            M3Error::VectorDimMismatch { expected, got, index } => {
+            M3Error::VectorDimMismatch {
+                expected,
+                got,
+                index,
+            } => {
                 let x = t.vector_dim_mismatch.bind(py).call1((msg.as_str(),))?;
                 x.setattr("expected", *expected)?;
                 x.setattr("got", *got)?;
@@ -194,7 +237,9 @@ fn packed_row_bytes(arg: &str, bytes: &[u8], dim: usize) -> PyResult<usize> {
 /// `ConfigError` naming the argument (`from_secs_f64` panics on them).
 fn duration_arg(arg: &str, secs: f64) -> PyResult<std::time::Duration> {
     std::time::Duration::try_from_secs_f64(secs).map_err(|e| {
-        config_err(format!("{arg} must be a finite, non-negative number of seconds; got {secs} ({e})"))
+        config_err(format!(
+            "{arg} must be a finite, non-negative number of seconds; got {secs} ({e})"
+        ))
     })
 }
 
@@ -253,7 +298,7 @@ fn cosine_batch_packed(
     blobs: Vec<Vec<u8>>,
     dim: usize,
 ) -> PyResult<Vec<f32>> {
-    py.detach(||{
+    py.detach(|| {
         let refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
         map_err(m3_vector::cosine_batch_packed(&query, &refs, dim))
     })
@@ -308,7 +353,11 @@ fn cosine_batch_maxpool_packed(
         let anchor_floats = m3_vector::decode_packed_row(anchors);
         let anchor_vecs: Vec<&[f32]> = anchor_floats.chunks_exact(dim).collect();
         let cand_refs: Vec<&[u8]> = blobs.chunks_exact(row_bytes).collect();
-        map_err(m3_vector::cosine_batch_maxpool_packed(&anchor_vecs, &cand_refs, dim))
+        map_err(m3_vector::cosine_batch_maxpool_packed(
+            &anchor_vecs,
+            &cand_refs,
+            dim,
+        ))
     })
 }
 
@@ -332,7 +381,7 @@ fn hybrid_score_batch(
     title_match_boost: f32,
     short_turn_threshold: u32,
 ) -> PyResult<Vec<f32>> {
-    py.detach(||{
+    py.detach(|| {
         map_err(m3_vector::hybrid_score_batch(
             &vector_scores,
             &bm25_scores,
@@ -355,12 +404,8 @@ fn hybrid_score_batch(
 /// Returns a list aligned 1:1 with `valid_froms`; caller adds to existing
 /// hybrid scores.
 #[pyfunction]
-fn recency_bonus_ranks(
-    py: Python<'_>,
-    valid_froms: Vec<Option<String>>,
-    bias: f32,
-) -> Vec<f32> {
-    py.detach(||m3_vector::recency_bonus_ranks(&valid_froms, bias))
+fn recency_bonus_ranks(py: Python<'_>, valid_froms: Vec<Option<String>>, bias: f32) -> Vec<f32> {
+    py.detach(|| m3_vector::recency_bonus_ranks(&valid_froms, bias))
 }
 
 #[pyfunction]
@@ -469,7 +514,10 @@ fn enforce_displacement_guard(
 ) -> Vec<usize> {
     let rows: Vec<m3_vector::DisplacementRow> = items
         .iter()
-        .map(|&(score, is_expansion)| m3_vector::DisplacementRow { score, is_expansion })
+        .map(|&(score, is_expansion)| m3_vector::DisplacementRow {
+            score,
+            is_expansion,
+        })
         .collect();
     m3_vector::displacement_permutation(&rows, protected_ranks, margin)
 }
@@ -478,7 +526,10 @@ fn enforce_displacement_guard(
 #[pyfunction]
 fn blob_as_f32(blob: Vec<u8>) -> PyResult<Vec<f32>> {
     if !blob.len().is_multiple_of(4) {
-        return Err(config_err(format!("blob length {} is not a multiple of 4 (f32 size)", blob.len())));
+        return Err(config_err(format!(
+            "blob length {} is not a multiple of 4 (f32 size)",
+            blob.len()
+        )));
     }
     Ok(m3_vector::decode_packed_row(&blob).into_owned())
 }
@@ -511,7 +562,9 @@ fn rank_hybrid(
     py.detach(|| {
         let refs: Vec<&[f32]> = embeddings.iter().map(|v| v.as_slice()).collect();
         let c_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
-        map_err(m3_vector::rank_hybrid(&relevance, &c_refs, &refs, lambda, k))
+        map_err(m3_vector::rank_hybrid(
+            &relevance, &c_refs, &refs, lambda, k,
+        ))
     })
 }
 
@@ -530,7 +583,9 @@ fn rank_hybrid_packed(
     py.detach(|| {
         let refs: Vec<&[f32]> = floats.chunks_exact(dim).collect();
         let c_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
-        map_err(m3_vector::rank_hybrid(&relevance, &c_refs, &refs, lambda, k))
+        map_err(m3_vector::rank_hybrid(
+            &relevance, &c_refs, &refs, lambda, k,
+        ))
     })
 }
 
@@ -648,7 +703,10 @@ impl PyRankRow {
         PyRankRow { id, score, source }
     }
     fn __repr__(&self) -> String {
-        format!("RankRow(id={:?}, score={}, source={:?})", self.id, self.score, self.source)
+        format!(
+            "RankRow(id={:?}, score={}, source={:?})",
+            self.id, self.score, self.source
+        )
     }
 }
 
@@ -665,16 +723,26 @@ fn source_from_str(s: &str) -> PyResult<m3_rank::RankSource> {
     match s.to_ascii_lowercase().as_str() {
         "vector" => Ok(m3_rank::RankSource::Vector),
         "fts" => Ok(m3_rank::RankSource::Fts),
-        _ => Err(config_err(format!("RankRow.source must be \"fts\" or \"vector\"; got {s:?}"))),
+        _ => Err(config_err(format!(
+            "RankRow.source must be \"fts\" or \"vector\"; got {s:?}"
+        ))),
     }
 }
 
 fn rankrow_in(r: &PyRankRow) -> PyResult<m3_rank::RankRow> {
-    Ok(m3_rank::RankRow { id: r.id.clone(), score: r.score, source: source_from_str(&r.source)? })
+    Ok(m3_rank::RankRow {
+        id: r.id.clone(),
+        score: r.score,
+        source: source_from_str(&r.source)?,
+    })
 }
 
 fn rankrow_out(r: m3_rank::RankRow) -> PyRankRow {
-    PyRankRow { id: r.id, score: r.score, source: source_to_str(r.source) }
+    PyRankRow {
+        id: r.id,
+        score: r.score,
+        source: source_to_str(r.source),
+    }
 }
 
 /// Fuse FTS5 and vector result sets with per-source weights (default 0.5/0.5).
@@ -687,9 +755,18 @@ fn fuse(
     vector_weight: f32,
 ) -> PyResult<Vec<PyRankRow>> {
     let fts_in = fts.iter().map(rankrow_in).collect::<PyResult<Vec<_>>>()?;
-    let vec_in = vector.iter().map(rankrow_in).collect::<PyResult<Vec<_>>>()?;
-    let weights = m3_rank::FusionWeights { fts: fts_weight, vector: vector_weight };
-    Ok(m3_rank::fuse(fts_in, vec_in, weights).into_iter().map(rankrow_out).collect())
+    let vec_in = vector
+        .iter()
+        .map(rankrow_in)
+        .collect::<PyResult<Vec<_>>>()?;
+    let weights = m3_rank::FusionWeights {
+        fts: fts_weight,
+        vector: vector_weight,
+    };
+    Ok(m3_rank::fuse(fts_in, vec_in, weights)
+        .into_iter()
+        .map(rankrow_out)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +813,10 @@ struct PyRouteDecision {
 #[pymethods]
 impl PyRouteDecision {
     fn __repr__(&self) -> String {
-        format!("RouteDecision(branch={:?}, confidence={})", self.branch, self.confidence)
+        format!(
+            "RouteDecision(branch={:?}, confidence={})",
+            self.branch, self.confidence
+        )
     }
 }
 
@@ -785,10 +865,14 @@ struct PyVectorIndex {
 
 impl PyVectorIndex {
     fn read(&self) -> PyResult<std::sync::RwLockReadGuard<'_, m3_vector::VectorIndex>> {
-        self.inner.read().map_err(|_| backend_err("vector index lock poisoned (an earlier call panicked)"))
+        self.inner
+            .read()
+            .map_err(|_| backend_err("vector index lock poisoned (an earlier call panicked)"))
     }
     fn write(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, m3_vector::VectorIndex>> {
-        self.inner.write().map_err(|_| backend_err("vector index lock poisoned (an earlier call panicked)"))
+        self.inner
+            .write()
+            .map_err(|_| backend_err("vector index lock poisoned (an earlier call panicked)"))
     }
 }
 
@@ -796,7 +880,9 @@ impl PyVectorIndex {
 impl PyVectorIndex {
     #[new]
     fn new(dim: usize) -> PyResult<Self> {
-        Ok(PyVectorIndex { inner: std::sync::RwLock::new(map_err(m3_vector::VectorIndex::new(dim))?) })
+        Ok(PyVectorIndex {
+            inner: std::sync::RwLock::new(map_err(m3_vector::VectorIndex::new(dim))?),
+        })
     }
 
     /// Insert or replace one vector per key from one contiguous `bytes` buffer
@@ -822,7 +908,9 @@ impl PyVectorIndex {
             let flat = m3_vector::decode_packed_row(blobs);
             match self.inner.write() {
                 Ok(mut idx) => idx.upsert_many(&keys, &flat),
-                Err(_) => Err(M3Error::Backend("vector index lock poisoned (an earlier call panicked)".into())),
+                Err(_) => Err(M3Error::Backend(
+                    "vector index lock poisoned (an earlier call panicked)".into(),
+                )),
             }
         });
         map_err(out)
@@ -837,10 +925,18 @@ impl PyVectorIndex {
     /// The `k` best `(key, approximate_cosine)` pairs, best first, optionally
     /// only among `allowed` keys. Re-score them exactly before trusting the order.
     #[pyo3(signature = (query, k, allowed=None))]
-    fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize, allowed: Option<Vec<i64>>) -> PyResult<Vec<(i64, f32)>> {
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: Vec<f32>,
+        k: usize,
+        allowed: Option<Vec<i64>>,
+    ) -> PyResult<Vec<(i64, f32)>> {
         let out = py.detach(|| match self.inner.read() {
             Ok(idx) => idx.search(&query, k, allowed.as_deref()),
-            Err(_) => Err(M3Error::Backend("vector index lock poisoned (an earlier call panicked)".into())),
+            Err(_) => Err(M3Error::Backend(
+                "vector index lock poisoned (an earlier call panicked)".into(),
+            )),
         });
         map_err(out)
     }
@@ -878,7 +974,9 @@ struct PyGraphIndex {
 impl PyGraphIndex {
     #[new]
     fn new() -> Self {
-        PyGraphIndex { inner: m3_graph::GraphIndex::new() }
+        PyGraphIndex {
+            inner: m3_graph::GraphIndex::new(),
+        }
     }
 
     fn add_node(&mut self, id: &str) {
@@ -924,7 +1022,10 @@ impl PyCircuitBreaker {
     #[new]
     fn new(threshold: u32, reset_after_secs: f64) -> PyResult<Self> {
         Ok(PyCircuitBreaker {
-            inner: m3_resilience::CircuitBreaker::new(threshold, duration_arg("reset_after_secs", reset_after_secs)?),
+            inner: m3_resilience::CircuitBreaker::new(
+                threshold,
+                duration_arg("reset_after_secs", reset_after_secs)?,
+            ),
         })
     }
 
@@ -1264,11 +1365,22 @@ impl PyOrtNer {
 /// `(max_spans, span_width, num_labels)`; `len(scores)` must equal its
 /// product (`ConfigError`, a `ValueError`, otherwise).
 #[pyfunction]
-fn decode_spans(scores: Vec<f32>, shape: (usize, usize, usize), threshold: f32) -> PyResult<Vec<PySpan>> {
-    Ok(map_err(m3_ner_ort::decode_spans(&scores, shape, threshold))?
-        .into_iter()
-        .map(|s| PySpan { start: s.start, end: s.end, label: s.label, score: s.score })
-        .collect())
+fn decode_spans(
+    scores: Vec<f32>,
+    shape: (usize, usize, usize),
+    threshold: f32,
+) -> PyResult<Vec<PySpan>> {
+    Ok(
+        map_err(m3_ner_ort::decode_spans(&scores, shape, threshold))?
+            .into_iter()
+            .map(|s| PySpan {
+                start: s.start,
+                end: s.end,
+                label: s.label,
+                score: s.score,
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1382,7 +1494,10 @@ fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let d = PyDict::new(py);
     d.set_item("M3_EMBED_STREAMS", config::embed_streams())?;
     d.set_item("M3_EMBED_COALESCE_MS", config::embed_coalesce_ms())?;
-    d.set_item("M3_EMBED_MAX_BATCH_TOKENS", config::embed_max_batch_tokens())?;
+    d.set_item(
+        "M3_EMBED_MAX_BATCH_TOKENS",
+        config::embed_max_batch_tokens(),
+    )?;
     d.set_item("M3_EMBED_CTX", config::embed_ctx())?;
     d.set_item("M3_EMBED_SEQ_MAX", config::embed_seq_max())?;
     d.set_item("M3_EMBED_N_BATCH", config::embed_n_batch())?;
@@ -1438,7 +1553,6 @@ fn format_log(
 
     Ok(out)
 }
-
 
 // ---------------------------------------------------------------------------
 // m3-embed-llamacpp — embedded (in-process) llama.cpp backend
@@ -1595,7 +1709,13 @@ impl PyEmbeddedEmbedder {
     /// windows, which over-count prose ~3x (192 vs 112 windows on 110 long
     /// memories, measured 2026-10-15). Releases the GIL.
     #[pyo3(signature = (text, budget, overlap))]
-    fn token_windows(&self, py: Python<'_>, text: String, budget: usize, overlap: usize) -> PyResult<Vec<(usize, usize)>> {
+    fn token_windows(
+        &self,
+        py: Python<'_>,
+        text: String,
+        budget: usize,
+        overlap: usize,
+    ) -> PyResult<Vec<(usize, usize)>> {
         let out = py.detach(|| self.backend.token_windows(&text, budget, overlap));
         map_err(out)
     }
@@ -1646,7 +1766,11 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
         env_logger::Builder::from_default_env()
     } else {
         let mut b = env_logger::Builder::new();
-        b.filter_level(if debug { log::LevelFilter::Debug } else { log::LevelFilter::Warn });
+        b.filter_level(if debug {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Warn
+        });
         b
     };
     if let Err(e) = builder.try_init() {
@@ -1656,7 +1780,10 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
             eprintln!("m3_core_rs: M3_DEBUG is set but Rust logging could not be enabled: {e}");
         }
     }
-    log::info!("m3_core_rs initialized (hash provider: {})", m3_hash::active_provider());
+    log::info!(
+        "m3_core_rs initialized (hash provider: {})",
+        m3_hash::active_provider()
+    );
     // Set llama.cpp's process env now, before any embedder thread exists (a
     // no-op except on CUDA builds; see m3_embed_llamacpp::prepare_process_env).
     #[cfg(feature = "embedded")]

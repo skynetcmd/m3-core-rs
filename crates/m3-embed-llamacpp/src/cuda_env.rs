@@ -83,7 +83,8 @@ pub(crate) fn detect_cuda_compute_caps() -> Result<Vec<(usize, f32)>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let stdout = String::from_utf8(out.stdout).map_err(|e| format!("nvidia-smi output is not UTF-8: {e}"))?;
+    let stdout = String::from_utf8(out.stdout)
+        .map_err(|e| format!("nvidia-smi output is not UTF-8: {e}"))?;
     parse_compute_caps(&stdout)
 }
 
@@ -95,17 +96,26 @@ pub(crate) fn parse_compute_caps(stdout: &str) -> Result<Vec<(usize, f32)>, Stri
         if line.is_empty() {
             continue;
         }
-        let (idx, cap) = line
-            .split_once(',')
-            .ok_or_else(|| format!("nvidia-smi line {}: expected `index, compute_cap`, got {line:?}", n + 1))?;
-        let idx = idx
-            .trim()
-            .parse::<usize>()
-            .map_err(|e| format!("nvidia-smi line {}: GPU index {:?} is not a number: {e}", n + 1, idx.trim()))?;
-        let cap = cap
-            .trim()
-            .parse::<f32>()
-            .map_err(|e| format!("nvidia-smi line {}: compute capability {:?} is not a number: {e}", n + 1, cap.trim()))?;
+        let (idx, cap) = line.split_once(',').ok_or_else(|| {
+            format!(
+                "nvidia-smi line {}: expected `index, compute_cap`, got {line:?}",
+                n + 1
+            )
+        })?;
+        let idx = idx.trim().parse::<usize>().map_err(|e| {
+            format!(
+                "nvidia-smi line {}: GPU index {:?} is not a number: {e}",
+                n + 1,
+                idx.trim()
+            )
+        })?;
+        let cap = cap.trim().parse::<f32>().map_err(|e| {
+            format!(
+                "nvidia-smi line {}: compute capability {:?} is not a number: {e}",
+                n + 1,
+                cap.trim()
+            )
+        })?;
         gpus.push((idx, cap));
     }
     if gpus.is_empty() {
@@ -128,7 +138,11 @@ mod tests {
     fn each_failure_names_its_cause() {
         assert!(parse_compute_caps("").unwrap_err().contains("no GPUs"));
         assert!(parse_compute_caps("8.9").unwrap_err().contains("line 1"));
-        assert!(parse_compute_caps("0, [N/A]").unwrap_err().contains("compute capability"));
-        assert!(parse_compute_caps("x, 8.9").unwrap_err().contains("GPU index"));
+        assert!(parse_compute_caps("0, [N/A]")
+            .unwrap_err()
+            .contains("compute capability"));
+        assert!(parse_compute_caps("x, 8.9")
+            .unwrap_err()
+            .contains("GPU index"));
     }
 }

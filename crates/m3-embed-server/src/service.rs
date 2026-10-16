@@ -63,8 +63,14 @@ pub fn log_files_hint() -> String {
             .map(|e| e.path())
     });
     match newest {
-        Some(p) => format!("{} (newest of the daily service.log.YYYY-MM-DD files)", p.display()),
-        None => format!("{}.YYYY-MM-DD (one file per UTC day; none written yet)", base.display()),
+        Some(p) => format!(
+            "{} (newest of the daily service.log.YYYY-MM-DD files)",
+            p.display()
+        ),
+        None => format!(
+            "{}.YYYY-MM-DD (one file per UTC day; none written yet)",
+            base.display()
+        ),
     }
 }
 
@@ -78,7 +84,9 @@ fn exit_code_meaning(code: ServiceExitCode) -> String {
             format!("service exit code {c}: the configuration was refused")
         }
         ServiceExitCode::ServiceSpecific(c) => format!("service exit code {c}: startup failed"),
-        ServiceExitCode::Win32(0) => "Windows exit code 0: it stopped without reporting a failure".into(),
+        ServiceExitCode::Win32(0) => {
+            "Windows exit code 0: it stopped without reporting a failure".into()
+        }
         ServiceExitCode::Win32(c) => format!("Windows exit code {c}"),
     }
 }
@@ -102,20 +110,27 @@ fn prune_old_logs(log_dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(log_dir) else {
         return;
     };
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(Duration::from_secs(14 * 24 * 60 * 60));
-    let Some(cutoff) = cutoff else { return; };
+    let cutoff = std::time::SystemTime::now().checked_sub(Duration::from_secs(14 * 24 * 60 * 60));
+    let Some(cutoff) = cutoff else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue; };
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
         // Match rolled logs: "service.log.YYYY-MM-DD". Leave the active
         // "service.log" file alone (tracing-appender::rolling::daily writes
         // dated filenames by default, but be conservative).
         if !name.starts_with("service.log.") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue; };
-        let Ok(modified) = meta.modified() else { continue; };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if modified < cutoff {
             let _ = std::fs::remove_file(&path);
         }
@@ -199,7 +214,8 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         // under SYSTEM, but `resolve` honors them when present).
         let file_cfg = config::load_file_config(&config::default_config_path())
             .map_err(|e| format!("{e:#}"))?;
-        let cfg = config::resolve(&file_cfg).map_err(|e| format!("config resolve failed: {e:#}"))?;
+        let cfg =
+            config::resolve(&file_cfg).map_err(|e| format!("config resolve failed: {e:#}"))?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -230,9 +246,13 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         runtime
-            .block_on(crate::server::run_with_ready(cfg, async move {
-                let _ = tk_rx.await;
-            }, on_ready))
+            .block_on(crate::server::run_with_ready(
+                cfg,
+                async move {
+                    let _ = tk_rx.await;
+                },
+                on_ready,
+            ))
             .map_err(|e| {
                 port_in_use.set(e.downcast_ref::<crate::server::PortInUse>().is_some());
                 refused.set(e.downcast_ref::<crate::security::ConfigRefused>().is_some());
@@ -337,12 +357,14 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| {
         Box::<dyn std::error::Error>::from(match win32_code(&e) {
-            Some(ERROR_ACCESS_DENIED) => "cannot register the service: access denied (Windows error 5).\n  \
+            Some(ERROR_ACCESS_DENIED) => {
+                "cannot register the service: access denied (Windows error 5).\n  \
                  Registering a Windows Service requires Administrator rights.\n  \
                  Open an *Administrator* terminal and run: m3-embed-server install\n  \
                  (The service is NOT currently registered — this is not the \
                  already-installed case.)"
-                .to_string(),
+                    .to_string()
+            }
             Some(c) => format!(
                 "cannot register the service: opening the Service Control Manager failed with \
                  Windows error {c} ({e}). The service is NOT registered"
@@ -351,8 +373,9 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         })
     })?;
 
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot register the service: cannot resolve this executable's path: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        format!("cannot register the service: cannot resolve this executable's path: {e}")
+    })?;
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY),
@@ -367,7 +390,10 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let service = service_manager
-        .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+        .create_service(
+            &service_info,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
+        )
         .map_err(|e| open_failure("install", e))?;
     // Registered from here on: every later failure must say so, or the
     // operator retries an install that already happened.
@@ -402,14 +428,20 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         println!("wrote starter config: {}", cfg_path.display());
     } else {
-        println!("config already exists, not overwritten: {}", cfg_path.display());
+        println!(
+            "config already exists, not overwritten: {}",
+            cfg_path.display()
+        );
     }
 
     println!("service installed: {SERVICE_NAME}");
     println!("log files:         {}", log_files_hint());
     println!();
     println!("Next steps:");
-    println!("  1. Edit {} to confirm [embed].gguf is set.", cfg_path.display());
+    println!(
+        "  1. Edit {} to confirm [embed].gguf is set.",
+        cfg_path.display()
+    );
     println!("  2. Start it:  m3-embed-server start    (or: sc start {SERVICE_NAME})");
     Ok(())
 }
@@ -459,8 +491,7 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let service_access =
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
     let service = match service_manager.open_service(SERVICE_NAME, service_access) {
         Ok(s) => s,
         Err(windows_service::Error::Winapi(e))
@@ -482,7 +513,9 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
             match wait_for(&service, ServiceState::Stopped, 10).map(|s| s.current_state) {
                 Some(ServiceState::Stopped) => {}
                 Some(s) => eprintln!("WARN: {SERVICE_NAME} still {} after 10s", state_word(s)),
-                None => eprintln!("WARN: could not read {SERVICE_NAME}'s state while waiting for it to stop"),
+                None => eprintln!(
+                    "WARN: could not read {SERVICE_NAME}'s state while waiting for it to stop"
+                ),
             }
         }
     }
@@ -591,9 +624,11 @@ fn state_word(state: ServiceState) -> &'static str {
 
 /// Poll until the service reaches `want` or `secs` pass; returns the last
 /// observed state. A start or stop REQUEST is not its outcome.
-fn wait_for(service: &windows_service::service::Service, want: ServiceState, secs: u64)
-    -> Option<ServiceStatus>
-{
+fn wait_for(
+    service: &windows_service::service::Service,
+    want: ServiceState,
+    secs: u64,
+) -> Option<ServiceStatus> {
     let mut last = None;
     for _ in 0..(secs * 4) {
         last = service.query_status().ok();
@@ -657,7 +692,10 @@ pub fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let service = service_manager
-        .open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+        )
         .map_err(|e| open_failure("start", e))?;
 
     // Belt-and-braces: it could have started between the check and here.
@@ -678,12 +716,14 @@ pub fn start() -> Result<(), Box<dyn std::error::Error>> {
     match last.as_ref().map(|s| s.current_state) {
         Some(ServiceState::Running) => println!("{SERVICE_NAME}: running"),
         Some(ServiceState::Stopped) => {
-            let meaning = last.map(|s| exit_code_meaning(s.exit_code)).unwrap_or_default();
+            let meaning = last
+                .map(|s| exit_code_meaning(s.exit_code))
+                .unwrap_or_default();
             return Err(Box::<dyn std::error::Error>::from(format!(
                 "{SERVICE_NAME} started and then stopped ({meaning}). The reason is the last line of \
                  the service log: {}",
                 log_files_hint()
-            )))
+            )));
         }
         Some(other) => println!(
             "{SERVICE_NAME}: {} (still loading; `m3-embed-server status` shows when it is running)",
@@ -706,7 +746,10 @@ pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let service = service_manager
-        .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+        )
         .map_err(|e| open_failure("stop", e))?;
 
     match service.stop() {

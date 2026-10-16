@@ -38,7 +38,9 @@ fn home_dir() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| "$HOME is not set — cannot locate the per-user service directory".to_string())
+        .ok_or_else(|| {
+            "$HOME is not set — cannot locate the per-user service directory".to_string()
+        })
 }
 
 /// Absolute path to this executable — what the unit file's `ExecStart` /
@@ -51,7 +53,10 @@ fn current_exe() -> Result<PathBuf, String> {
 /// service environment so a login-less supervisor still finds the model.
 /// Resolved here (install time) the same way `config::resolve` does at runtime.
 fn resolve_gguf_for_unit() -> Result<String, String> {
-    if let Some(g) = std::env::var("M3_EMBED_GGUF").ok().filter(|s| !s.is_empty()) {
+    if let Some(g) = std::env::var("M3_EMBED_GGUF")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return Ok(g);
     }
     // Fall back to a config.toml that an earlier run may have written.
@@ -72,7 +77,12 @@ fn resolve_gguf_for_unit() -> Result<String, String> {
 #[allow(dead_code)] // each Unix target calls it from its own install
 fn record_settings() -> Result<(), String> {
     let path = config::default_config_path();
-    config::merge_env_into_file(&path).map_err(|e| format!("cannot record install settings in {}: {e:#}", path.display()))
+    config::merge_env_into_file(&path).map_err(|e| {
+        format!(
+            "cannot record install settings in {}: {e:#}",
+            path.display()
+        )
+    })
 }
 
 /// The service's address from config.toml, as an error string for this module.
@@ -128,16 +138,26 @@ fn parse_health(response: &str) -> Result<Option<u32>, String> {
     }
     let status_line = response.lines().next().unwrap_or_default();
     let code = status_line.split_whitespace().nth(1).unwrap_or("?");
-    let body = response.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(response);
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or(response);
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| format!("answered {code}, but not with m3-embed-server's JSON health body"))?;
     match v.get("status").and_then(|s| s.as_str()) {
-        Some("ok") => Ok(v.get("pid").and_then(|p| p.as_u64()).and_then(|p| u32::try_from(p).ok())),
+        Some("ok") => Ok(v
+            .get("pid")
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u32::try_from(p).ok())),
         Some("degraded") => Err(format!(
             "answered {code} degraded: {}",
-            v.get("reason").and_then(|r| r.as_str()).unwrap_or("no reason given")
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("no reason given")
         )),
-        Some(s) if s.starts_with("loading") => Err(format!("answered {code} {s:?}: still loading the model")),
+        Some(s) if s.starts_with("loading") => {
+            Err(format!("answered {code} {s:?}: still loading the model"))
+        }
         Some(s) => Err(format!("answered {code} with status {s:?}")),
         None => Err(format!("answered {code} without a status")),
     }
@@ -207,13 +227,17 @@ fn report_serving(
         match whose(pid, main_pid()) {
             Answer::Ours => println!("{label}: running, serving on {host}:{port}"),
             Answer::Foreign(other) => return Err(foreign_message(label, &host, port, other, true)),
-            Answer::LikelyForeign(other) => return Err(foreign_message(label, &host, port, other, false)),
+            Answer::LikelyForeign(other) => {
+                return Err(foreign_message(label, &host, port, other, false))
+            }
             Answer::Unknown if answered_before => {
                 eprintln!(
                     "WARN: {host}:{port} was already answering before this start; another \
                      process may hold the port, so this service may not be the one serving"
                 );
-                println!("{label}: running; {host}:{port} answers, but it did before this start too");
+                println!(
+                    "{label}: running; {host}:{port} answers, but it did before this start too"
+                );
             }
             Answer::Unknown => println!("{label}: running, serving on {host}:{port}"),
         }
@@ -238,8 +262,12 @@ fn note_foreign_answer(label: &str, main_pid: Option<u32>) {
     };
     if let Ok(Some(pid)) = health(&host, port) {
         match whose(Some(pid), main_pid) {
-            Answer::Foreign(other) => eprintln!("{}", foreign_message(label, &host, port, other, true)),
-            Answer::LikelyForeign(other) => eprintln!("{}", foreign_message(label, &host, port, other, false)),
+            Answer::Foreign(other) => {
+                eprintln!("{}", foreign_message(label, &host, port, other, true))
+            }
+            Answer::LikelyForeign(other) => {
+                eprintln!("{}", foreign_message(label, &host, port, other, false))
+            }
             Answer::Ours | Answer::Unknown => {}
         }
     }
@@ -276,14 +304,17 @@ mod health_tests {
 
     #[test]
     fn a_loading_degraded_or_wrong_server_is_not_ok_and_says_why() {
-        let loading = parse_health("HTTP/1.0 503 Service Unavailable\r\n\r\n{\"status\":\"loading model\"}");
+        let loading =
+            parse_health("HTTP/1.0 503 Service Unavailable\r\n\r\n{\"status\":\"loading model\"}");
         assert!(loading.unwrap_err().contains("still loading"));
         let degraded = parse_health(
             "HTTP/1.0 503 Service Unavailable\r\n\r\n{\"status\":\"degraded\",\"reason\":\"breaker open\",\"pid\":1}",
         );
         assert!(degraded.unwrap_err().contains("degraded: breaker open"));
         assert!(parse_health("").unwrap_err().contains("no HTTP answer"));
-        assert!(parse_health("HTTP/1.0 404 Not Found\r\n\r\nnope").unwrap_err().contains("404"));
+        assert!(parse_health("HTTP/1.0 404 Not Found\r\n\r\nnope")
+            .unwrap_err()
+            .contains("404"));
     }
 
     #[test]
@@ -354,11 +385,7 @@ pub mod macos {
                 .map_err(|e| format!("cannot create LaunchAgents dir {}: {e}", dir.display()))?;
         }
 
-        let body = render_plist(
-            &exe.to_string_lossy(),
-            &gguf,
-            &log_path.to_string_lossy(),
-        );
+        let body = render_plist(&exe.to_string_lossy(), &gguf, &log_path.to_string_lossy());
         std::fs::write(&plist, body)
             .map_err(|e| format!("cannot write plist {}: {e}", plist.display()))?;
 
@@ -389,7 +416,10 @@ pub mod macos {
             }
         } else {
             println!("state:    {state}");
-            eprintln!("WARN: the agent did not reach running within 10s; see {}", log_path.display());
+            eprintln!(
+                "WARN: the agent did not reach running within 10s; see {}",
+                log_path.display()
+            );
         }
         Ok(())
     }
@@ -457,9 +487,11 @@ pub mod macos {
         if !out.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("last exit code = ").map(|v| v.trim().to_string()))
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("last exit code = ")
+                .map(|v| v.trim().to_string())
+        })
     }
 
     fn last_exit() -> String {
@@ -547,7 +579,11 @@ pub mod macos {
         // Not loaded is not the same as not installed: `launchctl unload` (what
         // `m3 stop` does) and our own `stop` leave the plist in place, and the
         // plist on disk is the registration.
-        Ok(if plist_path()?.exists() { "stopped" } else { "not installed" })
+        Ok(if plist_path()?.exists() {
+            "stopped"
+        } else {
+            "not installed"
+        })
     }
 
     /// Poll until the agent is `want` or `secs` pass; returns the last state.
@@ -647,12 +683,21 @@ pub mod linux {
         let state = wait_for("running", 10);
         if state == "running" {
             // Registered either way; a taken port is reported, not fatal here.
-            if let Err(e) = report_serving(SERVICE_NAME, answered_before, 30, &journal_hint(), &main_pid) {
+            if let Err(e) = report_serving(
+                SERVICE_NAME,
+                answered_before,
+                30,
+                &journal_hint(),
+                &main_pid,
+            ) {
                 eprintln!("WARN: {e}");
             }
         } else {
             println!("state:    {state}");
-            eprintln!("WARN: the unit did not reach running within 10s; {}", journal_hint());
+            eprintln!(
+                "WARN: the unit did not reach running within 10s; {}",
+                journal_hint()
+            );
         }
         if linger_enabled() {
             return Ok(());
@@ -713,7 +758,13 @@ pub mod linux {
         // bad GGUF or a busy port still exits 0. Report the outcome.
         let state = wait_for("running", 10);
         if state == "running" {
-            report_serving(SERVICE_NAME, answered_before, 30, &journal_hint(), &main_pid)
+            report_serving(
+                SERVICE_NAME,
+                answered_before,
+                30,
+                &journal_hint(),
+                &main_pid,
+            )
         } else {
             Err(format!(
                 "{SERVICE_NAME} did not reach running within 10s (state: {state}; {}); {}",
@@ -765,10 +816,19 @@ pub mod linux {
         let Ok(out) = out else {
             return "exit status unavailable".into();
         };
-        let prop = |k: &str| out.lines().find_map(|l| l.strip_prefix(k)?.strip_prefix('=')).unwrap_or("?").trim().to_string();
+        let prop = |k: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+                .unwrap_or("?")
+                .trim()
+                .to_string()
+        };
         let (result, status) = (prop("Result"), prop("ExecMainStatus"));
         match status.parse::<i64>() {
-            Ok(code) => format!("result {result}, exit status {code}: {}", exit_status_meaning(code)),
+            Ok(code) => format!(
+                "result {result}, exit status {code}: {}",
+                exit_status_meaning(code)
+            ),
             Err(_) => format!("result {result}, exit status {status}"),
         }
     }

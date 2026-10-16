@@ -71,7 +71,10 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(ApiJson(v)),
-            Err(rej) => Err((rej.status(), Json(serde_json::json!({ "error": rej.body_text() })))),
+            Err(rej) => Err((
+                rej.status(),
+                Json(serde_json::json!({ "error": rej.body_text() })),
+            )),
         }
     }
 }

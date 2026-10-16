@@ -57,8 +57,8 @@ pub fn active_backend() -> &'static str {
     COMPILED_BACKEND
 }
 
-pub mod windows;
 mod cuda_env;
+pub mod windows;
 
 #[cfg(feature = "embedded")]
 pub use cuda_env::prepare_process_env;
@@ -149,7 +149,12 @@ impl Tokenizer {
     }
 
     /// Token-exact windows (character offsets). See [`windows::plan_windows`].
-    pub fn token_windows(&self, text: &str, budget: usize, overlap: usize) -> Result<Vec<(usize, usize)>> {
+    pub fn token_windows(
+        &self,
+        text: &str,
+        budget: usize,
+        overlap: usize,
+    ) -> Result<Vec<(usize, usize)>> {
         self.pool.token_windows(text, budget, overlap)
     }
 }
@@ -177,7 +182,12 @@ impl EmbeddedBackend {
     /// `n_ctx` is the total token budget per decode call (shared across all sequences in a chunk).
     /// `seq_max` caps how many sequences are packed into one decode call per worker thread.
     /// Defaults n_batch = n_ubatch = n_ctx (encoder-safe; see body for why).
-    pub fn with_streams_ctx_seqmax(model_path: impl Into<String>, streams: usize, n_ctx: u32, seq_max: u32) -> Self {
+    pub fn with_streams_ctx_seqmax(
+        model_path: impl Into<String>,
+        streams: usize,
+        n_ctx: u32,
+        seq_max: u32,
+    ) -> Self {
         // n_batch / n_ubatch default to n_ctx. llama.cpp's BERT encoder asserts
         // `n_ubatch >= n_tokens` for the WHOLE batch it is handed, and a chunk in
         // `embed_on_ctx` can pack up to `n_ctx` tokens (across `seq_max` seqs, or
@@ -213,7 +223,9 @@ impl EmbeddedBackend {
         n_ubatch: u32,
     ) -> Self {
         if n_ctx < MIN_N_CTX {
-            log::warn!("m3-embed: n_ctx {n_ctx} is below the minimum {MIN_N_CTX}; using {MIN_N_CTX}");
+            log::warn!(
+                "m3-embed: n_ctx {n_ctx} is below the minimum {MIN_N_CTX}; using {MIN_N_CTX}"
+            );
         }
         let n_ctx = n_ctx.max(MIN_N_CTX);
         // Floor n_batch / n_ubatch at n_ctx (see doc comment for the encoder
@@ -284,7 +296,12 @@ impl EmbeddedBackend {
     /// Token-exact windows over `text` (character offsets). See
     /// [`windows::plan_windows`]. Forces the GGUF load, performs no decode.
     #[cfg(feature = "embedded")]
-    pub fn token_windows(&self, text: &str, budget: usize, overlap: usize) -> Result<Vec<(usize, usize)>> {
+    pub fn token_windows(
+        &self,
+        text: &str,
+        budget: usize,
+        overlap: usize,
+    ) -> Result<Vec<(usize, usize)>> {
         self.pool()?.token_windows(text, budget, overlap)
     }
 
@@ -388,7 +405,10 @@ pub mod embedded {
     /// against `n_ctx` (BOS/EOS included — `AddBos::Always`).
     fn tokenize(model: &LlamaModel, text: &str) -> Result<Vec<LlamaToken>> {
         model.str_to_token(text, AddBos::Always).map_err(|e| {
-            M3Error::Backend(format!("tokenize failed for a {}-byte text: {e}", text.len()))
+            M3Error::Backend(format!(
+                "tokenize failed for a {}-byte text: {e}",
+                text.len()
+            ))
         })
     }
 
@@ -452,12 +472,21 @@ pub mod embedded {
     fn observe_device(model: &LlamaModel, params: &LlamaModelParams, model_path: &str) -> String {
         let gpus: Vec<_> = list_llama_ggml_backend_devices()
             .into_iter()
-            .filter(|d| matches!(d.device_type, LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu))
+            .filter(|d| {
+                matches!(
+                    d.device_type,
+                    LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu
+                )
+            })
             .collect();
         let requested = params.n_gpu_layers();
         let n_layer = model.n_layer();
         // llama.cpp reads a negative or >= n_layer request as "all layers".
-        let offload = if requested < 0 { n_layer } else { (requested as u32).min(n_layer) };
+        let offload = if requested < 0 {
+            n_layer
+        } else {
+            (requested as u32).min(n_layer)
+        };
         let compiled = crate::active_backend();
         match gpus.first() {
             Some(d) if offload > 0 => {
@@ -516,9 +545,11 @@ pub mod embedded {
             // Shared, process-global backend (see `BACKEND` above).
             let backend = shared_backend()?;
             let params = LlamaModelParams::default();
-            let model = Arc::new(LlamaModel::load_from_file(backend, model_path, &params).map_err(|e| {
-                M3Error::Backend(format!("failed to load gguf model '{model_path}': {e}"))
-            })?);
+            let model = Arc::new(
+                LlamaModel::load_from_file(backend, model_path, &params).map_err(|e| {
+                    M3Error::Backend(format!("failed to load gguf model '{model_path}': {e}"))
+                })?,
+            );
             let n_embd = model.n_embd();
             let runtime_backend = observe_device(&model, &params, model_path);
 
@@ -538,10 +569,14 @@ pub mod embedded {
                 let handle = std::thread::Builder::new()
                     .name(format!("m3-embed-ctx-{id}"))
                     .spawn(move || {
-                        worker_loop(id, backend, model, rx, ready_tx, n_ctx, seq_max, n_batch, n_ubatch)
+                        worker_loop(
+                            id, backend, model, rx, ready_tx, n_ctx, seq_max, n_batch, n_ubatch,
+                        )
                     })
                     .map_err(|e| {
-                        M3Error::Backend(format!("failed to spawn embed worker {id} of {streams}: {e}"))
+                        M3Error::Backend(format!(
+                            "failed to spawn embed worker {id} of {streams}: {e}"
+                        ))
                     })?;
                 workers.push(handle);
             }
@@ -580,7 +615,10 @@ pub mod embedded {
         /// Counts INCLUDE the BOS/EOS frame, which occupies `n_ctx` like any
         /// other token.
         pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
-            texts.iter().map(|t| tokenize(&self.model, t).map(|v| v.len())).collect()
+            texts
+                .iter()
+                .map(|t| tokenize(&self.model, t).map(|v| v.len()))
+                .collect()
         }
 
         /// Token-exact windows over `text`: `[(start, end), ...]` in CHARACTER
@@ -591,7 +629,12 @@ pub mod embedded {
         /// `budget` must exceed the BOS/EOS frame (else every window would be
         /// one character) and must not exceed `n_ctx` (else a window cannot
         /// be embedded): either is a caller error, reported as such.
-        pub fn token_windows(&self, text: &str, budget: usize, overlap: usize) -> Result<Vec<(usize, usize)>> {
+        pub fn token_windows(
+            &self,
+            text: &str,
+            budget: usize,
+            overlap: usize,
+        ) -> Result<Vec<(usize, usize)>> {
             let frame = tokenize(&self.model, "")?.len();
             if budget <= frame || budget > self.n_ctx as usize {
                 return Err(M3Error::Config(format!(
@@ -602,7 +645,11 @@ pub mod embedded {
             }
             // Byte offset of every character boundary, so a character slice
             // maps onto `text` without re-encoding.
-            let bounds: Vec<usize> = text.char_indices().map(|(b, _)| b).chain(std::iter::once(text.len())).collect();
+            let bounds: Vec<usize> = text
+                .char_indices()
+                .map(|(b, _)| b)
+                .chain(std::iter::once(text.len()))
+                .collect();
             let n_chars = bounds.len() - 1;
             let mut count = |s: usize, e: usize| -> Result<usize> {
                 tokenize(&self.model, &text[bounds[s]..bounds[e]]).map(|t| t.len())
@@ -643,13 +690,18 @@ pub mod embedded {
                 let sender = guard
                     .as_ref()
                     .ok_or_else(|| M3Error::Backend("embed pool shut down".into()))?;
-                sender.send(Job { texts, reply: reply_tx }).map_err(|_| {
-                    M3Error::Backend(format!(
+                sender
+                    .send(Job {
+                        texts,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| {
+                        M3Error::Backend(format!(
                         "embed pool has no live workers (all {} exited; see the earlier worker \
                          panic logs) — recreate the embedder",
                         self.streams
                     ))
-                })?;
+                    })?;
             }
             // A worker that panics replies with its id and the panic message
             // before exiting (worker_loop), so this only fires if the reply
@@ -673,7 +725,11 @@ pub mod embedded {
         }
         M3Error::Backend(format!(
             "an embed worker (of {streams}) died before reporting readiness: {}",
-            if why.is_empty() { "no panic was recorded".to_string() } else { why.join("; ") }
+            if why.is_empty() {
+                "no panic was recorded".to_string()
+            } else {
+                why.join("; ")
+            }
         ))
     }
 
@@ -727,9 +783,7 @@ pub mod embedded {
             .with_n_seq_max(seq_max)
             .with_embeddings(true)
             .with_pooling_type(LlamaPoolingType::Cls)
-            .with_flash_attention_policy(
-                llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
-            );
+            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED);
         let mut ctx = match model.new_context(backend, ctx_params) {
             Ok(c) => c,
             Err(e) => {
@@ -808,7 +862,15 @@ pub mod embedded {
             // job". Answer with this worker's id and the panic message, then
             // exit: a context that panicked mid-decode is not trusted again.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                embed_on_ctx(&model, &mut ctx, &job.texts, n_ctx, seq_max, &mut batch, &mut norm_buf)
+                embed_on_ctx(
+                    &model,
+                    &mut ctx,
+                    &job.texts,
+                    n_ctx,
+                    seq_max,
+                    &mut batch,
+                    &mut norm_buf,
+                )
             }));
             match result {
                 Ok(r) => {
@@ -816,7 +878,10 @@ pub mod embedded {
                 }
                 Err(p) => {
                     let msg = panic_message(&*p);
-                    log::error!("m3-embed: worker {id} panicked on a {}-text batch and exited: {msg}", job.texts.len());
+                    log::error!(
+                        "m3-embed: worker {id} panicked on a {}-text batch and exited: {msg}",
+                        job.texts.len()
+                    );
                     let _ = job.reply.send(Err(M3Error::Backend(format!(
                         "embed worker {id} panicked and exited: {msg}"
                     ))));
@@ -919,9 +984,7 @@ pub mod embedded {
                 // concurrent load.
                 batch
                     .add_sequence(tokens, seq_i as i32, true)
-                    .map_err(|e| {
-                        M3Error::Backend(format!("batch add_sequence failed: {e}"))
-                    })?;
+                    .map_err(|e| M3Error::Backend(format!("batch add_sequence failed: {e}")))?;
             }
             // Fresh KV state per chunk; sequences within the chunk are
             // independent so one clear before the decode is enough (no
@@ -1011,11 +1074,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     async fn embedded_backend_runs_real_inference() {
-        let model_path = std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
         // 3-stream pool exercises the worker-thread context pool (CHANGE 1).
         let b = EmbeddedBackend::with_streams(model_path, 3);
         let out = b
-            .run(Batch::new(vec!["hello world".into(), "a different sentence".into()], 4))
+            .run(Batch::new(
+                vec!["hello world".into(), "a different sentence".into()],
+                4,
+            ))
             .await
             .expect("embedding run should succeed");
         assert_eq!(out.rows.len(), 2, "one embedding row per input text");
@@ -1045,10 +1112,14 @@ mod tests {
     #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     async fn shared_pool_invariant_one_arc_per_backend() {
         use m3_dispatcher::{Dispatcher, DispatcherConfig};
-        let model_path = std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
 
         let backend = EmbeddedBackend::with_streams(model_path, 2);
-        let cfg = DispatcherConfig { streams: 2, ..Default::default() };
+        let cfg = DispatcherConfig {
+            streams: 2,
+            ..Default::default()
+        };
         let dispatcher = Dispatcher::new(cfg, backend);
         // Pull the dispatcher's Arc; this is what `PyEmbeddedEmbedder` keeps.
         let backend_arc = dispatcher.backend().clone();
@@ -1089,7 +1160,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     async fn embedded_backend_concurrent_streams() {
-        let model_path = std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
         let b = std::sync::Arc::new(EmbeddedBackend::with_streams(model_path, 3));
         // Force the model+pool load once before timing the concurrent phase.
         let dim = b.embedding_dim().expect("model should load");
@@ -1124,11 +1196,14 @@ mod tests {
     #[test]
     #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     fn embedded_token_windows_fit_and_beat_the_estimate() {
-        let model_path = std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
         let b = EmbeddedBackend::new(model_path);
         let mut text = String::new();
         for i in 0..4000 {
-            text.push_str(&format!("Memory {i} records that the embedder moved to a free port. "));
+            text.push_str(&format!(
+                "Memory {i} records that the embedder moved to a free port. "
+            ));
             if i % 97 == 0 {
                 text.push_str("記憶は共有コンピュータで別のポートを使う 🚀 ");
             }
@@ -1136,23 +1211,47 @@ mod tests {
         let chars: Vec<char> = text.chars().collect();
         let (budget, overlap) = (512usize, 64usize);
         // Budgets the pool cannot honour are caller errors, not degenerate plans.
-        assert!(b.token_windows(&text, 2, 0).is_err(), "budget inside the BOS/EOS frame");
-        assert!(b.token_windows(&text, 1_000_000, 0).is_err(), "budget above n_ctx");
+        assert!(
+            b.token_windows(&text, 2, 0).is_err(),
+            "budget inside the BOS/EOS frame"
+        );
+        assert!(
+            b.token_windows(&text, 1_000_000, 0).is_err(),
+            "budget above n_ctx"
+        );
         let w = b.token_windows(&text, budget, overlap).expect("windows");
         assert_eq!(w.first().unwrap().0, 0);
         assert_eq!(w.last().unwrap().1, chars.len());
-        let slices: Vec<String> = w.iter().map(|&(s, e)| chars[s..e].iter().collect()).collect();
+        let slices: Vec<String> = w
+            .iter()
+            .map(|&(s, e)| chars[s..e].iter().collect())
+            .collect();
         let counts = b.count_tokens(&slices).expect("counts");
         for (i, c) in counts.iter().enumerate() {
-            assert!(*c <= budget, "window {i} {:?} has {c} tokens > {budget}", w[i]);
+            assert!(
+                *c <= budget,
+                "window {i} {:?} has {c} tokens > {budget}",
+                w[i]
+            );
         }
         let estimate = |s: usize, e: usize| -> Result<usize> {
             let slice: String = chars[s..e].iter().collect();
             Ok((slice.len() / 3).max(e - s) + 2)
         };
-        let est = crate::windows::plan_windows(chars.len(), budget, overlap, &mut { estimate }).unwrap();
-        eprintln!("{} chars: {} exact windows vs {} estimated", chars.len(), w.len(), est.len());
-        assert!(w.len() * 2 < est.len(), "exact {} vs estimated {}", w.len(), est.len());
+        let est =
+            crate::windows::plan_windows(chars.len(), budget, overlap, &mut { estimate }).unwrap();
+        eprintln!(
+            "{} chars: {} exact windows vs {} estimated",
+            chars.len(),
+            w.len(),
+            est.len()
+        );
+        assert!(
+            w.len() * 2 < est.len(),
+            "exact {} vs estimated {}",
+            w.len(),
+            est.len()
+        );
     }
 
     /// The compute-cap probe returns (a list or a cause) whether or not
@@ -1173,6 +1272,10 @@ mod tests {
         crate::prepare_process_env();
         let after_first = std::env::var_os("GGML_CUDA_DISABLE_GRAPHS");
         crate::prepare_process_env();
-        assert_eq!(after_first, std::env::var_os("GGML_CUDA_DISABLE_GRAPHS"), "second call must not change it");
+        assert_eq!(
+            after_first,
+            std::env::var_os("GGML_CUDA_DISABLE_GRAPHS"),
+            "second call must not change it"
+        );
     }
 }

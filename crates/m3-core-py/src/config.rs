@@ -48,7 +48,11 @@ pub fn embed_streams() -> usize {
 
 /// `M3_EMBED_COALESCE_MS` — coalescing-window width in milliseconds.
 pub fn embed_coalesce_ms() -> u64 {
-    env_or("M3_EMBED_COALESCE_MS", m3_dispatcher::DEFAULT_COALESCE_WINDOW_MS, 0)
+    env_or(
+        "M3_EMBED_COALESCE_MS",
+        m3_dispatcher::DEFAULT_COALESCE_WINDOW_MS,
+        0,
+    )
 }
 
 /// `M3_EMBED_MAX_BATCH_TOKENS` — the dispatcher's coalescing ceiling: how many
@@ -71,7 +75,11 @@ pub fn embed_max_batch_tokens() -> usize {
 /// Texts longer than that per-seq limit are decoded alone (using the full budget).
 /// KV memory per worker ≈ M3_EMBED_CTX × 96 KB (BGE-M3 fp16 KV estimate).
 pub fn embed_ctx() -> u32 {
-    env_or("M3_EMBED_CTX", m3_embed_llamacpp::DEFAULT_N_CTX, m3_embed_llamacpp::MIN_N_CTX)
+    env_or(
+        "M3_EMBED_CTX",
+        m3_embed_llamacpp::DEFAULT_N_CTX,
+        m3_embed_llamacpp::MIN_N_CTX,
+    )
 }
 
 /// `M3_EMBED_SEQ_MAX` — max sequences packed into one llama.cpp decode call per

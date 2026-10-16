@@ -131,7 +131,11 @@ where
 /// `run`, calling `on_ready` once the model is loaded and the port is bound —
 /// the earliest moment the server can actually answer. A supervisor that
 /// reports "running" must wait for this, not for the start request.
-pub async fn run_with_ready<F, R>(cfg: ResolvedConfig, shutdown: F, on_ready: R) -> anyhow::Result<()>
+pub async fn run_with_ready<F, R>(
+    cfg: ResolvedConfig,
+    shutdown: F,
+    on_ready: R,
+) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
     R: FnOnce(),
@@ -167,7 +171,11 @@ where
         cfg.gguf,
         cfg.gguf_source,
         config_path.display(),
-        if config_path.exists() { "present" } else { "absent: environment and defaults only" },
+        if config_path.exists() {
+            "present"
+        } else {
+            "absent: environment and defaults only"
+        },
     );
     log::info!(
         "embed params: streams={} n_ctx={} seq_max={} n_batch={} n_ubatch={} \
@@ -200,14 +208,20 @@ where
     // that arrives during the load waits in the listen backlog until serving.
     // Parsed as an IP, then paired with the port: "host:port" text breaks on
     // IPv6 ("::1:8082") and used to blame the port as well.
-    let ip: std::net::IpAddr = cfg.host.trim().trim_start_matches('[').trim_end_matches(']').parse().map_err(|e| {
-        anyhow::anyhow!(
+    let ip: std::net::IpAddr = cfg
+        .host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|e| {
+            anyhow::anyhow!(
             "invalid listen host {:?} (from {}): {e}. It must be a loopback IP address such as \
              127.0.0.1 or ::1; a hostname is not accepted",
             cfg.host,
             cfg.host_source
         )
-    })?;
+        })?;
     let addr = SocketAddr::new(ip, cfg.port);
     // Decide transport security before binding, so a refused configuration
     // never holds the port or loads the model.
@@ -242,9 +256,12 @@ where
         .embedding_dim()
         .map_err(|e| anyhow::anyhow!("eager GGUF load failed ({}): {e}", load_ctx()))?;
     log::info!("model loaded, embedding dim = {dim}");
-    let tokenizer = backend
-        .tokenizer()
-        .map_err(|e| anyhow::anyhow!("tokenizer unavailable after GGUF load ({}): {e}", load_ctx()))?;
+    let tokenizer = backend.tokenizer().map_err(|e| {
+        anyhow::anyhow!(
+            "tokenizer unavailable after GGUF load ({}): {e}",
+            load_ctx()
+        )
+    })?;
 
     let dcfg = DispatcherConfig {
         streams: cfg.streams,
@@ -273,11 +290,16 @@ where
     log::info!("listening on http://{addr}");
     let Some((remote_listener, remote)) = remote else {
         on_ready();
-        axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
         log::info!("shutdown complete");
         return Ok(());
     };
-    log::info!("listening on https://{} (bearer token required)", remote.addr);
+    log::info!(
+        "listening on https://{} (bearer token required)",
+        remote.addr
+    );
     on_ready();
     // One stop signal, both listeners.
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -288,16 +310,22 @@ where
     let stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
         let _ = rx.wait_for(|s| *s).await;
     };
-    let remote_app = app
-        .clone()
-        .layer(axum::middleware::from_fn_with_state(Arc::new(remote.token_digest), security::require_bearer));
+    let remote_app = app.clone().layer(axum::middleware::from_fn_with_state(
+        Arc::new(remote.token_digest),
+        security::require_bearer,
+    ));
     let local = async {
         axum::serve(listener, app)
             .with_graceful_shutdown(stopped(stop_rx.clone()))
             .await
             .map_err(anyhow::Error::from)
     };
-    let tls = security::serve_tls(remote_listener, remote_app, remote.tls, stopped(stop_rx.clone()));
+    let tls = security::serve_tls(
+        remote_listener,
+        remote_app,
+        remote.tls,
+        stopped(stop_rx.clone()),
+    );
     tokio::try_join!(local, tls)?;
 
     log::info!("shutdown complete");
@@ -375,7 +403,9 @@ fn describe_breaker(b: &BreakerStatus) -> String {
             b.consecutive_failures,
             ceil_secs(left)
         ),
-        _ if b.consecutive_failures > 0 => format!("closed, {} consecutive failure(s)", b.consecutive_failures),
+        _ if b.consecutive_failures > 0 => {
+            format!("closed, {} consecutive failure(s)", b.consecutive_failures)
+        }
         _ => "closed".into(),
     }
 }
@@ -396,7 +426,12 @@ fn backend_failure_reply(msg: String, b: &BreakerStatus) -> Response {
 
 /// Log a failed backend call with what identifies it (the client's copy is
 /// otherwise the only record) and build its reply. No input text is logged.
-async fn backend_failure(state: &AppState, what: &str, inputs: usize, err: &m3_error::M3Error) -> Response {
+async fn backend_failure(
+    state: &AppState,
+    what: &str,
+    inputs: usize,
+    err: &m3_error::M3Error,
+) -> Response {
     let msg = format!("{what} failed: {err}");
     let b = state.dispatcher.breaker_status().await;
     log::error!(
@@ -447,7 +482,10 @@ fn texts_from(input: serde_json::Value) -> Result<Vec<String>, (StatusCode, Stri
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!("input must be a string or an array of strings; got {}", json_type(&other)),
+                format!(
+                    "input must be a string or an array of strings; got {}",
+                    json_type(&other)
+                ),
             ));
         }
     };
@@ -486,7 +524,7 @@ async fn embed_handler(
                      (code=input_too_long observed_tokens={tokens} max_tokens={n_ctx})"
                 ),
             )
-                .into_response())
+                .into_response());
         }
         Err(other) => return Err(backend_failure(&state, "embed", inputs, &other).await),
     };
@@ -557,7 +595,9 @@ async fn tokenize_windows_handler(
     // The budget is validated by the tokenizer itself (inside the BOS/EOS
     // frame, or above n_ctx, is a Config error), answered 400 below.
     let tok = state.tokenizer.clone();
-    let windows = tokio::task::spawn_blocking(move || tok.token_windows(&req.input, req.budget, req.overlap)).await;
+    let windows =
+        tokio::task::spawn_blocking(move || tok.token_windows(&req.input, req.budget, req.overlap))
+            .await;
     let windows = tokenize_outcome(&state, "/tokenize/windows", 1, windows)?;
     Ok(Json(WindowsResponse { windows }))
 }
@@ -573,12 +613,18 @@ fn tokenize_outcome<T>(
     let msg = match r {
         Ok(Ok(v)) => return Ok(v),
         // A caller error (e.g. a budget the model cannot honour), not a fault.
-        Ok(Err(e @ m3_error::M3Error::Config(_))) => return Err((StatusCode::BAD_REQUEST, format!("{route}: {e}"))),
+        Ok(Err(e @ m3_error::M3Error::Config(_))) => {
+            return Err((StatusCode::BAD_REQUEST, format!("{route}: {e}")))
+        }
         Ok(Err(e)) => format!("{route} failed: {e}"),
         Err(e) if e.is_panic() => format!("{route} failed: the tokenizer task panicked ({e})"),
         Err(e) => format!("{route} failed: the tokenizer task was cancelled ({e})"),
     };
-    log::error!("{msg} ({inputs} input(s); backend={} gguf={})", compiled_backend(), state.gguf);
+    log::error!(
+        "{msg} ({inputs} input(s); backend={} gguf={})",
+        compiled_backend(),
+        state.gguf
+    );
     Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
 }
 
@@ -638,7 +684,9 @@ fn health_reply(b: &BreakerStatus, model: &str) -> Response {
             )
                 .into_response()
         }
-        _ => Json(serde_json::json!({ "status": "ok", "model": model, "pid": pid })).into_response(),
+        _ => {
+            Json(serde_json::json!({ "status": "ok", "model": model, "pid": pid })).into_response()
+        }
     }
 }
 
@@ -664,7 +712,9 @@ mod tests {
     use std::time::Duration;
 
     async fn body_text(r: Response) -> String {
-        let b = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8_lossy(&b).into_owned()
     }
 
@@ -691,7 +741,10 @@ mod tests {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
         assert!(msg.contains("code=body_too_large"), "{msg}");
         // The Python client subdivides a text on these; this needs fewer texts.
-        assert!(!msg.contains("input too long") && !msg.contains("tokens"), "{msg}");
+        assert!(
+            !msg.contains("input too long") && !msg.contains("tokens"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]
@@ -699,11 +752,17 @@ mod tests {
         let r = backend_failure_reply("embed failed: x".into(), &open_breaker());
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers()[header::RETRY_AFTER], "8");
-        let closed = BreakerStatus { consecutive_failures: 1, ..Default::default() };
+        let closed = BreakerStatus {
+            consecutive_failures: 1,
+            ..Default::default()
+        };
         let r = backend_failure_reply("embed failed: x".into(), &closed);
         assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_text(r).await, "embed failed: x");
-        assert_eq!(describe_breaker(&closed), "closed, 1 consecutive failure(s)");
+        assert_eq!(
+            describe_breaker(&closed),
+            "closed, 1 consecutive failure(s)"
+        );
     }
 
     #[tokio::test]
@@ -730,7 +789,10 @@ mod tests {
     async fn a_taken_port_names_the_listener_and_its_own_fix() {
         let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = held.local_addr().unwrap();
-        for (which, fix) in [(Listener::Local, "embed.server.port"), (Listener::Remote, "secure --listen")] {
+        for (which, fix) in [
+            (Listener::Local, "embed.server.port"),
+            (Listener::Remote, "secure --listen"),
+        ] {
             let e = bind(addr, which).await.unwrap_err();
             let p = e.downcast_ref::<PortInUse>().expect("PortInUse");
             assert_eq!(p.listener, which);

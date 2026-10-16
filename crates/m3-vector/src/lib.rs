@@ -6,10 +6,8 @@ use wide::f32x8;
 
 mod displacement;
 pub mod index;
+pub use displacement::{displacement_permutation, enforce_displacement_guard, DisplacementRow};
 pub use index::VectorIndex;
-pub use displacement::{
-    displacement_permutation, enforce_displacement_guard, DisplacementRow,
-};
 
 /// Reinterpret a SQLite BLOB (`&[u8]`) as `&[f32]` with no copy.
 ///
@@ -27,7 +25,11 @@ pub fn f32_as_blob(vec: &[f32]) -> &[u8] {
 /// Cosine similarity between two equal-length vectors (scalar fallback).
 pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
     if a.len() != b.len() {
-        return Err(M3Error::VectorDimMismatch { expected: a.len(), got: b.len(), index: None });
+        return Err(M3Error::VectorDimMismatch {
+            expected: a.len(),
+            got: b.len(),
+            index: None,
+        });
     }
     Ok(cosine_unchecked(a, b))
 }
@@ -71,10 +73,17 @@ fn cosine_unchecked(a: &[f32], b: &[f32]) -> f32 {
 pub fn cosine_batch(query: &[f32], corpus: &[&[f32]]) -> Result<Vec<f32>> {
     for (i, v) in corpus.iter().enumerate() {
         if v.len() != query.len() {
-            return Err(M3Error::VectorDimMismatch { expected: query.len(), got: v.len(), index: Some(i) });
+            return Err(M3Error::VectorDimMismatch {
+                expected: query.len(),
+                got: v.len(),
+                index: Some(i),
+            });
         }
     }
-    Ok(corpus.par_iter().map(|v| cosine_unchecked(query, v)).collect())
+    Ok(corpus
+        .par_iter()
+        .map(|v| cosine_unchecked(query, v))
+        .collect())
 }
 
 /// Decode one packed row of little-endian f32s: borrowed when the bytes are
@@ -86,7 +95,11 @@ pub fn decode_packed_row(b: &[u8]) -> std::borrow::Cow<'_, [f32]> {
     match bytemuck::try_cast_slice::<u8, f32>(b) {
         Ok(v) => std::borrow::Cow::Borrowed(v),
         Err(_) => std::borrow::Cow::Owned(
-            b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
+            b.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
         ),
     }
 }
@@ -96,7 +109,10 @@ pub fn decode_packed_row(b: &[u8]) -> std::borrow::Cow<'_, [f32]> {
 /// truncated or wrong-model blob; silently zero-scoring hid them.
 fn warn_wrong_length_rows(op: &str, blobs: &[&[u8]], dim: usize) {
     let expected = dim * 4;
-    let mut bad = blobs.iter().enumerate().filter(|(_, b)| b.len() != expected);
+    let mut bad = blobs
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.len() != expected);
     if let Some((first, b)) = bad.next() {
         log::warn!(
             "{op}: {} of {} candidate rows are not {expected} bytes (dim {dim} x 4) and scored 0.0; \
@@ -122,7 +138,11 @@ fn warn_wrong_length_rows(op: &str, blobs: &[&[u8]], dim: usize) {
 /// + Python `list` allocation and a `Vec<Vec<f32>>` FFI marshalling step.
 pub fn cosine_batch_packed(query: &[f32], blobs: &[&[u8]], dim: usize) -> Result<Vec<f32>> {
     if query.len() != dim {
-        return Err(M3Error::VectorDimMismatch { expected: dim, got: query.len(), index: None });
+        return Err(M3Error::VectorDimMismatch {
+            expected: dim,
+            got: query.len(),
+            index: None,
+        });
     }
     warn_wrong_length_rows("cosine_batch_packed", blobs, dim);
     let expected_bytes = dim * 4;
@@ -160,7 +180,11 @@ pub fn cosine_batch_maxpool_packed(
 ) -> Result<Vec<f32>> {
     for (j, a) in anchors.iter().enumerate() {
         if a.len() != dim {
-            return Err(M3Error::VectorDimMismatch { expected: dim, got: a.len(), index: Some(j) });
+            return Err(M3Error::VectorDimMismatch {
+                expected: dim,
+                got: a.len(),
+                index: Some(j),
+            });
         }
     }
     warn_wrong_length_rows("cosine_batch_maxpool_packed", blobs, dim);
@@ -305,7 +329,9 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
         let mut digits = 0u32;
         for ch in s.bytes() {
             if ch.is_ascii_digit() {
-                current = current.saturating_mul(10).saturating_add((ch - b'0') as u64);
+                current = current
+                    .saturating_mul(10)
+                    .saturating_add((ch - b'0') as u64);
                 digits += 1;
             } else if digits > 0 {
                 if idx < 6 {
@@ -325,7 +351,9 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
         [10_000_000_000u64, 100_000_000, 1_000_000, 10_000, 100, 1]
             .iter()
             .zip(parts)
-            .fold(0u64, |acc, (scale, p)| acc.saturating_add(p.saturating_mul(*scale)))
+            .fold(0u64, |acc, (scale, p)| {
+                acc.saturating_add(p.saturating_mul(*scale))
+            })
     }
 
     let mut dated: Vec<(usize, u64)> = valid_froms
@@ -372,7 +400,11 @@ fn mmr_pick(remaining: &[usize], score: impl Fn(usize) -> f32 + Sync) -> Option<
     let best = if remaining.len() < MMR_PAR_THRESHOLD {
         remaining.iter().enumerate().map(scored).reduce(mmr_better)
     } else {
-        remaining.par_iter().enumerate().map(scored).reduce_with(mmr_better)
+        remaining
+            .par_iter()
+            .enumerate()
+            .map(scored)
+            .reduce_with(mmr_better)
     };
     best.map(|(pos, _)| pos)
 }
@@ -480,7 +512,6 @@ pub fn mmr_rerank_scored(
     Ok(selected)
 }
 
-
 /// Token-set Jaccard similarity, lowercased, punctuation-stripped.
 ///
 /// Strips anything that is not alphanumeric, whitespace, or underscore
@@ -535,7 +566,9 @@ pub fn rank_hybrid(
     if contents.len() != n || embeddings.len() != n {
         return Err(M3Error::Config(format!(
             "rank_hybrid length mismatch: relevance={}, contents={}, embeddings={}",
-            n, contents.len(), embeddings.len()
+            n,
+            contents.len(),
+            embeddings.len()
         )));
     }
 
@@ -626,7 +659,10 @@ mod tests {
         let v0: &[f32] = &[1.0, 0.0];
         let rel = [0.5];
         let cands = [v0];
-        assert_eq!(mmr_rerank_scored(&rel, &cands, 0.7, 9, true).unwrap(), vec![0]);
+        assert_eq!(
+            mmr_rerank_scored(&rel, &cands, 0.7, 9, true).unwrap(),
+            vec![0]
+        );
     }
 
     #[test]
@@ -691,7 +727,11 @@ mod tests {
                 .iter()
                 .map(|a| cosine_unchecked(a, v))
                 .fold(-1.0_f32, f32::max);
-            assert!((got[k] - want).abs() < 1e-6, "row {k}: got={}, want={want}", got[k]);
+            assert!(
+                (got[k] - want).abs() < 1e-6,
+                "row {k}: got={}, want={want}",
+                got[k]
+            );
         }
         assert!((got[0] - 1.0).abs() < 1e-6); // v0 best-matches a1
         assert!((got[1] - 1.0).abs() < 1e-6); // v1 best-matches a0
@@ -736,7 +776,8 @@ mod tests {
         let imp = vec![0.0f32, 1.0];
         let titles = vec![0.5f32, 0.0];
         // vw=0.7, iw=0.1, tmb=0.15, stt=40
-        let out = hybrid_score_batch(&vec_s, &bm, &lens, &imp, &titles, 0.7, 0.1, 0.15, 40).unwrap();
+        let out =
+            hybrid_score_batch(&vec_s, &bm, &lens, &imp, &titles, 0.7, 0.1, 0.15, 40).unwrap();
         // Row 0: bm25_norm = 1/(1+1) = 0.5; raw = 0.9*0.7 + 0.5*0.3 = 0.63+0.15 = 0.78
         //        len 100 >= 40 -> penalty 1.0; final = 0.78 + 0.15*0.5 + 0.1*0.0 = 0.855
         // Row 1: bm25_norm = 1/(1+4) = 0.2; raw = 0.5*0.7 + 0.2*0.3 = 0.35+0.06 = 0.41
@@ -748,7 +789,17 @@ mod tests {
 
     #[test]
     fn hybrid_score_batch_length_mismatch_errors() {
-        let r = hybrid_score_batch(&[1.0], &[1.0, 2.0], &[1], &[0.0], &[0.0], 0.7, 0.1, 0.15, 40);
+        let r = hybrid_score_batch(
+            &[1.0],
+            &[1.0, 2.0],
+            &[1],
+            &[0.0],
+            &[0.0],
+            0.7,
+            0.1,
+            0.15,
+            40,
+        );
         assert!(r.is_err());
     }
 
@@ -813,7 +864,10 @@ mod tests {
     #[test]
     fn recency_bonus_ranks_degenerate_cases() {
         assert_eq!(recency_bonus_ranks(&[], 1.0), Vec::<f32>::new());
-        assert_eq!(recency_bonus_ranks(&[Some("x".to_string())], 1.0), vec![0.0]);
+        assert_eq!(
+            recency_bonus_ranks(&[Some("x".to_string())], 1.0),
+            vec![0.0]
+        );
         assert_eq!(recency_bonus_ranks(&[None, None], 1.0), vec![0.0, 0.0]);
         // zero bias -> all zero regardless
         let v = vec![Some("a".to_string()), Some("b".to_string())];
@@ -821,7 +875,9 @@ mod tests {
     }
 
     fn unit_vectors(n: usize) -> Vec<Vec<f32>> {
-        (0..n).map(|i| vec![(i as f32).cos(), (i as f32).sin(), 0.5]).collect()
+        (0..n)
+            .map(|i| vec![(i as f32).cos(), (i as f32).sin(), 0.5])
+            .collect()
     }
 
     #[test]
@@ -835,7 +891,11 @@ mod tests {
             rel[0] = f32::NAN;
             let out = mmr_rerank_scored(&rel, &refs, 1.0, n, false).unwrap();
             assert_eq!(out.len(), n);
-            assert_eq!(*out.last().unwrap(), 0, "n={n}: NaN candidate must rank last, got {out:?}");
+            assert_eq!(
+                *out.last().unwrap(),
+                0,
+                "n={n}: NaN candidate must rank last, got {out:?}"
+            );
         }
     }
 
@@ -844,10 +904,17 @@ mod tests {
         for n in [MMR_PAR_THRESHOLD - 1, MMR_PAR_THRESHOLD + 1] {
             let remaining: Vec<usize> = (0..n).collect();
             // Two equal maxima at 7 and 90 (when present); NaN everywhere else.
-            let best = mmr_pick(&remaining, |c| if c == 7 || c == 90 { 1.0 } else { f32::NAN });
+            let best = mmr_pick(
+                &remaining,
+                |c| if c == 7 || c == 90 { 1.0 } else { f32::NAN },
+            );
             assert_eq!(best, Some(7), "n={n}: a tie must go to the lower position");
             let all_nan = mmr_pick(&remaining, |_| f32::NAN);
-            assert_eq!(all_nan, Some(0), "n={n}: all-NaN picks position 0 on both branches");
+            assert_eq!(
+                all_nan,
+                Some(0),
+                "n={n}: all-NaN picks position 0 on both branches"
+            );
         }
         assert_eq!(mmr_pick(&[], |_| 0.0), None);
     }
@@ -860,7 +927,11 @@ mod tests {
         buf.extend_from_slice(&row); // offset by one byte: never 4-aligned
         let blobs: Vec<&[u8]> = vec![&buf[1..]];
         let got = cosine_batch_packed(q, &blobs, 4).unwrap();
-        assert!((got[0] - 1.0).abs() < 1e-6, "misaligned row scored {}", got[0]);
+        assert!(
+            (got[0] - 1.0).abs() < 1e-6,
+            "misaligned row scored {}",
+            got[0]
+        );
     }
 
     #[test]
@@ -869,15 +940,32 @@ mod tests {
         let good: &[f32] = &[1.0, 0.0];
         let bad: &[f32] = &[1.0, 0.0, 0.0];
         let e = cosine_batch(q, &[good, bad]).unwrap_err();
-        assert!(matches!(e, M3Error::VectorDimMismatch { expected: 2, got: 3, index: Some(1) }), "{e}");
+        assert!(
+            matches!(
+                e,
+                M3Error::VectorDimMismatch {
+                    expected: 2,
+                    got: 3,
+                    index: Some(1)
+                }
+            ),
+            "{e}"
+        );
         assert!(e.to_string().contains("at row 1"), "{e}");
     }
 
     #[test]
     fn recency_parse_saturates_instead_of_overflowing() {
-        let v = vec![Some("99999999999999999999999-01-01".to_string()), Some("2025-01-01".to_string())];
+        let v = vec![
+            Some("99999999999999999999999-01-01".to_string()),
+            Some("2025-01-01".to_string()),
+        ];
         let b = recency_bonus_ranks(&v, 1.0);
-        assert_eq!(b, vec![1.0, 0.0], "an absurd year sorts newest, without a panic");
+        assert_eq!(
+            b,
+            vec![1.0, 0.0],
+            "an absurd year sorts newest, without a panic"
+        );
     }
 
     #[test]

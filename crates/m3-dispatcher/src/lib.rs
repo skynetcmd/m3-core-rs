@@ -4,7 +4,7 @@
 //! Backends (llama.cpp embed, ONNX NER) implement `ModelBackend`.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,10 @@ pub struct Batch {
 
 impl Batch {
     pub fn new(texts: Vec<String>, token_len_hint: usize) -> Self {
-        Self { texts, token_len_hint }
+        Self {
+            texts,
+            token_len_hint,
+        }
     }
 }
 
@@ -45,10 +48,7 @@ impl BatchOutput {
 
 /// Backend abstraction shared by all dispatcher consumers.
 pub trait ModelBackend {
-    fn run(
-        &self,
-        batch: Batch,
-    ) -> impl std::future::Future<Output = Result<BatchOutput>> + Send;
+    fn run(&self, batch: Batch) -> impl std::future::Future<Output = Result<BatchOutput>> + Send;
 }
 
 /// Circuit-breaker tuning.
@@ -62,7 +62,10 @@ pub struct BreakerCfg {
 
 impl Default for BreakerCfg {
     fn default() -> Self {
-        Self { failure_threshold: 5, open_secs: 10 }
+        Self {
+            failure_threshold: 5,
+            open_secs: 10,
+        }
     }
 }
 
@@ -425,7 +428,8 @@ impl LengthBucketQueue {
 
     fn push(&mut self, job: Job) {
         let idx = self.bucket_index(job.token_len);
-        self.total_tokens.fetch_add(job.token_len, Ordering::Relaxed);
+        self.total_tokens
+            .fetch_add(job.token_len, Ordering::Relaxed);
         self.pending[idx].push_back(job);
     }
 
@@ -506,7 +510,16 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
             queue_cap: cap,
         };
         tokio::spawn(scheduler_loop(
-            cfg, backend, breaker, queue, total_tokens, slots, in_flight, queued, latency, rx,
+            cfg,
+            backend,
+            breaker,
+            queue,
+            total_tokens,
+            slots,
+            in_flight,
+            queued,
+            latency,
+            rx,
         ));
         d
     }
@@ -525,11 +538,7 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
     /// Callers that have already tokenized should pass the real count here.
     /// The dispatcher uses it solely for bucket selection and the running-total
     /// cap; the backend still sees the raw text.
-    pub async fn embed_with_token_count(
-        &self,
-        text: String,
-        token_len: usize,
-    ) -> Result<Vec<f32>> {
+    pub async fn embed_with_token_count(&self, text: String, token_len: usize) -> Result<Vec<f32>> {
         self.embed_inner(text, None, Some(token_len)).await
     }
 
@@ -557,7 +566,12 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         self.breaker.peek().await?;
         let token_len = token_len_hint.unwrap_or_else(|| estimate_tokens(&text));
         let (reply, rx) = oneshot::channel();
-        let job = Job { text, token_len, reply, deadline };
+        let job = Job {
+            text,
+            token_len,
+            reply,
+            deadline,
+        };
         // Count before sending so the scheduler's decrement cannot run first.
         self.queued.fetch_add(1, Ordering::SeqCst);
         if let Err(e) = self.tx.try_send(job) {
@@ -576,7 +590,8 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         }
         rx.await.map_err(|_| {
             M3Error::Backend(
-                "dispatcher dropped the job without a reply (the scheduler or a batch task exited)".into(),
+                "dispatcher dropped the job without a reply (the scheduler or a batch task exited)"
+                    .into(),
             )
         })?
     }
@@ -620,7 +635,10 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         }
         match texts.len() {
             0 => Ok(Vec::new()),
-            1 => Ok(vec![self.embed_with_token_count(texts.swap_remove(0), token_lens[0]).await?]),
+            1 => Ok(vec![
+                self.embed_with_token_count(texts.swap_remove(0), token_lens[0])
+                    .await?,
+            ]),
             _ => self.run_direct(texts, token_lens.iter().sum()).await,
         }
     }
@@ -629,11 +647,9 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
     /// stream slot, one backend call, breaker bookkeeping.
     async fn run_direct(&self, texts: Vec<String>, token_len: usize) -> Result<Vec<Vec<f32>>> {
         self.breaker.check().await?;
-        let _permit = self
-            .slots
-            .acquire()
-            .await
-            .map_err(|_| M3Error::Backend("dispatcher closed: its stream semaphore was shut down".into()))?;
+        let _permit = self.slots.acquire().await.map_err(|_| {
+            M3Error::Backend("dispatcher closed: its stream semaphore was shut down".into())
+        })?;
         let sent = texts.len();
         let in_flight = InFlight::enter(&self.in_flight);
         // Time the backend call only — the queue/semaphore wait before this
@@ -872,12 +888,18 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
                             }
                             return;
                         }
-                        Err(M3Error::InputTooLong { tokens, n_ctx, index: Some(i) })
-                            if jobs.len() > 1 && i < jobs.len() =>
-                        {
+                        Err(M3Error::InputTooLong {
+                            tokens,
+                            n_ctx,
+                            index: Some(i),
+                        }) if jobs.len() > 1 && i < jobs.len() => {
                             let (_, reply) = jobs.remove(i);
                             // Index 0: relative to that caller's one text.
-                            let _ = reply.send(Err(M3Error::InputTooLong { tokens, n_ctx, index: Some(0) }));
+                            let _ = reply.send(Err(M3Error::InputTooLong {
+                                tokens,
+                                n_ctx,
+                                index: Some(0),
+                            }));
                         }
                         Err(e) => {
                             if !is_client_error(&e) {
@@ -902,7 +924,12 @@ mod tests {
 
     fn mk_job(token_len: usize) -> Job {
         let (reply, _rx) = oneshot::channel();
-        Job { text: String::new(), token_len, reply, deadline: None }
+        Job {
+            text: String::new(),
+            token_len,
+            reply,
+            deadline: None,
+        }
     }
 
     /// bucket_index boundaries.
@@ -935,7 +962,10 @@ mod tests {
             q.push(mk_job(l));
         }
         // running total invariant.
-        assert_eq!(q.total_tokens.load(Ordering::Relaxed), lens.iter().sum::<usize>());
+        assert_eq!(
+            q.total_tokens.load(Ordering::Relaxed),
+            lens.iter().sum::<usize>()
+        );
 
         // Drain with cap = 300. Greedy FIFO: 50+100+80 = 230; next is 120 ->
         // 350 > 300 so stop. First job is always taken even if it exceeds cap
@@ -957,7 +987,10 @@ mod tests {
     /// breaker falls through to the mutex.
     #[tokio::test]
     async fn breaker_check_uses_lock_free_path_when_closed() {
-        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 2, open_secs: 60 });
+        let cb = CircuitBreaker::new(BreakerCfg {
+            failure_threshold: 2,
+            open_secs: 60,
+        });
         // Closed: 1000 checks should all hit the fast path.
         for _ in 0..1000 {
             cb.check().await.unwrap();
@@ -995,12 +1028,18 @@ mod tests {
     /// last failure; `peek` refuses with the same words.
     #[tokio::test]
     async fn refusal_names_failures_cooldown_and_last_error() {
-        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 2, open_secs: 60 });
+        let cb = CircuitBreaker::new(BreakerCfg {
+            failure_threshold: 2,
+            open_secs: 60,
+        });
         let why = M3Error::Backend("connection refused".to_string());
         cb.record_failure_because(&why).await;
         cb.record_failure_because(&why).await;
         let e = cb.check().await.unwrap_err().to_string();
-        assert!(e.contains("circuit breaker open after 2 consecutive backend failures"), "{e}");
+        assert!(
+            e.contains("circuit breaker open after 2 consecutive backend failures"),
+            "{e}"
+        );
         assert!(e.contains("another 60s"), "{e}");
         assert!(e.contains("last failure: connection refused"), "{e}");
         assert_eq!(cb.peek().await.unwrap_err().to_string(), e);
@@ -1016,7 +1055,10 @@ mod tests {
     /// decides.
     #[tokio::test]
     async fn half_open_admits_a_single_probe() {
-        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 1, open_secs: 60 });
+        let cb = CircuitBreaker::new(BreakerCfg {
+            failure_threshold: 1,
+            open_secs: 60,
+        });
         cb.record_failure().await;
         assert!(cb.check().await.is_err(), "open inside the cooldown");
         cb.core.lock().await.record_failure_at(ago(61));
@@ -1030,13 +1072,19 @@ mod tests {
         assert!(cb.status().await.open, "refusing others reads as open");
         cb.record_success().await;
         assert_eq!(cb.state_fast.load(Ordering::Acquire), BREAKER_CLOSED);
-        assert!(cb.check().await.is_ok() && cb.check().await.is_ok(), "closed again");
+        assert!(
+            cb.check().await.is_ok() && cb.check().await.is_ok(),
+            "closed again"
+        );
     }
 
     /// A failed probe re-opens the breaker for a fresh cooldown.
     #[tokio::test]
     async fn a_failed_probe_reopens() {
-        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 3, open_secs: 60 });
+        let cb = CircuitBreaker::new(BreakerCfg {
+            failure_threshold: 3,
+            open_secs: 60,
+        });
         for _ in 0..3 {
             cb.core.lock().await.record_failure_at(ago(61));
         }
@@ -1239,8 +1287,14 @@ mod tests {
         let ring = LatencyRing::new(1024);
         ring.record(Duration::from_millis(100));
         let (p50, p99) = ring.percentiles().unwrap();
-        assert!((p50 - 100.0).abs() < 1.0, "p50 diluted by empty slots: {p50}");
-        assert!((p99 - 100.0).abs() < 1.0, "p99 diluted by empty slots: {p99}");
+        assert!(
+            (p50 - 100.0).abs() < 1.0,
+            "p50 diluted by empty slots: {p50}"
+        );
+        assert!(
+            (p99 - 100.0).abs() < 1.0,
+            "p99 diluted by empty slots: {p99}"
+        );
     }
 
     #[tokio::test]

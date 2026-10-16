@@ -123,7 +123,9 @@ impl Hub {
                     .front()
                     .is_some_and(|r| now.duration_since(r.at) > self.keep)
             {
-                let Some(gone) = st.log.pop_front() else { break };
+                let Some(gone) = st.log.pop_front() else {
+                    break;
+                };
                 // A trimmed ring a reader set had not collected is a ring that
                 // set would never hear about; mark it so it resyncs.
                 let State { cursors, lost, .. } = &mut *st;
@@ -409,10 +411,17 @@ mod tests {
         h.ring(r(&["a"]), None);
         tokio::time::advance(Duration::from_secs(120)).await;
         h.ring(r(&["z"]), None); // a later ring trims the log
-        // The trimmed ring was "a"'s and uncollected: a count would be short
-        // (here zero), so the waiter is told to read its inbox.
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Resync);
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Timeout, "resync once");
+                                 // The trimmed ring was "a"'s and uncollected: a count would be short
+                                 // (here zero), so the waiter is told to read its inbox.
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+            Wake::Resync
+        );
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+            Wake::Timeout,
+            "resync once"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -422,7 +431,10 @@ mod tests {
         h.ring(r(&["b"]), None);
         tokio::time::advance(Duration::from_secs(120)).await;
         h.ring(r(&["z"]), None);
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Timeout);
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+            Wake::Timeout
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -434,7 +446,10 @@ mod tests {
         h.ring(r(&["a"]), None);
         h.ring(r(&["z", "z", "z"]), None); // pushes "a"'s ring out
         assert_eq!(h.status()["readers"]["a"]["aged_out"], 1);
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Resync);
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+            Wake::Resync
+        );
     }
 
     #[tokio::test(start_paused = true)]

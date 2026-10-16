@@ -7,7 +7,11 @@
 pub enum M3Error {
     /// `index` is the offending row when the input was a batch, `None` for a
     /// single vector.
-    VectorDimMismatch { expected: usize, got: usize, index: Option<usize> },
+    VectorDimMismatch {
+        expected: usize,
+        got: usize,
+        index: Option<usize>,
+    },
     DatabaseLocked,
     /// Input exceeds the model's context window — a CLIENT error, distinct from
     /// a backend failure.
@@ -28,19 +32,33 @@ pub enum M3Error {
     ///
     /// `index` is the position of the over-long text in the batch the CALLER
     /// submitted, `None` when unknown.
-    InputTooLong { tokens: usize, n_ctx: usize, index: Option<usize> },
+    InputTooLong {
+        tokens: usize,
+        n_ctx: usize,
+        index: Option<usize>,
+    },
     Backend(String),
     Io(std::io::Error),
     Config(String),
-    Parity { context: String, detail: String },
+    Parity {
+        context: String,
+        detail: String,
+    },
     Other(String),
 }
 
 impl std::fmt::Display for M3Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            M3Error::VectorDimMismatch { expected, got, index } => {
-                write!(f, "vector dimension mismatch: expected {expected}, got {got}")?;
+            M3Error::VectorDimMismatch {
+                expected,
+                got,
+                index,
+            } => {
+                write!(
+                    f,
+                    "vector dimension mismatch: expected {expected}, got {got}"
+                )?;
                 match index {
                     Some(i) => write!(f, " at row {i}"),
                     None => Ok(()),
@@ -50,7 +68,11 @@ impl std::fmt::Display for M3Error {
             // The leading wording is preserved VERBATIM from the former
             // Backend(String) form: existing clients (and #139's test fixtures)
             // match `N tokens > n_ctx M`. The index is only ever appended.
-            M3Error::InputTooLong { tokens, n_ctx, index } => {
+            M3Error::InputTooLong {
+                tokens,
+                n_ctx,
+                index,
+            } => {
                 write!(f, "input too long: {tokens} tokens > n_ctx {n_ctx}")?;
                 match index {
                     Some(i) => write!(f, " (input {i})"),
@@ -75,19 +97,32 @@ impl std::fmt::Display for M3Error {
 impl Clone for M3Error {
     fn clone(&self) -> Self {
         match self {
-            M3Error::VectorDimMismatch { expected, got, index } => {
-                M3Error::VectorDimMismatch { expected: *expected, got: *got, index: *index }
-            }
+            M3Error::VectorDimMismatch {
+                expected,
+                got,
+                index,
+            } => M3Error::VectorDimMismatch {
+                expected: *expected,
+                got: *got,
+                index: *index,
+            },
             M3Error::DatabaseLocked => M3Error::DatabaseLocked,
-            M3Error::InputTooLong { tokens, n_ctx, index } => {
-                M3Error::InputTooLong { tokens: *tokens, n_ctx: *n_ctx, index: *index }
-            }
+            M3Error::InputTooLong {
+                tokens,
+                n_ctx,
+                index,
+            } => M3Error::InputTooLong {
+                tokens: *tokens,
+                n_ctx: *n_ctx,
+                index: *index,
+            },
             M3Error::Backend(m) => M3Error::Backend(m.clone()),
             M3Error::Io(e) => M3Error::Io(std::io::Error::new(e.kind(), e.to_string())),
             M3Error::Config(m) => M3Error::Config(m.clone()),
-            M3Error::Parity { context, detail } => {
-                M3Error::Parity { context: context.clone(), detail: detail.clone() }
-            }
+            M3Error::Parity { context, detail } => M3Error::Parity {
+                context: context.clone(),
+                detail: detail.clone(),
+            },
             M3Error::Other(m) => M3Error::Other(m.clone()),
         }
     }
@@ -131,9 +166,20 @@ mod tests {
 
     #[test]
     fn input_too_long_keeps_the_parsed_prefix_and_appends_the_index() {
-        let e = M3Error::InputTooLong { tokens: 9000, n_ctx: 8192, index: Some(3) };
-        assert_eq!(e.to_string(), "input too long: 9000 tokens > n_ctx 8192 (input 3)");
-        let e = M3Error::InputTooLong { tokens: 9000, n_ctx: 8192, index: None };
+        let e = M3Error::InputTooLong {
+            tokens: 9000,
+            n_ctx: 8192,
+            index: Some(3),
+        };
+        assert_eq!(
+            e.to_string(),
+            "input too long: 9000 tokens > n_ctx 8192 (input 3)"
+        );
+        let e = M3Error::InputTooLong {
+            tokens: 9000,
+            n_ctx: 8192,
+            index: None,
+        };
         assert_eq!(e.to_string(), "input too long: 9000 tokens > n_ctx 8192");
     }
 }

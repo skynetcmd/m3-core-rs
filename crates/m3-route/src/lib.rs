@@ -9,8 +9,8 @@
 //! unit tests below cover branch selection, signal extraction, and tie-break
 //! determinism as an interim guard.
 
-use std::sync::OnceLock;
 use regex::Regex;
+use std::sync::OnceLock;
 
 /// Signals extracted from a query, fed into the scoring function.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +60,7 @@ fn intent_re() -> &'static Regex {
 fn entity_hint_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Quoted span, or two+ consecutive Capitalized words.
-    RE.get_or_init(|| {
-        Regex::new(r#"("[^"]+"|\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b)"#).unwrap()
-    })
+    RE.get_or_init(|| Regex::new(r#"("[^"]+"|\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b)"#).unwrap())
 }
 
 /// Pure feature extraction from a raw query string.
@@ -70,21 +68,25 @@ pub fn extract_signals(query: &str) -> RouteSignals {
     let token_count = query.split_whitespace().filter(|t| !t.is_empty()).count();
     let recency_cue = recency_re().is_match(query);
     let has_entity_hint = entity_hint_re().is_match(query);
-    let intent_marker = intent_re()
-        .find(query)
-        .map(|m| m.as_str().to_lowercase());
+    let intent_marker = intent_re().find(query).map(|m| m.as_str().to_lowercase());
     let trimmed = query.trim_end();
     let question_form = trimmed.ends_with('?') || {
         // First-word ASCII case-insensitive check — allocation-free.
         let first_word = query.split_whitespace().next().unwrap_or("");
         const PREFIXES: &[&str] = &[
-            "who", "what", "when", "where", "why", "how",
-            "which", "did", "is", "are", "was", "were",
+            "who", "what", "when", "where", "why", "how", "which", "did", "is", "are", "was",
+            "were",
         ];
         PREFIXES.iter().any(|&p| first_word.eq_ignore_ascii_case(p))
     };
 
-    RouteSignals { token_count, has_entity_hint, recency_cue, intent_marker, question_form }
+    RouteSignals {
+        token_count,
+        has_entity_hint,
+        recency_cue,
+        intent_marker,
+        question_form,
+    }
 }
 
 /// Multi-signal weighted scoring. Returns the chosen branch, its confidence
@@ -182,7 +184,12 @@ mod tests {
 
     #[test]
     fn extract_intent_marker() {
-        assert_eq!(extract_signals("compare these two").intent_marker.as_deref(), Some("compare"));
+        assert_eq!(
+            extract_signals("compare these two")
+                .intent_marker
+                .as_deref(),
+            Some("compare")
+        );
         assert_eq!(extract_signals("just chatting").intent_marker, None);
     }
 
@@ -232,7 +239,10 @@ mod tests {
         let d1 = decide_route("x", &signals);
         let d2 = decide_route("x", &signals);
         assert_eq!(d1.branch, d2.branch, "must be deterministic");
-        assert_eq!(d1.branch, "entity", "lexicographically first of the tied pair");
+        assert_eq!(
+            d1.branch, "entity",
+            "lexicographically first of the tied pair"
+        );
     }
 
     #[test]

@@ -61,7 +61,10 @@ pub async fn serve(
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| {
-            anyhow::anyhow!("cannot create the socket's directory {}: {e}", dir.display())
+            anyhow::anyhow!(
+                "cannot create the socket's directory {}: {e}",
+                dir.display()
+            )
         })?;
     }
     // Create with a 0177 umask so the socket is never briefly wider than 0600.
@@ -76,9 +79,8 @@ pub async fn serve(
             endpoint.len()
         )
     })?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-        anyhow::anyhow!("cannot restrict {endpoint} to mode 0600: {e}")
-    })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow::anyhow!("cannot restrict {endpoint} to mode 0600: {e}"))?;
     let me = unsafe { libc::geteuid() };
     log::info!("serving on unix socket {endpoint}");
     tokio::pin!(shutdown);
@@ -263,7 +265,10 @@ async fn next_instance<C>(
     endpoint: &str,
 ) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer>
 where
-    C: Fn(bool, &mut win::Attrs) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer>,
+    C: Fn(
+        bool,
+        &mut win::Attrs,
+    ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer>,
 {
     const TRIES: u32 = 50;
     let mut last = None;
@@ -271,7 +276,9 @@ where
         match create(false, attrs) {
             Ok(s) => return Ok(s),
             Err(e) => {
-                log::warn!("cannot create the next instance of {endpoint}: {e}; retrying in 100 ms");
+                log::warn!(
+                    "cannot create the next instance of {endpoint}: {e}; retrying in 100 ms"
+                );
                 last = Some(e);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }

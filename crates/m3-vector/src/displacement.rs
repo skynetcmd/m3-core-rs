@@ -110,7 +110,10 @@ mod tests {
     use super::*;
 
     fn row(score: f32, is_expansion: bool) -> DisplacementRow {
-        DisplacementRow { score, is_expansion }
+        DisplacementRow {
+            score,
+            is_expansion,
+        }
     }
 
     #[test]

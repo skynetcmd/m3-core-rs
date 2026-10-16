@@ -52,7 +52,11 @@ pub fn service_addr() -> anyhow::Result<(String, u16)> {
     let file = load_file_config(&default_config_path())?;
     let host = file.embed.host.unwrap_or_else(|| DEFAULT_HOST.into());
     // A wildcard bind is reached on loopback.
-    let host = if host == "0.0.0.0" { DEFAULT_HOST.into() } else { host };
+    let host = if host == "0.0.0.0" {
+        DEFAULT_HOST.into()
+    } else {
+        host
+    };
     Ok((host, file.embed.port.unwrap_or(DEFAULT_PORT)))
 }
 
@@ -190,26 +194,35 @@ fn edit_embed(path: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> anyhow::
     if !doc.contains_table("embed") {
         doc["embed"] = toml_edit::table();
     }
-    let embed = doc["embed"]
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[embed] in {} is not a table; correct the file, then retry", path.display()))?;
+    let embed = doc["embed"].as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "[embed] in {} is not a table; correct the file, then retry",
+            path.display()
+        )
+    })?;
     edit(embed);
     // The io::Error stays in the chain (render with {:#}) so a caller can tell
     // permission denied from other failures.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::Error::new(e).context(format!("cannot create config directory {}", parent.display()))
+            anyhow::Error::new(e).context(format!(
+                "cannot create config directory {}",
+                parent.display()
+            ))
         })?;
     }
-    std::fs::write(path, doc.to_string())
-        .map_err(|e| anyhow::Error::new(e).context(format!("cannot write config file {}", path.display())))?;
+    std::fs::write(path, doc.to_string()).map_err(|e| {
+        anyhow::Error::new(e).context(format!("cannot write config file {}", path.display()))
+    })?;
     Ok(())
 }
 
 /// Whether `e` was caused by a permission refusal anywhere in its chain.
 pub fn is_permission_denied(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied))
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// Default location for the service config file. The Unix service runs as a
@@ -223,13 +236,16 @@ pub fn default_config_path() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        let base = std::env::var("PROGRAMDATA")
-            .unwrap_or_else(|_| "C:\\ProgramData".into());
-        PathBuf::from(base).join("m3-embed-server").join("config.toml")
+        let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
+        PathBuf::from(base)
+            .join("m3-embed-server")
+            .join("config.toml")
     }
     #[cfg(not(windows))]
     {
-        user_config_base().join("m3-embed-server").join("config.toml")
+        user_config_base()
+            .join("m3-embed-server")
+            .join("config.toml")
     }
 }
 
@@ -243,13 +259,16 @@ pub fn default_config_path() -> PathBuf {
 pub fn default_log_path() -> PathBuf {
     #[cfg(windows)]
     {
-        let base = std::env::var("PROGRAMDATA")
-            .unwrap_or_else(|_| "C:\\ProgramData".into());
-        PathBuf::from(base).join("m3-embed-server").join("service.log")
+        let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
+        PathBuf::from(base)
+            .join("m3-embed-server")
+            .join("service.log")
     }
     #[cfg(not(windows))]
     {
-        user_state_base().join("m3-embed-server").join("service.log")
+        user_state_base()
+            .join("m3-embed-server")
+            .join("service.log")
     }
 }
 
@@ -335,7 +354,10 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
     let (gguf, source) = match env_str("M3_EMBED_GGUF") {
         Some(g) => (g, "M3_EMBED_GGUF".to_string()),
         None => match file.embed.gguf.clone() {
-            Some(g) => (g, format!("[embed].gguf in {}", default_config_path().display())),
+            Some(g) => (
+                g,
+                format!("[embed].gguf in {}", default_config_path().display()),
+            ),
             None => anyhow::bail!(
                 "M3_EMBED_GGUF is unset and {} has no [embed].gguf — set the env \
                  var, or run `m3-embed-server install` with it set",
@@ -350,7 +372,10 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
 
     let (host, host_source) = match (env_str("M3_EMBED_SERVER_HOST"), file.embed.host.clone()) {
         (Some(h), _) => (h, "M3_EMBED_SERVER_HOST".to_string()),
-        (None, Some(h)) => (h, format!("[embed].host in {}", default_config_path().display())),
+        (None, Some(h)) => (
+            h,
+            format!("[embed].host in {}", default_config_path().display()),
+        ),
         (None, None) => (DEFAULT_HOST.to_string(), "the default".to_string()),
     };
 
@@ -469,7 +494,10 @@ pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
         anyhow::anyhow!("refusing to record install settings: {e:#}. Correct the file (or remove it), then retry")
     })?;
     let env = snapshot_env_to_file().embed;
-    let int = |v: Option<u64>| v.and_then(|v| i64::try_from(v).ok()).map(toml_edit::Value::from);
+    let int = |v: Option<u64>| {
+        v.and_then(|v| i64::try_from(v).ok())
+            .map(toml_edit::Value::from)
+    };
     let set: [(&str, Option<toml_edit::Value>); 12] = [
         ("gguf", env.gguf.map(toml_edit::Value::from)),
         ("port", int(env.port.map(u64::from))),
@@ -480,7 +508,10 @@ pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
         ("n_batch", int(env.n_batch.map(u64::from))),
         ("n_ubatch", int(env.n_ubatch.map(u64::from))),
         ("coalesce_ms", int(env.coalesce_ms)),
-        ("max_batch_tokens", int(env.max_batch_tokens.map(|v| v as u64))),
+        (
+            "max_batch_tokens",
+            int(env.max_batch_tokens.map(|v| v as u64)),
+        ),
         ("fips_mode", env.fips_mode.map(toml_edit::Value::from)),
         ("fips_strict", env.fips_strict.map(toml_edit::Value::from)),
     ];
@@ -599,10 +630,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[embed]\ngguf = \"/m/bge.gguf\"\nstreams = 3\n").unwrap();
-        let saved: Vec<(&str, Option<String>)> = ["M3_EMBED_SERVER_PORT", "M3_EMBED_GGUF", "M3_EMBED_STREAMS"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
+        let saved: Vec<(&str, Option<String>)> =
+            ["M3_EMBED_SERVER_PORT", "M3_EMBED_GGUF", "M3_EMBED_STREAMS"]
+                .iter()
+                .map(|k| (*k, std::env::var(k).ok()))
+                .collect();
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
@@ -663,13 +695,20 @@ mod tests {
         std::fs::write(&path, broken).unwrap();
         let e = merge_env_into_file(&path).unwrap_err().to_string();
         assert!(e.contains("refusing") && e.contains("config.toml"), "{e}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "a refused file is left untouched");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            broken,
+            "a refused file is left untouched"
+        );
 
         let good = "[embed]\n# chosen for this box\nstreams = 3\n";
         std::fs::write(&path, good).unwrap();
         merge_env_into_file(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# chosen for this box") && text.contains("streams = 3"), "{text}");
+        assert!(
+            text.contains("# chosen for this box") && text.contains("streams = 3"),
+            "{text}"
+        );
     }
 
     fn temp_env_without_streams<T>(f: impl FnOnce() -> T) -> T {

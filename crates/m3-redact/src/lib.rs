@@ -171,7 +171,9 @@ impl Redactor {
                     if let Some(specs) = builtin_group("pii") {
                         let compiled: Vec<Regex> = specs
                             .iter()
-                            .map(|(_, src)| Regex::new(src).expect("builtin pii regex must compile"))
+                            .map(|(_, src)| {
+                                Regex::new(src).expect("builtin pii regex must compile")
+                            })
                             .collect();
                         groups.push(("pii".to_string(), compiled));
                     }
@@ -216,9 +218,7 @@ impl Redactor {
                     if let Some(specs) = builtin_group(group_name) {
                         let compiled: Vec<Regex> = specs
                             .iter()
-                            .map(|(_, src)| {
-                                Regex::new(src).expect("builtin regex must compile")
-                            })
+                            .map(|(_, src)| Regex::new(src).expect("builtin regex must compile"))
                             .collect();
                         groups.push((group_name.to_string(), compiled));
                     }
@@ -290,7 +290,6 @@ impl Redactor {
     }
 }
 
-
 /// Convenience: build a throwaway `Redactor` and scrub in one call.
 /// Faithful to Python's per-call `compile_patterns()` + `scrub()`.
 ///
@@ -352,7 +351,10 @@ mod tests {
         };
         let errs = Redactor::new(&cfg).compile_errors().to_vec();
         assert_eq!(errs.len(), 1, "{errs:?}");
-        assert!(errs[0].contains("\"api_key\"") && errs[0].contains("patterns[1]"), "{errs:?}");
+        assert!(
+            errs[0].contains("\"api_key\"") && errs[0].contains("patterns[1]"),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -367,6 +369,9 @@ mod tests {
         let errs = Redactor::new(&cfg).compile_errors().to_vec();
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(!errs[0].contains("SECRET"), "pattern text leaked: {errs:?}");
-        assert!(errs[0].contains("custom_regex[0]") && errs[0].contains("23 chars"), "{errs:?}");
+        assert!(
+            errs[0].contains("custom_regex[0]") && errs[0].contains("23 chars"),
+            "{errs:?}"
+        );
     }
 }

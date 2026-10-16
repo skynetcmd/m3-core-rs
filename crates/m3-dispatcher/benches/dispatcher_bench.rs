@@ -12,8 +12,7 @@ use m3_dispatcher::estimate_tokens;
 
 fn bench_estimate_tokens(c: &mut Criterion) {
     // Deterministic 500-char string (no RNG needed; same string each iter).
-    let s: String = "the quick brown fox jumps over the lazy dog. "
-        .repeat(12); // ~540 chars
+    let s: String = "the quick brown fox jumps over the lazy dog. ".repeat(12); // ~540 chars
     let s = s[..500].to_string();
     c.bench_function("estimate_tokens_500ch", |b| {
         b.iter(|| estimate_tokens(black_box(&s)));

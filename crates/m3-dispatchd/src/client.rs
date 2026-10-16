@@ -30,16 +30,18 @@ async fn connect(endpoint: &str) -> Result<tokio::net::UnixStream, ClientError> 
     // Only a missing socket or a refused one means "no daemon": the caller
     // then polls. Access denied is a daemon this user may not use, which
     // polling would hide.
-    tokio::net::UnixStream::connect(endpoint).await.map_err(|e| match e.kind() {
-        ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
-            ClientError::NoDaemon(format!("{endpoint}: {e}"))
-        }
-        ErrorKind::PermissionDenied => ClientError::Failed(format!(
+    tokio::net::UnixStream::connect(endpoint)
+        .await
+        .map_err(|e| match e.kind() {
+            ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
+                ClientError::NoDaemon(format!("{endpoint}: {e}"))
+            }
+            ErrorKind::PermissionDenied => ClientError::Failed(format!(
             "{endpoint}: {e}. The socket exists but this user may not connect: it is mode 0600 for \
              the user who started m3-dispatchd, so another user's daemon may hold this path"
         )),
-        _ => ClientError::Failed(format!("connecting to {endpoint}: {e}")),
-    })
+            _ => ClientError::Failed(format!("connecting to {endpoint}: {e}")),
+        })
 }
 
 #[cfg(windows)]

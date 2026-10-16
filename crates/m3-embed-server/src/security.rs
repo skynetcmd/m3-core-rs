@@ -105,8 +105,15 @@ impl Security {
         match &self.remote {
             None => format!("{local} plaintext (loopback only); no listener for other machines"),
             Some(r) => {
-                let module = if provider_is_fips() { "aws-lc-rs FIPS module" } else { "aws-lc-rs, not the FIPS module" };
-                format!("{local} plaintext (loopback only); {} TLS 1.3 ({module}) with a bearer token", r.addr)
+                let module = if provider_is_fips() {
+                    "aws-lc-rs FIPS module"
+                } else {
+                    "aws-lc-rs, not the FIPS module"
+                };
+                format!(
+                    "{local} plaintext (loopback only); {} TLS 1.3 ({module}) with a bearer token",
+                    r.addr
+                )
             }
         }
     }
@@ -133,17 +140,20 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
         None => None,
         Some(hex) => Some(parse_digest(hex)?),
     };
-    let tls_pair = match (&cfg.tls_cert, &cfg.tls_key) {
-        (None, None) => None,
-        (Some(cert), Some(key)) => Some((cert, key)),
-        (cert, _) => anyhow::bail!(
+    let tls_pair =
+        match (&cfg.tls_cert, &cfg.tls_key) {
+            (None, None) => None,
+            (Some(cert), Some(key)) => Some((cert, key)),
+            (cert, _) => {
+                anyhow::bail!(
             "{} has {} but not {}: tls_cert and tls_key must be set together. Set both with \
              `m3 embedder secure`, or remove both with `m3 embedder secure --off`",
             cfg.file(),
             if cert.is_some() { "tls_cert" } else { "tls_key" },
             if cert.is_some() { "tls_key" } else { "tls_cert" },
-        ),
-    };
+        )
+            }
+        };
     let Some(remote) = cfg.remote_listen.as_deref() else {
         let unused = match (tls_pair.is_some(), token_digest.is_some()) {
             (true, true) => Some("TLS (tls_cert, tls_key) and a token (token_sha256) are"),
@@ -167,7 +177,9 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
     }
     let (Some((cert, key)), Some(token_digest)) = (tls_pair, token_digest) else {
         let missing = match (tls_pair.is_some(), token_digest.is_some()) {
-            (false, false) => "has neither TLS (tls_cert, tls_key) nor a bearer token (token_sha256)",
+            (false, false) => {
+                "has neither TLS (tls_cert, tls_key) nor a bearer token (token_sha256)"
+            }
             (false, true) => "has no TLS certificate and key (tls_cert, tls_key)",
             _ => "has no bearer token (token_sha256)",
         };
@@ -195,7 +207,13 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
         );
     }
     let tls = Arc::new(server_tls_config(cert, key)?);
-    Ok(Security { remote: Some(Remote { addr, tls, token_digest }) })
+    Ok(Security {
+        remote: Some(Remote {
+            addr,
+            tls,
+            token_digest,
+        }),
+    })
 }
 
 /// `IP` or `IP:port` (IPv6 as `[::1]:port`); a bare IP takes `default_port`.
@@ -204,10 +222,16 @@ pub fn parse_listen(s: &str, default_port: u16) -> anyhow::Result<SocketAddr> {
     if let Ok(a) = s.parse::<SocketAddr>() {
         return Ok(a);
     }
-    if let Ok(ip) = s.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+    if let Ok(ip) = s
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
         return Ok(SocketAddr::new(ip, default_port));
     }
-    anyhow::bail!("remote_listen {s:?} is not an IP address or IP:port (a hostname is not accepted)")
+    anyhow::bail!(
+        "remote_listen {s:?} is not an IP address or IP:port (a hostname is not accepted)"
+    )
 }
 
 fn parse_digest(hex: &str) -> anyhow::Result<[u8; 32]> {
@@ -390,11 +414,20 @@ fn warn_rejected(peer: &str, method: &axum::http::Method, path: &str, why: &Auth
         .unwrap_or(0);
     let last = LAST_REJECT_WARN_S.load(Relaxed);
     if now.saturating_sub(last) >= REJECT_WARN_EVERY_S
-        && LAST_REJECT_WARN_S.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
+        && LAST_REJECT_WARN_S
+            .compare_exchange(last, now, Relaxed, Relaxed)
+            .is_ok()
     {
         let quiet = REJECTS_UNREPORTED.swap(0, Relaxed);
-        let more = if quiet > 0 { format!(" ({quiet} more rejected since the last report)") } else { String::new() };
-        log::warn!("rejected {method} {path} from {peer}: {}{more}", why.reason());
+        let more = if quiet > 0 {
+            format!(" ({quiet} more rejected since the last report)")
+        } else {
+            String::new()
+        };
+        log::warn!(
+            "rejected {method} {path} from {peer}: {}{more}",
+            why.reason()
+        );
     } else {
         REJECTS_UNREPORTED.fetch_add(1, Relaxed);
         log::debug!("rejected {method} {path} from {peer}: {}", why.reason());
@@ -402,7 +435,11 @@ fn warn_rejected(peer: &str, method: &axum::http::Method, path: &str, why: &Auth
 }
 
 /// Axum middleware: every route except `/health` needs `Authorization: Bearer`.
-pub async fn require_bearer(State(want): State<Arc<[u8; 32]>>, req: Request, next: Next) -> Response {
+pub async fn require_bearer(
+    State(want): State<Arc<[u8; 32]>>,
+    req: Request,
+    next: Next,
+) -> Response {
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
@@ -504,7 +541,10 @@ where
         }
     }
     drop(listener);
-    if tokio::time::timeout(Duration::from_secs(10), graceful.shutdown()).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(10), graceful.shutdown())
+        .await
+        .is_err()
+    {
         log::warn!("connections still open 10 s after shutdown; closing them");
     }
     Ok(())
@@ -531,7 +571,8 @@ mod tests {
     }
 
     fn self_signed() -> Pem {
-        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+        let ck = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
+            .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let cert = dir.path().join("cert.pem");
         let key = dir.path().join("key.pem");
@@ -542,7 +583,12 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        Pem { ca_der: ck.cert.der().to_vec(), _dir: dir, cert, key }
+        Pem {
+            ca_der: ck.cert.der().to_vec(),
+            _dir: dir,
+            cert,
+            key,
+        }
     }
 
     fn secured(pem: &Pem, listen: &str) -> SecurityConfig {
@@ -557,7 +603,10 @@ mod tests {
 
     #[test]
     fn the_default_is_loopback_plaintext_with_no_remote_listener() {
-        assert!(plan(LOCAL, &SecurityConfig::default()).unwrap().remote.is_none());
+        assert!(plan(LOCAL, &SecurityConfig::default())
+            .unwrap()
+            .remote
+            .is_none());
         let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8082);
         assert!(plan(v6, &SecurityConfig::default()).is_ok());
     }
@@ -565,9 +614,16 @@ mod tests {
     #[test]
     fn a_non_loopback_host_is_refused_and_pointed_at_remote_listen() {
         let pem = self_signed();
-        for ip in [LAN, IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
+        for ip in [
+            LAN,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ] {
             // Refused even with TLS and a token configured: the host listener is plaintext.
-            let e = plan(SocketAddr::new(ip, 8082), &secured(&pem, "100.100.50.63")).err().unwrap().to_string();
+            let e = plan(SocketAddr::new(ip, 8082), &secured(&pem, "100.100.50.63"))
+                .err()
+                .unwrap()
+                .to_string();
             assert!(e.contains("plaintext") && e.contains("--listen"), "{e}");
         }
     }
@@ -577,17 +633,39 @@ mod tests {
         let pem = self_signed();
         let full = secured(&pem, "100.100.50.63");
         let r = plan(LOCAL, &full).unwrap().remote.expect("remote listener");
-        assert_eq!(r.addr, SocketAddr::new(LAN, 8082), "a bare IP takes the local port");
-        let no_token = SecurityConfig { token_sha256: None, ..full.clone() };
-        let no_tls = SecurityConfig { tls_cert: None, tls_key: None, ..full.clone() };
+        assert_eq!(
+            r.addr,
+            SocketAddr::new(LAN, 8082),
+            "a bare IP takes the local port"
+        );
+        let no_token = SecurityConfig {
+            token_sha256: None,
+            ..full.clone()
+        };
+        let no_tls = SecurityConfig {
+            tls_cert: None,
+            tls_key: None,
+            ..full.clone()
+        };
         for cfg in [no_token, no_tls] {
             let e = plan(LOCAL, &cfg).err().unwrap().to_string();
-            assert!(e.contains("needs both") && e.contains("m3 embedder secure"), "{e}");
+            assert!(
+                e.contains("needs both") && e.contains("m3 embedder secure"),
+                "{e}"
+            );
         }
         let same = secured(&pem, "127.0.0.1:8082");
-        assert!(plan(LOCAL, &same).err().unwrap().to_string().contains("own address"));
+        assert!(plan(LOCAL, &same)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("own address"));
         let host = secured(&pem, "embed.example.ts.net");
-        assert!(plan(LOCAL, &host).err().unwrap().to_string().contains("hostname is not accepted"));
+        assert!(plan(LOCAL, &host)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("hostname is not accepted"));
         assert_eq!(parse_listen("[::1]:9", 1).unwrap().port(), 9);
         assert_eq!(parse_listen("::1", 7).unwrap().port(), 7);
     }
@@ -595,18 +673,38 @@ mod tests {
     #[test]
     fn tls_without_remote_listen_serves_loopback_only() {
         let pem = self_signed();
-        let cfg = SecurityConfig { remote_listen: None, ..secured(&pem, "x") };
+        let cfg = SecurityConfig {
+            remote_listen: None,
+            ..secured(&pem, "x")
+        };
         assert!(plan(LOCAL, &cfg).unwrap().remote.is_none());
     }
 
     #[test]
     fn half_a_tls_pair_and_a_malformed_digest_are_refused() {
         let pem = self_signed();
-        let half = SecurityConfig { tls_cert: Some(pem.cert), ..Default::default() };
-        assert!(plan(LOCAL, &half).err().unwrap().to_string().contains("set together"));
-        let bad = SecurityConfig { token_sha256: Some("abc".into()), ..Default::default() };
-        assert!(plan(LOCAL, &bad).err().unwrap().to_string().contains("64 hexadecimal"));
-        let non_hex = SecurityConfig { token_sha256: Some("z".repeat(64)), ..Default::default() };
+        let half = SecurityConfig {
+            tls_cert: Some(pem.cert),
+            ..Default::default()
+        };
+        assert!(plan(LOCAL, &half)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("set together"));
+        let bad = SecurityConfig {
+            token_sha256: Some("abc".into()),
+            ..Default::default()
+        };
+        assert!(plan(LOCAL, &bad)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("64 hexadecimal"));
+        let non_hex = SecurityConfig {
+            token_sha256: Some("z".repeat(64)),
+            ..Default::default()
+        };
         assert!(plan(LOCAL, &non_hex).is_err());
     }
 
@@ -614,21 +712,39 @@ mod tests {
     /// is named by position only, since the text may be the token itself.
     #[test]
     fn a_malformed_digest_says_which_mistake_without_echoing_it() {
-        let e = parse_digest(&format!("{}Q{}", "a".repeat(10), "b".repeat(53))).unwrap_err().to_string();
-        assert!(e.contains("position 11") && e.contains("paste the token itself"), "{e}");
+        let e = parse_digest(&format!("{}Q{}", "a".repeat(10), "b".repeat(53)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("position 11") && e.contains("paste the token itself"),
+            "{e}"
+        );
         assert!(!e.contains('Q') && !e.contains("got 64"), "{e}");
         let e = parse_digest(&"a".repeat(63)).unwrap_err().to_string();
-        assert!(e.contains("got 63 characters") && !e.contains("position"), "{e}");
+        assert!(
+            e.contains("got 63 characters") && !e.contains("position"),
+            "{e}"
+        );
         assert!(parse_digest(&"A".repeat(64)).is_ok());
     }
 
     #[test]
     fn a_half_tls_pair_and_unused_keys_name_what_is_missing() {
-        let half = SecurityConfig { tls_key: Some("/k.pem".into()), config_path: "/c/config.toml".into(), ..Default::default() };
+        let half = SecurityConfig {
+            tls_key: Some("/k.pem".into()),
+            config_path: "/c/config.toml".into(),
+            ..Default::default()
+        };
         let e = plan(LOCAL, &half).err().unwrap().to_string();
-        assert!(e.contains("/c/config.toml has tls_key but not tls_cert"), "{e}");
+        assert!(
+            e.contains("/c/config.toml has tls_key but not tls_cert"),
+            "{e}"
+        );
         let pem = self_signed();
-        let no_token = SecurityConfig { token_sha256: None, ..secured(&pem, "100.100.50.63") };
+        let no_token = SecurityConfig {
+            token_sha256: None,
+            ..secured(&pem, "100.100.50.63")
+        };
         let e = plan(LOCAL, &no_token).err().unwrap().to_string();
         assert!(e.contains("has no bearer token (token_sha256)"), "{e}");
     }
@@ -638,10 +754,20 @@ mod tests {
         let want = token_digest(b"right");
         let h = |s: &str| header::HeaderValue::from_str(s).unwrap();
         assert_eq!(check_bearer(None, &want), Err(AuthFailure::NoHeader));
-        assert_eq!(check_bearer(Some(&h("Basic dXNlcjpwdw==")), &want), Err(AuthFailure::NotBearer));
-        assert_eq!(check_bearer(Some(&h("Bearer wrong")), &want), Err(AuthFailure::WrongToken));
+        assert_eq!(
+            check_bearer(Some(&h("Basic dXNlcjpwdw==")), &want),
+            Err(AuthFailure::NotBearer)
+        );
+        assert_eq!(
+            check_bearer(Some(&h("Bearer wrong")), &want),
+            Err(AuthFailure::WrongToken)
+        );
         assert_eq!(check_bearer(Some(&h("Bearer right")), &want), Ok(()));
-        assert_eq!(check_bearer(Some(&h("bearer right")), &want), Ok(()), "the scheme is case-insensitive");
+        assert_eq!(
+            check_bearer(Some(&h("bearer right")), &want),
+            Ok(()),
+            "the scheme is case-insensitive"
+        );
     }
 
     /// A plaintext client on the TLS port is recognisable, so the log can say
@@ -650,15 +776,25 @@ mod tests {
     async fn a_plaintext_client_is_recognised_in_the_handshake_error() {
         use tokio::io::AsyncWriteExt;
         let pem = self_signed();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls_config(&pem.cert, &pem.key).unwrap()));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
+            server_tls_config(&pem.cert, &pem.key).unwrap(),
+        ));
         let (mut client, server) = tokio::io::duplex(4096);
-        client.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         let Err(e) = acceptor.accept(server).await else {
             panic!("a plaintext client completed a TLS handshake");
         };
         let r = e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>());
         assert!(
-            matches!(r, Some(rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType))),
+            matches!(
+                r,
+                Some(rustls::Error::InvalidMessage(
+                    rustls::InvalidMessage::InvalidContentType
+                ))
+            ),
             "{e:?}"
         );
     }
@@ -673,7 +809,10 @@ mod tests {
     #[test]
     fn fips_strict_refuses_tls_from_a_build_without_the_fips_module() {
         let pem = self_signed();
-        let cfg = SecurityConfig { fips_strict: true, ..secured(&pem, "100.100.50.63") };
+        let cfg = SecurityConfig {
+            fips_strict: true,
+            ..secured(&pem, "100.100.50.63")
+        };
         let r = plan(LOCAL, &cfg);
         if provider_is_fips() {
             assert!(r.is_ok());
@@ -681,7 +820,14 @@ mod tests {
             assert!(r.err().unwrap().to_string().contains("FIPS build"));
         }
         // Loopback only needs no TLS, so strict mode does not refuse it.
-        assert!(plan(LOCAL, &SecurityConfig { fips_strict: true, ..Default::default() }).is_ok());
+        assert!(plan(
+            LOCAL,
+            &SecurityConfig {
+                fips_strict: true,
+                ..Default::default()
+            }
+        )
+        .is_ok());
     }
 
     #[cfg(unix)]
@@ -690,7 +836,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let pem = self_signed();
         std::fs::set_permissions(&pem.key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let e = server_tls_config(&pem.cert, &pem.key).err().unwrap().to_string();
+        let e = server_tls_config(&pem.cert, &pem.key)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(e.contains("chmod 600"), "{e}");
     }
 
@@ -719,7 +868,10 @@ mod tests {
         let app = axum::Router::new()
             .route("/health", get(|| async { "ok" }))
             .route("/embedding", get(|| async { "vec" }))
-            .layer(axum::middleware::from_fn_with_state(Arc::new(remote.token_digest), require_bearer));
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(remote.token_digest),
+                require_bearer,
+            ));
         let listener = tokio::net::TcpListener::bind((LOOP, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -729,11 +881,12 @@ mod tests {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from(pem.ca_der.clone())).unwrap();
-        let client_cfg = rustls::ClientConfig::builder_with_provider(Arc::new(provider::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let client_cfg =
+            rustls::ClientConfig::builder_with_provider(Arc::new(provider::default_provider()))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
 
         async fn get_status(
@@ -746,31 +899,58 @@ mod tests {
             let tcp = tokio::net::TcpStream::connect((LOOP, port)).await.unwrap();
             let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
             let mut tls = connector.connect(name, tcp).await.unwrap();
-            assert_eq!(tls.get_ref().1.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
-            let auth = auth.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-            let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n");
+            assert_eq!(
+                tls.get_ref().1.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+            let auth = auth
+                .map(|t| format!("Authorization: Bearer {t}\r\n"))
+                .unwrap_or_default();
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n"
+            );
             tls.write_all(req.as_bytes()).await.unwrap();
             let mut buf = Vec::new();
             let _ = tls.read_to_end(&mut buf).await;
-            String::from_utf8_lossy(&buf).lines().next().unwrap_or_default().to_string()
+            String::from_utf8_lossy(&buf)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
         }
 
-        assert!(get_status(&connector, port, "/health", None).await.contains("200"));
-        assert!(get_status(&connector, port, "/embedding", None).await.contains("401"));
-        assert!(get_status(&connector, port, "/embedding", Some("wrong")).await.contains("401"));
-        assert!(get_status(&connector, port, "/embedding", Some(token)).await.contains("200"));
+        assert!(get_status(&connector, port, "/health", None)
+            .await
+            .contains("200"));
+        assert!(get_status(&connector, port, "/embedding", None)
+            .await
+            .contains("401"));
+        assert!(get_status(&connector, port, "/embedding", Some("wrong"))
+            .await
+            .contains("401"));
+        assert!(get_status(&connector, port, "/embedding", Some(token))
+            .await
+            .contains("200"));
 
         // A plaintext client gets no HTTP answer from the TLS port.
         {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut tcp = tokio::net::TcpStream::connect((LOOP, port)).await.unwrap();
-            tcp.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+            tcp.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
+                .unwrap();
             let mut buf = Vec::new();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut buf)).await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), tcp.read_to_end(&mut buf))
+                    .await;
             assert!(!String::from_utf8_lossy(&buf).contains("200 OK"));
         }
 
         stop_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(15), server).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

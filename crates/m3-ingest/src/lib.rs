@@ -76,7 +76,10 @@ pub fn walk(
 ) -> m3_error::Result<Walk> {
     let root_path = Path::new(root);
     let rd = std::fs::read_dir(root_path).map_err(|e| {
-        m3_error::M3Error::Io(std::io::Error::new(e.kind(), format!("cannot read walk root '{root}': {e}")))
+        m3_error::M3Error::Io(std::io::Error::new(
+            e.kind(),
+            format!("cannot read walk root '{root}': {e}"),
+        ))
     })?;
     let mut w = Walk::default();
     let ignore: HashSet<&str> = dir_ignores.iter().map(|s| s.as_str()).collect();
@@ -84,7 +87,11 @@ pub fn walk(
     if let Ok(c) = std::fs::canonicalize(root_path) {
         visited.insert(c);
     }
-    let ctx = Ctx { max_depth, follow_symlinks, ignore: &ignore };
+    let ctx = Ctx {
+        max_depth,
+        follow_symlinks,
+        ignore: &ignore,
+    };
     recurse(rd, 0, &ctx, &mut visited, &mut w);
     Ok(w)
 }
@@ -96,10 +103,19 @@ struct Ctx<'a> {
 }
 
 fn record(w: &mut Walk, path: &Path, error: impl std::fmt::Display) {
-    w.errors.push(WalkError { path: path.to_string_lossy().into_owned(), error: error.to_string() });
+    w.errors.push(WalkError {
+        path: path.to_string_lossy().into_owned(),
+        error: error.to_string(),
+    });
 }
 
-fn recurse(rd: std::fs::ReadDir, depth: usize, ctx: &Ctx<'_>, visited: &mut HashSet<PathBuf>, w: &mut Walk) {
+fn recurse(
+    rd: std::fs::ReadDir,
+    depth: usize,
+    ctx: &Ctx<'_>,
+    visited: &mut HashSet<PathBuf>,
+    w: &mut Walk,
+) {
     for entry in rd {
         let entry = match entry {
             Ok(e) => e,
@@ -145,21 +161,38 @@ fn recurse(rd: std::fs::ReadDir, depth: usize, ctx: &Ctx<'_>, visited: &mut Hash
             .unwrap_or(0.0);
 
         if !is_dir {
-            w.entries.push(Entry { path: path_str, size: meta.len(), mtime, is_dir: false });
+            w.entries.push(Entry {
+                path: path_str,
+                size: meta.len(),
+                mtime,
+                is_dir: false,
+            });
             continue;
         }
-        let basename = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let basename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         // Cheap dir-ignore stage (parity with `bn in dir_ignores`).
         if ctx.ignore.contains(basename.as_str()) {
             continue;
         }
-        w.entries.push(Entry { path: path_str, size: 0, mtime, is_dir: true });
+        w.entries.push(Entry {
+            path: path_str,
+            size: 0,
+            mtime,
+            is_dir: true,
+        });
         let child_depth = depth + 1;
         if ctx.max_depth.is_some_and(|md| child_depth > md) {
             continue;
         }
         if child_depth > MAX_WALK_DEPTH {
-            record(w, &path, format!("not descended: deeper than the {MAX_WALK_DEPTH}-level walk ceiling"));
+            record(
+                w,
+                &path,
+                format!("not descended: deeper than the {MAX_WALK_DEPTH}-level walk ceiling"),
+            );
             continue;
         }
         if ctx.follow_symlinks {
@@ -169,7 +202,10 @@ fn recurse(rd: std::fs::ReadDir, depth: usize, ctx: &Ctx<'_>, visited: &mut Hash
                         record(
                             w,
                             &path,
-                            format!("not descended: {} was already walked (symlink cycle or alias)", real.display()),
+                            format!(
+                                "not descended: {} was already walked (symlink cycle or alias)",
+                                real.display()
+                            ),
                         );
                         continue;
                     }
@@ -270,7 +306,9 @@ mod tests {
         std::fs::write(dir.join("top.txt"), b"t").unwrap();
         std::fs::write(dir.join("sub/deep.txt"), b"d").unwrap();
 
-        let entries = walk(&dir.to_string_lossy(), &[], Some(0), false).unwrap().entries;
+        let entries = walk(&dir.to_string_lossy(), &[], Some(0), false)
+            .unwrap()
+            .entries;
         let files: Vec<&str> = entries
             .iter()
             .filter(|e| !e.is_dir)
@@ -284,7 +322,10 @@ mod tests {
     fn a_missing_root_is_an_error_not_an_empty_tree() {
         let e = walk("/nonexistent/m3/ingest/root", &[], None, false).unwrap_err();
         assert!(e.to_string().contains("cannot read walk root"), "{e}");
-        assert!(matches!(e, m3_error::M3Error::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound), "{e}");
+        assert!(
+            matches!(e, m3_error::M3Error::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{e}"
+        );
     }
 
     /// A link back up the tree is walked once and reported, not followed
@@ -297,7 +338,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("a")).unwrap();
         std::os::unix::fs::symlink(&dir, dir.join("a/loop")).unwrap();
         let w = walk(&dir.to_string_lossy(), &[], None, true).unwrap();
-        assert!(w.errors.iter().any(|e| e.error.contains("already walked")), "{:?}", w.errors);
+        assert!(
+            w.errors.iter().any(|e| e.error.contains("already walked")),
+            "{:?}",
+            w.errors
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

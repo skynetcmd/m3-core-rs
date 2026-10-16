@@ -29,7 +29,14 @@ fn parse(argv: &[String]) -> anyhow::Result<Args> {
         };
         let number = |v: String| {
             v.parse::<u64>().map_err(|e| {
-                anyhow::anyhow!("{a} {v:?} is not a whole number of {}: {e}", if a == "--keep-s" { "seconds" } else { "milliseconds" })
+                anyhow::anyhow!(
+                    "{a} {v:?} is not a whole number of {}: {e}",
+                    if a == "--keep-s" {
+                        "seconds"
+                    } else {
+                        "milliseconds"
+                    }
+                )
             })
         };
         match a.as_str() {
@@ -39,9 +46,13 @@ fn parse(argv: &[String]) -> anyhow::Result<Args> {
             other => anyhow::bail!("unknown argument {other:?}\n{USAGE}"),
         }
     }
-    let endpoint =
-        endpoint.ok_or_else(|| anyhow::anyhow!("--endpoint PATH is required (m3 passes it)\n{USAGE}"))?;
-    Ok(Args { endpoint, window_ms, keep_s })
+    let endpoint = endpoint
+        .ok_or_else(|| anyhow::anyhow!("--endpoint PATH is required (m3 passes it)\n{USAGE}"))?;
+    Ok(Args {
+        endpoint,
+        window_ms,
+        keep_s,
+    })
 }
 
 /// Resolves on Ctrl-C. A handler that cannot be installed is warned about and
@@ -64,7 +75,11 @@ fn main() -> anyhow::Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-    let Args { endpoint, window_ms, keep_s } = parse(&argv)?;
+    let Args {
+        endpoint,
+        window_ms,
+        keep_s,
+    } = parse(&argv)?;
     let hub = Arc::new(Hub::new(
         Duration::from_millis(window_ms),
         Duration::from_secs(keep_s),
@@ -117,12 +132,29 @@ mod tests {
     #[test]
     fn arguments_are_known_or_refused_by_name() {
         let a = parse(&v(&["--endpoint", "/s", "--keep-s", "60"])).unwrap();
-        assert_eq!((a.endpoint.as_str(), a.window_ms, a.keep_s), ("/s", 250, 60));
-        let e = parse(&v(&["--endpoint", "/s", "--keep", "60"])).err().unwrap().to_string();
+        assert_eq!(
+            (a.endpoint.as_str(), a.window_ms, a.keep_s),
+            ("/s", 250, 60)
+        );
+        let e = parse(&v(&["--endpoint", "/s", "--keep", "60"]))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(e.contains("unknown argument \"--keep\""), "{e}");
-        let e = parse(&v(&["--endpoint", "/s", "--coalesce-ms", "2x"])).err().unwrap().to_string();
+        let e = parse(&v(&["--endpoint", "/s", "--coalesce-ms", "2x"]))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(e.contains("--coalesce-ms \"2x\""), "{e}");
-        assert!(parse(&v(&["--keep-s", "1"])).err().unwrap().to_string().contains("--endpoint"));
-        assert!(parse(&v(&["--endpoint"])).err().unwrap().to_string().contains("needs a value"));
+        assert!(parse(&v(&["--keep-s", "1"]))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("--endpoint"));
+        assert!(parse(&v(&["--endpoint"]))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("needs a value"));
     }
 }

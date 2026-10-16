@@ -31,7 +31,10 @@ pub struct FusionWeights {
 
 impl Default for FusionWeights {
     fn default() -> Self {
-        FusionWeights { fts: 0.5, vector: 0.5 }
+        FusionWeights {
+            fts: 0.5,
+            vector: 0.5,
+        }
     }
 }
 
@@ -46,7 +49,11 @@ fn min_max_normalize(rows: &mut [RankRow]) {
     }
     let range = hi - lo;
     for r in rows.iter_mut() {
-        r.score = if range > 0.0 { (r.score - lo) / range } else { 1.0 };
+        r.score = if range > 0.0 {
+            (r.score - lo) / range
+        } else {
+            1.0
+        };
     }
 }
 
@@ -136,7 +143,11 @@ mod tests {
     use super::*;
 
     fn row(id: &str, score: f32, source: RankSource) -> RankRow {
-        RankRow { id: id.to_string(), score, source }
+        RankRow {
+            id: id.to_string(),
+            score,
+            source,
+        }
     }
 
     #[test]
@@ -154,16 +165,32 @@ mod tests {
 
     #[test]
     fn normalization_degenerate_range() {
-        let mut rows = vec![row("a", 5.0, RankSource::Fts), row("b", 5.0, RankSource::Fts)];
+        let mut rows = vec![
+            row("a", 5.0, RankSource::Fts),
+            row("b", 5.0, RankSource::Fts),
+        ];
         min_max_normalize(&mut rows);
         assert!(rows.iter().all(|r| r.score == 1.0));
     }
 
     #[test]
     fn dedup_takes_max_contribution() {
-        let fts = vec![row("shared", 100.0, RankSource::Fts), row("f", 0.0, RankSource::Fts)];
-        let vec_rows = vec![row("shared", 100.0, RankSource::Vector), row("v", 0.0, RankSource::Vector)];
-        let fused = fuse(fts, vec_rows, FusionWeights { fts: 0.3, vector: 0.7 });
+        let fts = vec![
+            row("shared", 100.0, RankSource::Fts),
+            row("f", 0.0, RankSource::Fts),
+        ];
+        let vec_rows = vec![
+            row("shared", 100.0, RankSource::Vector),
+            row("v", 0.0, RankSource::Vector),
+        ];
+        let fused = fuse(
+            fts,
+            vec_rows,
+            FusionWeights {
+                fts: 0.3,
+                vector: 0.7,
+            },
+        );
         // 3 unique ids.
         assert_eq!(fused.len(), 3);
         let shared = fused.iter().find(|r| r.id == "shared").unwrap();
@@ -173,7 +200,10 @@ mod tests {
 
     #[test]
     fn ordering_descending_with_id_tiebreak() {
-        let fts = vec![row("b", 1.0, RankSource::Fts), row("a", 1.0, RankSource::Fts)];
+        let fts = vec![
+            row("b", 1.0, RankSource::Fts),
+            row("a", 1.0, RankSource::Fts),
+        ];
         let fused = fuse(fts, vec![], FusionWeights::default());
         // Equal scores -> id ascending.
         assert_eq!(fused[0].id, "a");
@@ -182,9 +212,19 @@ mod tests {
 
     #[test]
     fn weight_extreme_all_fts() {
-        let fts = vec![row("f1", 1.0, RankSource::Fts), row("f2", 0.0, RankSource::Fts)];
+        let fts = vec![
+            row("f1", 1.0, RankSource::Fts),
+            row("f2", 0.0, RankSource::Fts),
+        ];
         let vec_rows = vec![row("v1", 1.0, RankSource::Vector)];
-        let fused = fuse(fts, vec_rows, FusionWeights { fts: 1.0, vector: 0.0 });
+        let fused = fuse(
+            fts,
+            vec_rows,
+            FusionWeights {
+                fts: 1.0,
+                vector: 0.0,
+            },
+        );
         let v1 = fused.iter().find(|r| r.id == "v1").unwrap();
         assert_eq!(v1.score, 0.0);
         assert_eq!(fused[0].id, "f1");
@@ -193,8 +233,18 @@ mod tests {
     #[test]
     fn weight_extreme_all_vector() {
         let fts = vec![row("f1", 1.0, RankSource::Fts)];
-        let vec_rows = vec![row("v1", 1.0, RankSource::Vector), row("v2", 0.0, RankSource::Vector)];
-        let fused = fuse(fts, vec_rows, FusionWeights { fts: 0.0, vector: 1.0 });
+        let vec_rows = vec![
+            row("v1", 1.0, RankSource::Vector),
+            row("v2", 0.0, RankSource::Vector),
+        ];
+        let fused = fuse(
+            fts,
+            vec_rows,
+            FusionWeights {
+                fts: 0.0,
+                vector: 1.0,
+            },
+        );
         let f1 = fused.iter().find(|r| r.id == "f1").unwrap();
         assert_eq!(f1.score, 0.0);
         assert_eq!(fused[0].id, "v1");
@@ -203,7 +253,11 @@ mod tests {
     #[test]
     fn empty_inputs() {
         assert!(fuse(vec![], vec![], FusionWeights::default()).is_empty());
-        let only_fts = fuse(vec![row("a", 1.0, RankSource::Fts)], vec![], FusionWeights::default());
+        let only_fts = fuse(
+            vec![row("a", 1.0, RankSource::Fts)],
+            vec![],
+            FusionWeights::default(),
+        );
         assert_eq!(only_fts.len(), 1);
     }
 }

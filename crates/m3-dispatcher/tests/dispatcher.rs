@@ -4,9 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use m3_dispatcher::{
-    Batch, BatchOutput, BreakerCfg, Dispatcher, DispatcherConfig, ModelBackend,
-};
+use m3_dispatcher::{Batch, BatchOutput, BreakerCfg, Dispatcher, DispatcherConfig, ModelBackend};
 use m3_error::{M3Error, Result};
 
 /// Echoes a deterministic vector per text; records the size of each batch it saw.
@@ -69,9 +67,9 @@ async fn coalesces_multiple_embed_calls_into_one_batch() {
     let mut handles = Vec::new();
     for i in 0..5 {
         let d = disp.clone();
-        handles.push(tokio::spawn(async move {
-            d.embed(format!("text-{i}")).await
-        }));
+        handles.push(tokio::spawn(
+            async move { d.embed(format!("text-{i}")).await },
+        ));
     }
     for h in handles {
         let v = h.await.unwrap().unwrap();
@@ -87,7 +85,10 @@ async fn coalesces_multiple_embed_calls_into_one_batch() {
 async fn circuit_breaker_opens_after_n_failures() {
     let cfg = DispatcherConfig {
         coalesce_window_ms: 5,
-        circuit_breaker: BreakerCfg { failure_threshold: 3, open_secs: 30 },
+        circuit_breaker: BreakerCfg {
+            failure_threshold: 3,
+            open_secs: 30,
+        },
         ..Default::default()
     };
     let disp = Dispatcher::new(cfg, FailBackend);
@@ -101,18 +102,28 @@ async fn circuit_breaker_opens_after_n_failures() {
     let msg = format!("{err}");
     assert!(msg.contains("circuit breaker open"), "got: {msg}");
     // The refusal carries the failure that opened it, once, and the cooldown.
-    assert!(msg.contains("last failure: boom") && msg.contains("3 consecutive"), "got: {msg}");
+    assert!(
+        msg.contains("last failure: boom") && msg.contains("3 consecutive"),
+        "got: {msg}"
+    );
     assert!(!msg.contains("backend error: backend error"), "got: {msg}");
     let st = disp.breaker_status().await;
     assert!(st.open && st.retry_after.is_some(), "{st:?}");
-    assert_eq!((st.consecutive_failures, st.last_error.as_deref()), (3, Some("boom")));
+    assert_eq!(
+        (st.consecutive_failures, st.last_error.as_deref()),
+        (3, Some("boom"))
+    );
 }
 
 /// Fails every batch with a client length error.
 struct TooLongBackend;
 impl ModelBackend for TooLongBackend {
     async fn run(&self, _batch: Batch) -> Result<BatchOutput> {
-        Err(M3Error::InputTooLong { tokens: 9000, n_ctx: 8192, index: Some(0) })
+        Err(M3Error::InputTooLong {
+            tokens: 9000,
+            n_ctx: 8192,
+            index: Some(0),
+        })
     }
 }
 
@@ -122,14 +133,30 @@ impl ModelBackend for TooLongBackend {
 async fn input_too_long_stays_typed_and_does_not_open_the_breaker() {
     let cfg = DispatcherConfig {
         coalesce_window_ms: 5,
-        circuit_breaker: BreakerCfg { failure_threshold: 2, open_secs: 30 },
+        circuit_breaker: BreakerCfg {
+            failure_threshold: 2,
+            open_secs: 30,
+        },
         ..Default::default()
     };
     let disp = Dispatcher::new(cfg, TooLongBackend);
     for _ in 0..5 {
         let e = disp.embed("x".into()).await.unwrap_err();
-        assert!(matches!(e, M3Error::InputTooLong { tokens: 9000, n_ctx: 8192, .. }), "{e}");
-        let e = disp.embed_batch(vec!["a".into(), "b".into()]).await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                M3Error::InputTooLong {
+                    tokens: 9000,
+                    n_ctx: 8192,
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        let e = disp
+            .embed_batch(vec!["a".into(), "b".into()])
+            .await
+            .unwrap_err();
         assert!(matches!(e, M3Error::InputTooLong { .. }), "{e}");
     }
     assert!(!disp.breaker_status().await.open);
@@ -151,7 +178,9 @@ impl ModelBackend for CountingBackend {
 #[tokio::test]
 async fn embed_with_deadline_in_past_short_circuits() {
     let calls = Arc::new(AtomicUsize::new(0));
-    let backend = CountingBackend { calls: calls.clone() };
+    let backend = CountingBackend {
+        calls: calls.clone(),
+    };
     let cfg = DispatcherConfig {
         coalesce_window_ms: 5,
         ..Default::default()
@@ -187,8 +216,7 @@ async fn backpressure_rejects_when_queue_full() {
     for i in 0..50 {
         let d = disp.clone();
         handles.push(tokio::spawn(async move {
-            tokio::time::timeout(Duration::from_millis(200), d.embed(format!("t{i}")))
-                .await
+            tokio::time::timeout(Duration::from_millis(200), d.embed(format!("t{i}"))).await
         }));
     }
     let mut rejected = 0;
@@ -211,9 +239,15 @@ struct OneLongBackend;
 impl ModelBackend for OneLongBackend {
     async fn run(&self, batch: Batch) -> Result<BatchOutput> {
         if let Some(i) = batch.texts.iter().position(|t| t == "LONG") {
-            return Err(M3Error::InputTooLong { tokens: 9000, n_ctx: 8192, index: Some(i) });
+            return Err(M3Error::InputTooLong {
+                tokens: 9000,
+                n_ctx: 8192,
+                index: Some(i),
+            });
         }
-        Ok(BatchOutput::new(batch.texts.iter().map(|_| vec![1.0]).collect()))
+        Ok(BatchOutput::new(
+            batch.texts.iter().map(|_| vec![1.0]).collect(),
+        ))
     }
 }
 
@@ -221,20 +255,32 @@ impl ModelBackend for OneLongBackend {
 /// into the same batch.
 #[tokio::test]
 async fn an_over_long_text_fails_only_its_own_caller() {
-    let cfg = DispatcherConfig { coalesce_window_ms: 30, ..Default::default() };
+    let cfg = DispatcherConfig {
+        coalesce_window_ms: 30,
+        ..Default::default()
+    };
     let disp = Arc::new(Dispatcher::new(cfg, OneLongBackend));
     let mut handles = Vec::new();
     for t in ["a", "LONG", "b"] {
         let d = disp.clone();
-        handles.push(tokio::spawn(async move { (t, d.embed(t.to_string()).await) }));
+        handles.push(tokio::spawn(
+            async move { (t, d.embed(t.to_string()).await) },
+        ));
     }
     for h in handles {
         let (t, r) = h.await.unwrap();
         if t == "LONG" {
             let e = r.unwrap_err();
-            assert!(matches!(e, M3Error::InputTooLong { index: Some(0), .. }), "{e}");
+            assert!(
+                matches!(e, M3Error::InputTooLong { index: Some(0), .. }),
+                "{e}"
+            );
         } else {
-            assert!(r.is_ok(), "{t} failed: {:?}", r.err().map(|e| e.to_string()));
+            assert!(
+                r.is_ok(),
+                "{t} failed: {:?}",
+                r.err().map(|e| e.to_string())
+            );
         }
     }
 }
@@ -243,7 +289,12 @@ async fn an_over_long_text_fails_only_its_own_caller() {
 /// is busy (a try_lock reported 0 exactly then).
 #[tokio::test]
 async fn queue_depth_counts_waiting_jobs() {
-    let cfg = DispatcherConfig { streams: 1, coalesce_window_ms: 1, max_batch_tokens: 1, ..Default::default() };
+    let cfg = DispatcherConfig {
+        streams: 1,
+        coalesce_window_ms: 1,
+        max_batch_tokens: 1,
+        ..Default::default()
+    };
     let disp = Arc::new(Dispatcher::new(cfg, HangBackend));
     for i in 0..3 {
         let d = disp.clone();
@@ -278,6 +329,12 @@ impl ModelBackend for ShortBackend {
 #[tokio::test]
 async fn a_short_reply_is_an_error_with_both_counts_on_the_direct_path() {
     let disp = Dispatcher::new(DispatcherConfig::default(), ShortBackend);
-    let e = disp.embed_batch(vec!["a".into(), "b".into(), "c".into()]).await.unwrap_err();
-    assert!(e.to_string().contains("2 embedding rows for 3 input texts"), "{e}");
+    let e = disp
+        .embed_batch(vec!["a".into(), "b".into(), "c".into()])
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("2 embedding rows for 3 input texts"),
+        "{e}"
+    );
 }

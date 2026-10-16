@@ -94,7 +94,11 @@ fn run_then(then: &[String], wake: &str) -> Result<i32, String> {
     match status.code() {
         Some(c) => Ok(c),
         None => {
-            eprintln!("m3-wait: {} was killed by {}; exiting 1", then[0], signal_of(&status));
+            eprintln!(
+                "m3-wait: {} was killed by {}; exiting 1",
+                then[0],
+                signal_of(&status)
+            );
             Ok(1)
         }
     }
@@ -103,7 +107,10 @@ fn run_then(then: &[String], wake: &str) -> Result<i32, String> {
 #[cfg(unix)]
 fn signal_of(status: &std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
-    status.signal().map(|s| format!("signal {s}")).unwrap_or_else(|| "a signal".into())
+    status
+        .signal()
+        .map(|s| format!("signal {s}"))
+        .unwrap_or_else(|| "a signal".into())
 }
 
 #[cfg(not(unix))]

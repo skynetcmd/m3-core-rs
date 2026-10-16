@@ -39,7 +39,10 @@ impl PartialOrd for Hit {
 }
 impl Ord for Hit {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.0.total_cmp(&self.0).then_with(|| other.1.cmp(&self.1))
+        other
+            .0
+            .total_cmp(&self.0)
+            .then_with(|| other.1.cmp(&self.1))
     }
 }
 
@@ -48,7 +51,13 @@ impl VectorIndex {
         if dim == 0 {
             return Err(M3Error::Config("index dimension must be > 0".into()));
         }
-        Ok(Self { dim, keys: Vec::new(), codes: Vec::new(), scales: Vec::new(), pos: HashMap::new() })
+        Ok(Self {
+            dim,
+            keys: Vec::new(),
+            codes: Vec::new(),
+            scales: Vec::new(),
+            pos: HashMap::new(),
+        })
     }
 
     pub fn dim(&self) -> usize {
@@ -77,7 +86,11 @@ impl VectorIndex {
     /// row would score NaN — which the `total_cmp` heap ranks FIRST, forever.
     fn check(&self, key: i64, vec: &[f32]) -> Result<()> {
         if vec.len() != self.dim {
-            return Err(M3Error::VectorDimMismatch { expected: self.dim, got: vec.len(), index: None });
+            return Err(M3Error::VectorDimMismatch {
+                expected: self.dim,
+                got: vec.len(),
+                index: None,
+            });
         }
         if let Some((i, x)) = vec.iter().enumerate().find(|(_, x)| !x.is_finite()) {
             return Err(M3Error::Config(format!(
@@ -151,7 +164,9 @@ impl VectorIndex {
 
     /// Remove `key` if present (swap-remove: O(dim)). Returns whether it was there.
     pub fn remove(&mut self, key: i64) -> bool {
-        let Some(i) = self.pos.remove(&key) else { return false };
+        let Some(i) = self.pos.remove(&key) else {
+            return false;
+        };
         let last = self.keys.len() - 1;
         if i != last {
             let moved = self.keys[last];
@@ -175,9 +190,18 @@ impl VectorIndex {
 
     /// The `k` best keys by approximate cosine to `query`, best first. With
     /// `allowed`, only those keys are considered (unknown keys are ignored).
-    pub fn search(&self, query: &[f32], k: usize, allowed: Option<&[i64]>) -> Result<Vec<(i64, f32)>> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: Option<&[i64]>,
+    ) -> Result<Vec<(i64, f32)>> {
         if query.len() != self.dim {
-            return Err(M3Error::VectorDimMismatch { expected: self.dim, got: query.len(), index: None });
+            return Err(M3Error::VectorDimMismatch {
+                expected: self.dim,
+                got: query.len(),
+                index: None,
+            });
         }
         if let Some((i, x)) = query.iter().enumerate().find(|(_, x)| !x.is_finite()) {
             return Err(M3Error::Config(format!(
@@ -194,7 +218,10 @@ impl VectorIndex {
         }
         let q: Vec<f32> = query.iter().map(|x| x / norm).collect();
         let rows: Vec<usize> = match allowed {
-            Some(keys) => keys.iter().filter_map(|key| self.pos.get(key).copied()).collect(),
+            Some(keys) => keys
+                .iter()
+                .filter_map(|key| self.pos.get(key).copied())
+                .collect(),
             None => (0..self.keys.len()).collect(),
         };
         let top = rows
@@ -262,10 +289,18 @@ mod tests {
         for q in vectors(20, dim, 99) {
             let truth = exact_top(&q, &vs, 10);
             // The caller re-scores a wider candidate set exactly; 50 here.
-            let cand: Vec<i64> = idx.search(&q, 50, None).unwrap().into_iter().map(|x| x.0).collect();
+            let cand: Vec<i64> = idx
+                .search(&q, 50, None)
+                .unwrap()
+                .into_iter()
+                .map(|x| x.0)
+                .collect();
             found += truth.iter().filter(|t| cand.contains(t)).count();
         }
-        assert!(found >= 195, "{found}/200 exact top-10 hits reached the top-50 candidates");
+        assert!(
+            found >= 195,
+            "{found}/200 exact top-10 hits reached the top-50 candidates"
+        );
     }
 
     #[test]
@@ -278,7 +313,10 @@ mod tests {
         let q = &vs[5];
         for (key, approx) in idx.search(q, 200, None).unwrap() {
             let exact = crate::cosine(q, &vs[key as usize]).unwrap();
-            assert!((approx - exact).abs() < 0.02, "key {key}: {approx} vs {exact}");
+            assert!(
+                (approx - exact).abs() < 0.02,
+                "key {key}: {approx} vs {exact}"
+            );
         }
     }
 
@@ -311,7 +349,10 @@ mod tests {
         for key in 1..50i64 {
             let v = if key == 7 { &vs[20] } else { &vs[key as usize] };
             let best = idx.search(v, 1, None).unwrap()[0].0;
-            assert!(best == key || (key == 7 && best == 20) || (key == 20 && best == 7), "key {key} found {best}");
+            assert!(
+                best == key || (key == 7 && best == 20) || (key == 20 && best == 7),
+                "key {key} found {best}"
+            );
         }
     }
 
@@ -337,10 +378,19 @@ mod tests {
     #[test]
     fn upsert_many_is_all_or_nothing() {
         let mut idx = VectorIndex::new(2).unwrap();
-        let e = idx.upsert_many(&[1, 2, 3], &[1.0, 0.0, 0.0, 1.0, f32::NAN, 1.0]).unwrap_err();
+        let e = idx
+            .upsert_many(&[1, 2, 3], &[1.0, 0.0, 0.0, 1.0, f32::NAN, 1.0])
+            .unwrap_err();
         assert!(e.to_string().contains("key 3"), "{e}");
-        assert!(idx.is_empty(), "rows before the bad one must not be applied");
-        assert!(idx.upsert_many(&[1, 2], &[1.0, 0.0]).unwrap_err().to_string().contains("expected 4"));
+        assert!(
+            idx.is_empty(),
+            "rows before the bad one must not be applied"
+        );
+        assert!(idx
+            .upsert_many(&[1, 2], &[1.0, 0.0])
+            .unwrap_err()
+            .to_string()
+            .contains("expected 4"));
         idx.upsert_many(&[1, 2], &[1.0, 0.0, 0.0, 1.0]).unwrap();
         assert_eq!(idx.len(), 2);
     }

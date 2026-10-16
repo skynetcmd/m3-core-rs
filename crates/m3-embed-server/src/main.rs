@@ -12,7 +12,8 @@
 //!   run-as-service    Internal — Windows SCM invokes this when starting the
 //!                     service. (Unix supervisors run foreground mode directly.)
 //!
-//! Config priority: env var > per-user/per-system config.toml > default.
+//! Config: m3's m3_config.toml and the secrets file it names (src/config.rs).
+//! Per key: `--set` > m3_config.toml > the legacy environment name > default.
 
 #[cfg(feature = "embedded")]
 mod config;
@@ -48,18 +49,18 @@ fn main() -> anyhow::Result<()> {
 #[cfg(feature = "embedded")]
 fn main() -> anyhow::Result<()> {
     let mut args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("--config") {
-        let Some(path) = args.get(2).cloned() else {
-            anyhow::bail!("--config needs a path");
-        };
-        args.drain(1..3);
-        // The service subcommands act on the installed service's own file.
-        if !matches!(args.get(1).map(String::as_str), None | Some("secure")) {
-            anyhow::bail!("--config applies to foreground mode and `secure` only");
-        }
-        config::set_config_override(std::path::PathBuf::from(path));
+    let global = take_global_options(&mut args)?;
+    let sub = args.get(1).map(|s| s.as_str()).unwrap_or("").to_string();
+    let sub = sub.as_str();
+    // A supervised service sees no --set (install pins only --config), so a
+    // --set given to a service subcommand would describe a server that never runs.
+    if global.set.is_some() && !matches!(sub, "" | "secure") {
+        anyhow::bail!(
+            "--set applies to foreground mode and `secure --check` only. A service reads its settings \
+             from m3_config.toml: record them with `m3 config set <key> <value>`, then restart it"
+        );
     }
-    let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    config::set_args(global);
     // Every subcommand reads config and may warn (an unparseable env value, a
     // half-configured listener); with no logger those warnings vanished. The
     // service path is the exception: it installs its own file logger, and
@@ -91,6 +92,61 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Remove `--config <file>` / `--config=<file>` and `--set {...}` /
+/// `--set={...}` from the front of `args` (before the subcommand), each at most
+/// once. `--set` is m3's flag: one TOML table with m3_config.toml's key names.
+#[cfg(feature = "embedded")]
+fn take_global_options(args: &mut Vec<String>) -> anyhow::Result<config::Args> {
+    let mut out = config::Args::default();
+    while let Some(a) = args.get(1).cloned() {
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) if n == "--config" || n == "--set" => (n.to_string(), Some(v.to_string())),
+            _ if a == "--config" || a == "--set" => (a.clone(), None),
+            _ => break,
+        };
+        args.remove(1);
+        let value = match inline {
+            Some(v) => v,
+            None => {
+                if args.len() < 2 {
+                    anyhow::bail!("{name} needs a value, e.g. {name} {}", example(&name));
+                }
+                args.remove(1)
+            }
+        };
+        let given = if name == "--config" {
+            out.config.is_some()
+        } else {
+            out.set.is_some()
+        };
+        if given {
+            anyhow::bail!(
+                "{name} was given twice; give it once{}",
+                if name == "--set" {
+                    ", with every setting in one table, e.g. \"--set={embed.server.port=8083, crypto.fips_mode=true}\""
+                } else {
+                    ""
+                }
+            );
+        }
+        if name == "--config" {
+            out.config = Some(std::path::PathBuf::from(value));
+        } else {
+            out.set = Some(value);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "embedded")]
+fn example(flag: &str) -> &'static str {
+    if flag == "--set" {
+        "\"--set={embed.server.port=8083}\""
+    } else {
+        "<path to m3_config.toml>"
+    }
+}
+
 #[cfg(feature = "embedded")]
 fn print_help() {
     // The `install` line names the concrete mechanism for the host OS so the
@@ -108,9 +164,11 @@ fn print_help() {
         "m3-embed-server — OpenAI-compatible CPU embed server (port 8082 by default)\n\
          \n\
          USAGE:\n  \
-           m3-embed-server [--config <path>] [SUBCOMMAND]\n\
+           m3-embed-server [--config <m3_config.toml>] [\"--set={{key=value, ...}}\"] [SUBCOMMAND]\n\
          \n\
-         --config uses that config.toml instead of the service's (foreground and secure only).\n\
+         Settings come from m3's m3_config.toml (M3_CONFIG_ROOT > M3_MEMORY_ROOT/config > ~/.m3/config,\n\
+         or --config) and the secrets file it names. --set (foreground and secure only) outranks the\n\
+         file; legacy M3_* environment names rank below it. `install` records --config for the service.\n\
          \n\
          SUBCOMMANDS:\n  \
            (none)        run in foreground (dev mode); Ctrl-C to stop \
@@ -120,46 +178,45 @@ fn print_help() {
            start         start the installed service\n  \
            stop          stop the installed service\n  \
            status        running / stopped / not installed\n  \
-           secure        --listen <ip[:port]> --cert <pem> --key <pem> --token-sha256 <hex>: \
-add a TLS listener with a bearer token for other machines; --off removes it\n  \
+           secure        --check --listen <ip[:port]> --cert <pem> --key <pem> --token-sha256 <hex>: \
+check a TLS listener with a bearer token for other machines as the server will; writes nothing \
+(m3 embedder secure records it)\n  \
            help          show this message\n"
     );
 }
 
-/// `secure --listen ADDR --cert PEM --key PEM --token-sha256 HEX` adds the
-/// listener for other machines (TLS and a bearer token) to config.toml, after
-/// checking it exactly as the server will at startup (FIPS flags included);
-/// `secure --off` removes it, leaving the loopback listener alone.
-/// `m3 embedder secure` drives this.
+/// `secure --check --listen ADDR --cert PEM --key PEM --token-sha256 HEX`
+/// checks a listener for other machines (TLS and a bearer token) exactly as the
+/// server will at startup, FIPS flags included, and writes NOTHING: the
+/// settings live in m3's files, which m3 writes (`m3 embedder secure` records
+/// them after this check passes). `--check` is required so a caller expecting
+/// the old write-in-place behaviour fails loudly instead of recording nothing.
 #[cfg(feature = "embedded")]
 fn run_secure(args: &[String]) -> anyhow::Result<()> {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    let usage = "usage: m3-embed-server secure --listen <ip[:port]> --cert <pem> --key <pem> \
-                 --token-sha256 <hex> | --off";
-    let path = config::default_config_path();
-    let file = config::load_file_config(&path)?;
-    let write = |keys: &config::SecurityKeys| {
-        config::write_security_keys(&path, keys).map_err(|e| {
-            // Elevation fixes only a refusal on the default (%PROGRAMDATA%) file.
-            let hint = if cfg!(windows) && !config::config_overridden() && config::is_permission_denied(&e) {
-                ". The file is under %PROGRAMDATA%, writable by Administrators: run this from an elevated prompt"
-            } else {
-                ""
-            };
-            anyhow::anyhow!("{e:#}{hint}")
-        })
-    };
+    let usage =
+        "usage: m3-embed-server secure --check --listen <ip[:port]> --cert <pem> --key <pem> \
+                 --token-sha256 <hex>";
+    let cfg = config::load()?;
+    let file = cfg.location().file.clone();
+    let (secrets_path, _) = m3_config::secrets::secrets_file(&cfg)?;
     if args.iter().any(|a| a == "--off") {
-        write(&config::SecurityKeys::default())?;
-        println!(
-            "removed the listener for other machines from {}; the server serves this machine only. \
-             Restart it to apply.",
-            path.display()
+        anyhow::bail!(
+            "m3-embed-server no longer writes configuration, so `secure --off` has nothing to do. \
+             Remove the listener for other machines from {}: m3 config unset embed.server.remote_listen \
+             (and embed.server.tls_cert, embed.server.tls_key), then restart the server",
+            file.display()
         );
-        return Ok(());
+    }
+    if !args.iter().any(|a| a == "--check") {
+        anyhow::bail!(
+            "`secure` only checks settings now (m3-embed-server no longer writes {}); pass --check. \
+             `m3 embedder secure` checks and records them\n{usage}",
+            file.display()
+        );
     }
     let (mut listen, mut cert, mut key, mut token) = (None, None, None, None);
-    let mut it = args.iter();
+    let mut it = args.iter().filter(|a| *a != "--check");
     while let Some(a) = it.next() {
         let slot = match a.as_str() {
             "--listen" => &mut listen,
@@ -190,31 +247,34 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
     // Absolute, because the service does not start in this directory.
     let cert = std::path::absolute(&cert)?;
     let key = std::path::absolute(&key)?;
-    let mut sec = config::security_config(&file.embed);
+    let mut sec = config::security_config(&cfg, false)?;
     sec.remote_listen = Some(listen.trim().to_string());
     sec.tls_cert = Some(cert.clone());
     sec.tls_key = Some(key.clone());
     sec.token_sha256 = Some(token.trim().to_ascii_lowercase());
-    let local = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        file.embed.port.unwrap_or(config::DEFAULT_PORT),
-    );
-    let remote = security::plan(local, &sec)?.remote.map(|r| r.addr);
-    write(&config::SecurityKeys {
-        remote_listen: sec.remote_listen.as_deref(),
-        tls_cert: Some(&cert.display().to_string()),
-        tls_key: Some(&key.display().to_string()),
-        token_sha256: sec.token_sha256.as_deref(),
-    })?;
-    // Recorded, not verified: nothing listens there until the server restarts,
-    // and reachability depends on the network in between.
-    let remote = remote.map(|a| a.to_string()).unwrap_or_default();
+    sec.token_from = "--token-sha256".into();
+    let port = cfg.int_or(&config::PORT, config::DEFAULT_PORT)?.0;
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let remote = security::plan(local, &sec)?
+        .remote
+        .map(|r| r.addr.to_string())
+        .unwrap_or_default();
+    // Checked, not recorded, and not verified: nothing listens there until the
+    // settings are recorded and the server restarts.
     println!(
-        "recorded remote_listen {remote} (TLS certificate {}, bearer token required) in {}. After a \
-         restart the server listens there for other machines. Verify from one of them: \
-         curl --cacert {} https://{remote}/health",
+        "checked: remote_listen {remote} with TLS certificate {} and a bearer token passes the \
+         server's startup checks. Nothing was written. Record it (m3 embedder secure does):\n  \
+         m3 config set embed.server.remote_listen {}\n  \
+         m3 config set embed.server.tls_cert {}\n  \
+         m3 config set embed.server.tls_key {}\n  \
+         the digest as {} in the secrets file {}\n\
+         then restart the server and verify from another machine: curl --cacert {} https://{remote}/health",
         cert.display(),
-        path.display(),
+        listen.trim(),
+        cert.display(),
+        key.display(),
+        config::TOKEN_SECRET,
+        secrets_path.display(),
         cert.display()
     );
     Ok(())
@@ -224,30 +284,42 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
 // Foreground mode (works on every platform)
 // ---------------------------------------------------------------------------
 
+/// The exit status for a failure `e`: a refused configuration (an invalid
+/// m3_config.toml, value or security setting) and a taken port are not cured by
+/// a restart, so supervisors are told not to retry.
+#[cfg(feature = "embedded")]
+fn exit_code_for(e: &anyhow::Error) -> Option<i32> {
+    if e.downcast_ref::<server::PortInUse>().is_some() {
+        return Some(server::EXIT_PORT_IN_USE);
+    }
+    if e.downcast_ref::<security::ConfigRefused>().is_some()
+        || e.chain()
+            .any(|c| c.downcast_ref::<m3_config::ConfigError>().is_some())
+    {
+        return Some(security::EXIT_CONFIG_REFUSED);
+    }
+    None
+}
+
 #[cfg(feature = "embedded")]
 fn run_foreground() -> anyhow::Result<()> {
-    // Foreground reads env first, but will still pick up a config.toml if
-    // present (handy for testing the service config without installing).
-    // A missing file is the empty default; a broken one is an error, not that.
-    let file_cfg = config::load_file_config(&config::default_config_path())?;
-    let cfg = config::resolve(&file_cfg)?;
+    let result = (|| {
+        let cfg = config::load()?;
+        config::warn_legacy_file(&cfg);
+        let resolved = config::resolve(&cfg)?;
 
-    // Still single-threaded here: the one safe point for llama.cpp's env
-    // (GGML_CUDA_DISABLE_GRAPHS on CUDA builds; a no-op otherwise).
-    m3_embed_llamacpp::prepare_process_env();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    let result = runtime.block_on(async move { server::run(cfg, shutdown_signal()).await });
+        // Still single-threaded here: the one safe point for llama.cpp's env
+        // (GGML_CUDA_DISABLE_GRAPHS on CUDA builds; a no-op otherwise).
+        m3_embed_llamacpp::prepare_process_env();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move { server::run(resolved, shutdown_signal()).await })
+    })();
     if let Err(e) = &result {
-        if e.downcast_ref::<server::PortInUse>().is_some() {
-            log::error!("{e}");
-            std::process::exit(server::EXIT_PORT_IN_USE);
-        }
-        if e.downcast_ref::<security::ConfigRefused>().is_some() {
-            log::error!("{e}");
-            std::process::exit(security::EXIT_CONFIG_REFUSED);
+        if let Some(code) = exit_code_for(e) {
+            log::error!("{e:#}");
+            std::process::exit(code);
         }
     }
     result
@@ -425,4 +497,51 @@ fn run_stop() -> anyhow::Result<()> {
 #[cfg(all(not(windows), feature = "embedded"))]
 fn run_status() -> anyhow::Result<()> {
     service_unix::status().map_err(anyhow::Error::msg)
+}
+
+#[cfg(all(test, feature = "embedded"))]
+mod tests {
+    use super::*;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn global_options_come_off_the_front_in_either_form_and_order() {
+        let mut a = argv(&[
+            "exe",
+            "--set={embed.server.port=8083}",
+            "--config",
+            "/c/m3.toml",
+            "secure",
+            "--check",
+        ]);
+        let g = take_global_options(&mut a).unwrap();
+        assert_eq!(
+            g.config.as_deref(),
+            Some(std::path::Path::new("/c/m3.toml"))
+        );
+        assert_eq!(g.set.as_deref(), Some("{embed.server.port=8083}"));
+        assert_eq!(a, argv(&["exe", "secure", "--check"]));
+
+        let mut a = argv(&["exe", "--config=/c/m3.toml", "install"]);
+        let g = take_global_options(&mut a).unwrap();
+        assert!(g.config.is_some() && g.set.is_none());
+        assert_eq!(a, argv(&["exe", "install"]));
+    }
+
+    #[test]
+    fn a_repeated_or_valueless_option_is_refused() {
+        let mut a = argv(&["exe", "--set", "{a=1}", "--set", "{b=2}"]);
+        assert!(take_global_options(&mut a)
+            .unwrap_err()
+            .to_string()
+            .contains("given twice"));
+        let mut a = argv(&["exe", "--config"]);
+        assert!(take_global_options(&mut a)
+            .unwrap_err()
+            .to_string()
+            .contains("needs a value"));
+    }
 }

@@ -21,8 +21,8 @@
 //! AWS-LC's FIPS module; under `crypto.fips_strict` the server refuses TLS from
 //! any other build, since that is a fact it can check rather than attest.
 //!
-//! The token is stored as its SHA-256 (`token_sha256`): the config file can be
-//! readable by other local users (Windows keeps it under %PROGRAMDATA%), and a
+//! The token is stored as its SHA-256 (`M3_EMBED_SERVER_TOKEN_SHA256` in m3's
+//! user-only secrets file), so even a copy of that file that leaks gives a
 //! digest of a random 256-bit token is no use to whoever reads it. `/health`
 //! needs no token, so supervisors and probes can check liveness.
 
@@ -58,7 +58,7 @@ impl std::fmt::Display for ConfigRefused {
 impl std::error::Error for ConfigRefused {}
 
 /// The settings that decide transport security, as read from config.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SecurityConfig {
     /// The listener for other machines: `IP` or `IP:port` (the port defaults
     /// to the local listener's).
@@ -69,18 +69,49 @@ pub struct SecurityConfig {
     pub token_sha256: Option<String>,
     pub fips_mode: bool,
     pub fips_strict: bool,
-    /// The config file these came from, for messages ("" = not given).
+    /// The m3_config.toml these came from, for messages ("" = not given).
     pub config_path: PathBuf,
-    /// Where `fips_mode` / `fips_strict` were set (the environment wins over
-    /// the file), so a refusal names the setting to change.
+    /// Where `fips_mode` / `fips_strict` were set (`--set`, the file, a legacy
+    /// environment name or the default), so a refusal names the setting to change.
     pub fips_mode_from: String,
     pub fips_strict_from: String,
+    pub fips_mode_source: m3_config::Source,
+    pub fips_strict_source: m3_config::Source,
+    /// Where the token digest is read from, for messages ("" = not given).
+    pub token_from: String,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            remote_listen: None,
+            tls_cert: None,
+            tls_key: None,
+            token_sha256: None,
+            fips_mode: false,
+            fips_strict: false,
+            config_path: PathBuf::new(),
+            fips_mode_from: String::new(),
+            fips_strict_from: String::new(),
+            fips_mode_source: m3_config::Source::Default,
+            fips_strict_source: m3_config::Source::Default,
+            token_from: String::new(),
+        }
+    }
 }
 
 impl SecurityConfig {
+    fn token_where(&self) -> String {
+        if self.token_from.is_empty() {
+            "M3_EMBED_SERVER_TOKEN_SHA256 in the secrets file".into()
+        } else {
+            self.token_from.clone()
+        }
+    }
+
     fn file(&self) -> String {
         if self.config_path.as_os_str().is_empty() {
-            "config.toml".into()
+            "m3_config.toml".into()
         } else {
             self.config_path.display().to_string()
         }
@@ -156,9 +187,9 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
         };
     let Some(remote) = cfg.remote_listen.as_deref() else {
         let unused = match (tls_pair.is_some(), token_digest.is_some()) {
-            (true, true) => Some("TLS (tls_cert, tls_key) and a token (token_sha256) are"),
+            (true, true) => Some("TLS (tls_cert, tls_key) and a bearer token are"),
             (true, false) => Some("TLS (tls_cert, tls_key) is"),
-            (false, true) => Some("a token (token_sha256) is"),
+            (false, true) => Some("a bearer token is"),
             (false, false) => None,
         };
         if let Some(unused) = unused {
@@ -177,16 +208,16 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
     }
     let (Some((cert, key)), Some(token_digest)) = (tls_pair, token_digest) else {
         let missing = match (tls_pair.is_some(), token_digest.is_some()) {
-            (false, false) => {
-                "has neither TLS (tls_cert, tls_key) nor a bearer token (token_sha256)"
-            }
+            (false, false) => "has neither TLS (tls_cert, tls_key) nor a bearer token",
             (false, true) => "has no TLS certificate and key (tls_cert, tls_key)",
-            _ => "has no bearer token (token_sha256)",
+            _ => "has no bearer token",
         };
         anyhow::bail!(
-            "remote_listen {addr} needs both a TLS certificate and a bearer token; {} {missing}. \
-             There is no plaintext listener for other machines. Run `m3 embedder secure`",
-            cfg.file()
+            "remote_listen {addr} needs both a TLS certificate and a bearer token; {} {missing} \
+             (the token's SHA-256 is read from {}). There is no plaintext listener for other \
+             machines. Run `m3 embedder secure`",
+            cfg.file(),
+            cfg.token_where()
         );
     };
     if cfg.fips_strict && !provider_is_fips() {
@@ -240,7 +271,7 @@ fn parse_digest(hex: &str) -> anyhow::Result<[u8; 32]> {
     // itself pasted in place of its digest, and the message reaches logs.
     if let Some(pos) = hex.chars().position(|c| !c.is_ascii_hexdigit()) {
         anyhow::bail!(
-            "token_sha256 has a non-hexadecimal character at position {} (of {}); it must be the \
+            "the token digest (M3_EMBED_SERVER_TOKEN_SHA256) has a non-hexadecimal character at position {} (of {}); it must be the \
              SHA-256 of the token as 64 hexadecimal characters. Did you paste the token itself instead \
              of its SHA-256? Re-run `m3 embedder secure`",
             pos + 1,
@@ -249,7 +280,7 @@ fn parse_digest(hex: &str) -> anyhow::Result<[u8; 32]> {
     }
     if hex.len() != 64 {
         anyhow::bail!(
-            "token_sha256 must be 64 hexadecimal characters (the SHA-256 of the token), got {} \
+            "the token digest (M3_EMBED_SERVER_TOKEN_SHA256) must be 64 hexadecimal characters (the SHA-256 of the token), got {} \
              characters. Re-run `m3 embedder secure`",
             hex.len()
         );
@@ -383,7 +414,7 @@ impl AuthFailure {
         match self {
             AuthFailure::NoHeader => "no Authorization header",
             AuthFailure::NotBearer => "the Authorization header is not a Bearer token",
-            AuthFailure::WrongToken => "the bearer token does not match this server's token_sha256",
+            AuthFailure::WrongToken => "the bearer token does not match this server's token digest",
         }
     }
 }
@@ -732,12 +763,12 @@ mod tests {
     fn a_half_tls_pair_and_unused_keys_name_what_is_missing() {
         let half = SecurityConfig {
             tls_key: Some("/k.pem".into()),
-            config_path: "/c/config.toml".into(),
+            config_path: "/c/m3_config.toml".into(),
             ..Default::default()
         };
         let e = plan(LOCAL, &half).err().unwrap().to_string();
         assert!(
-            e.contains("/c/config.toml has tls_key but not tls_cert"),
+            e.contains("/c/m3_config.toml has tls_key but not tls_cert"),
             "{e}"
         );
         let pem = self_signed();
@@ -746,7 +777,10 @@ mod tests {
             ..secured(&pem, "100.100.50.63")
         };
         let e = plan(LOCAL, &no_token).err().unwrap().to_string();
-        assert!(e.contains("has no bearer token (token_sha256)"), "{e}");
+        assert!(
+            e.contains("has no bearer token") && e.contains("M3_EMBED_SERVER_TOKEN_SHA256"),
+            "{e}"
+        );
     }
 
     #[test]

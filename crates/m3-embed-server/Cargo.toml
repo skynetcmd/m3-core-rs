@@ -48,9 +48,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 tracing-log = "0.2"
 anyhow = "1"
-toml = "0.8"
-# `secure` edits config.toml in place, keeping the operator's comments.
-toml_edit = "0.22"
+# m3_config.toml and the secrets file: located and parsed in one place.
+m3-config = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"

@@ -49,40 +49,11 @@ fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot resolve current executable path: {e}"))
 }
 
-/// The GGUF path the service must embed with. The unit file pins it into the
-/// service environment so a login-less supervisor still finds the model.
-/// Resolved here (install time) the same way `config::resolve` does at runtime.
-fn resolve_gguf_for_unit() -> Result<String, String> {
-    if let Some(g) = std::env::var("M3_EMBED_GGUF")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(g);
-    }
-    // Fall back to a config.toml that an earlier run may have written.
-    let path = config::default_config_path();
-    let file_cfg = config::load_file_config(&path).map_err(|e| e.to_string())?;
-    file_cfg.embed.gguf.clone().ok_or_else(|| {
-        format!(
-            "M3_EMBED_GGUF is unset and {} has no [embed].gguf — set the env var \
-             before `install` so the service can find the model",
-            path.display()
-        )
-    })
-}
-
-/// Record the settings `install` was given (port, host, streams...) in
-/// config.toml, where the supervised service reads them: the unit pins only
-/// the model, so a port handed to `install` used to be dropped.
+/// The unit's arguments (`--config <m3_config.toml>`) and that file, checked as
+/// the supervised service will read it: a bare environment, the file only.
 #[allow(dead_code)] // each Unix target calls it from its own install
-fn record_settings() -> Result<(), String> {
-    let path = config::default_config_path();
-    config::merge_env_into_file(&path).map_err(|e| {
-        format!(
-            "cannot record install settings in {}: {e:#}",
-            path.display()
-        )
-    })
+fn service_args() -> Result<(Vec<String>, PathBuf), String> {
+    config::service_args().map_err(|e| format!("{e:#}"))
 }
 
 /// The service's address from config.toml, as an error string for this module.
@@ -372,8 +343,7 @@ pub mod macos {
 
     pub fn install() -> Result<(), String> {
         let exe = current_exe()?;
-        let gguf = resolve_gguf_for_unit()?;
-        record_settings()?;
+        let (args, cfg_file) = service_args()?;
         let log_path = config::default_log_path();
         if let Some(dir) = log_path.parent() {
             std::fs::create_dir_all(dir)
@@ -385,7 +355,7 @@ pub mod macos {
                 .map_err(|e| format!("cannot create LaunchAgents dir {}: {e}", dir.display()))?;
         }
 
-        let body = render_plist(&exe.to_string_lossy(), &gguf, &log_path.to_string_lossy());
+        let body = render_plist(&exe.to_string_lossy(), &args, &log_path.to_string_lossy());
         std::fs::write(&plist, body)
             .map_err(|e| format!("cannot write plist {}: {e}", plist.display()))?;
 
@@ -404,7 +374,7 @@ pub mod macos {
 
         println!("launchd agent installed: {LAUNCHD_LABEL}");
         println!("plist:    {}", plist.display());
-        println!("config:   {}", config::default_config_path().display());
+        println!("config:   {}", cfg_file.display());
         println!("log file: {}", log_path.display());
         // RunAtLoad starts it now; report whether it actually came up.
         let state = wait_for("running", 10)?;
@@ -445,8 +415,8 @@ pub mod macos {
         }
         println!("launchd agent removed: {LAUNCHD_LABEL}");
         println!(
-            "config file left in place: {} (delete manually if desired)",
-            config::default_config_path().display()
+            "m3_config.toml is m3's and is left in place: {}",
+            config::located_file()
         );
         Ok(())
     }
@@ -652,14 +622,13 @@ pub mod linux {
 
     pub fn install() -> Result<(), String> {
         let exe = current_exe()?;
-        let gguf = resolve_gguf_for_unit()?;
-        record_settings()?;
+        let (args, cfg_file) = service_args()?;
         let unit = unit_path()?;
         if let Some(dir) = unit.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("cannot create systemd user dir {}: {e}", dir.display()))?;
         }
-        let body = render_unit(&exe.to_string_lossy(), &gguf);
+        let body = render_unit(&exe.to_string_lossy(), &args);
         std::fs::write(&unit, body)
             .map_err(|e| format!("cannot write unit {}: {e}", unit.display()))?;
 
@@ -677,7 +646,7 @@ pub mod linux {
 
         println!("systemd --user unit installed: {}", unit_name());
         println!("unit:     {}", unit.display());
-        println!("config:   {}", config::default_config_path().display());
+        println!("config:   {}", cfg_file.display());
         println!("log:      journalctl --user -u {SERVICE_NAME}");
         // `enable --now` returns once the start is queued; report the outcome.
         let state = wait_for("running", 10);
@@ -745,8 +714,8 @@ pub mod linux {
         }
         println!("systemd --user unit removed: {}", unit_name());
         println!(
-            "config file left in place: {} (delete manually if desired)",
-            config::default_config_path().display()
+            "m3_config.toml is m3's and is left in place: {}",
+            config::located_file()
         );
         Ok(())
     }

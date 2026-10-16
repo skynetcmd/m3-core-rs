@@ -1,70 +1,221 @@
-//! Configuration resolution: env vars > config.toml > built-in defaults.
+//! The server's settings, from m3's two config files.
 //!
-//! Foreground/dev mode typically uses env vars. Service mode (running under
-//! LocalSystem) cannot see the operator's user env, so it falls back to the
-//! TOML file written by `m3-embed-server install`.
+//! m3_config.toml and the secrets file it names are the server's only config
+//! files (m3 memory `9655f30a`); `m3_config` locates and parses them. This
+//! module says WHICH keys the server reads, their defaults, and what a
+//! supervised service will see. Precedence per key, m3's:
+//! `--set` > m3_config.toml > the legacy environment name > the default.
+//!
+//! A service is started with `--config <m3_config.toml>` (`install` pins it):
+//! the Windows service runs as LocalSystem, and launchd / systemd start it
+//! with a bare environment, so neither can find the user's root on its own.
+//!
+//! The server's own `config.toml` from earlier versions is no longer read; if
+//! it is still there, one warning says so ([`warn_legacy_file`]). m3 migrates
+//! its values and removes it.
 
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EmbedSection {
-    pub gguf: Option<String>,
-    pub port: Option<u16>,
-    pub host: Option<String>,
-    pub streams: Option<usize>,
-    pub ctx: Option<u32>,
-    pub seq_max: Option<u32>,
-    pub n_batch: Option<u32>,
-    pub n_ubatch: Option<u32>,
-    pub coalesce_ms: Option<u64>,
-    pub max_batch_tokens: Option<usize>,
-    // Transport security (src/security.rs). File-only, written by
-    // `m3-embed-server secure`: no environment variable opens or changes the
-    // listener for other machines.
-    pub remote_listen: Option<String>,
-    pub tls_cert: Option<String>,
-    pub tls_key: Option<String>,
-    pub token_sha256: Option<String>,
-    // m3's crypto.fips_mode / fips_strict, for a service that starts without
-    // the caller's environment (captured from M3_FIPS_MODE / M3_FIPS_STRICT).
-    pub fips_mode: Option<bool>,
-    pub fips_strict: Option<bool>,
-}
+use m3_config::{secrets, Config, Key, Overrides, ProcessEnv, Source, Value};
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FileConfig {
-    #[serde(default)]
-    pub embed: EmbedSection,
-}
+// ── The keys the server reads (m3 registry names) ───────────────────────────
+pub const GGUF: Key = Key::path("embed.gguf", &["M3_EMBED_GGUF"]);
+pub const HOST: Key = Key::string(
+    "embed.server.host",
+    &["M3_EMBED_SERVER_HOST", "EMBED_SERVER_HOST"],
+);
+pub const PORT: Key = Key::int("embed.server.port", &["M3_EMBED_SERVER_PORT"], 1, 65535);
+pub const CTX: Key = Key::int("embed.ctx", &["M3_EMBED_CTX"], 1, u32::MAX as i64);
+pub const STREAMS: Key = Key::int("embed.server.streams", &["M3_EMBED_STREAMS"], 1, 4096);
+pub const SEQ_MAX: Key = Key::int(
+    "embed.server.seq_max",
+    &["M3_EMBED_SEQ_MAX"],
+    1,
+    u32::MAX as i64,
+);
+pub const N_BATCH: Key = Key::int(
+    "embed.server.n_batch",
+    &["M3_EMBED_N_BATCH"],
+    1,
+    u32::MAX as i64,
+);
+pub const N_UBATCH: Key = Key::int(
+    "embed.server.n_ubatch",
+    &["M3_EMBED_N_UBATCH"],
+    1,
+    u32::MAX as i64,
+);
+pub const COALESCE_MS: Key = Key::int(
+    "embed.server.coalesce_ms",
+    &["M3_EMBED_COALESCE_MS"],
+    0,
+    i64::MAX,
+);
+pub const MAX_BATCH_TOKENS: Key = Key::int(
+    "embed.server.max_batch_tokens",
+    &["M3_EMBED_MAX_BATCH_TOKENS"],
+    1,
+    i64::MAX,
+);
+// The listener for other machines: no environment name opens or changes it.
+pub const REMOTE_LISTEN: Key = Key::string("embed.server.remote_listen", &[]);
+pub const TLS_CERT: Key = Key::path("embed.server.tls_cert", &[]);
+pub const TLS_KEY: Key = Key::path("embed.server.tls_key", &[]);
+pub const FIPS_MODE: Key = Key::bool("crypto.fips_mode", &["M3_FIPS_MODE"]);
+pub const FIPS_STRICT: Key = Key::bool("crypto.fips_strict", &["M3_FIPS_STRICT"]);
+
+/// The SHA-256 of the bearer token, in the SECRETS file (not m3_config.toml: a
+/// digest of a guessable token can be brute-forced offline). A `[secrets]`
+/// entry name, so in m3's flat NAME style.
+pub const TOKEN_SECRET: &str = "M3_EMBED_SERVER_TOKEN_SHA256";
+
+/// Every key the server reads; `--set` accepts these (not `secrets.file`, a
+/// locator). m3's registry must define each.
+pub const KEYS: [Key; 16] = [
+    GGUF,
+    HOST,
+    PORT,
+    CTX,
+    STREAMS,
+    SEQ_MAX,
+    N_BATCH,
+    N_UBATCH,
+    COALESCE_MS,
+    MAX_BATCH_TOKENS,
+    REMOTE_LISTEN,
+    TLS_CERT,
+    TLS_KEY,
+    FIPS_MODE,
+    FIPS_STRICT,
+    secrets::SECRETS_FILE,
+];
 
 pub const DEFAULT_PORT: u16 = 8082;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_CTX: u32 = 8192;
+const DEFAULT_SEQ_MAX: u32 = 32;
+const DEFAULT_N_BATCH: u32 = 2048;
+const DEFAULT_N_UBATCH: u32 = 512;
+const DEFAULT_COALESCE_MS: u64 = 3;
+const DEFAULT_MAX_BATCH_TOKENS: usize = 2048;
 
-/// Where the SUPERVISED service listens. launchd/systemd start it with only
-/// `M3_EMBED_GGUF` in its environment, so it binds from config.toml or the
-/// defaults; the calling shell's `M3_EMBED_SERVER_*` are not the service's.
-#[cfg(not(windows))]
-pub fn service_addr() -> anyhow::Result<(String, u16)> {
-    // A broken file is an error, not the defaults: the service cannot start
-    // from it either, and probing the default port would report on the wrong
-    // server.
-    let file = load_file_config(&default_config_path())?;
-    let host = file.embed.host.unwrap_or_else(|| DEFAULT_HOST.into());
-    // A wildcard bind is reached on loopback.
-    let host = if host == "0.0.0.0" {
-        DEFAULT_HOST.into()
-    } else {
-        host
-    };
-    Ok((host, file.embed.port.unwrap_or(DEFAULT_PORT)))
+/// The default a key takes when nothing sets it (`None`: no default).
+fn default_of(key: &Key) -> Option<Value> {
+    Some(match key.name {
+        "embed.server.host" => Value::Str(DEFAULT_HOST.into()),
+        "embed.server.port" => Value::Int(DEFAULT_PORT.into()),
+        "embed.ctx" => Value::Int(DEFAULT_CTX.into()),
+        "embed.server.streams" => Value::Int(default_streams() as i64),
+        "embed.server.seq_max" => Value::Int(DEFAULT_SEQ_MAX.into()),
+        "embed.server.n_batch" => Value::Int(DEFAULT_N_BATCH.into()),
+        "embed.server.n_ubatch" => Value::Int(DEFAULT_N_UBATCH.into()),
+        "embed.server.coalesce_ms" => Value::Int(DEFAULT_COALESCE_MS as i64),
+        "embed.server.max_batch_tokens" => Value::Int(DEFAULT_MAX_BATCH_TOKENS as i64),
+        "crypto.fips_mode" | "crypto.fips_strict" => Value::Bool(false),
+        _ => return None,
+    })
 }
 
-/// Fully-resolved runtime config (after env/toml/default merge).
+// ── The command line's global options ───────────────────────────────────────
+/// `--config <file>` and `--set={...}`, given before the subcommand.
+#[derive(Debug, Default, Clone)]
+pub struct Args {
+    pub config: Option<PathBuf>,
+    pub set: Option<String>,
+}
+
+static ARGS: OnceLock<Args> = OnceLock::new();
+
+/// Record the global options once, at startup.
+pub fn set_args(args: Args) {
+    let _ = ARGS.set(args);
+}
+
+fn args() -> Args {
+    ARGS.get().cloned().unwrap_or_default()
+}
+
+/// Whether `--config` was given.
+pub fn config_given() -> bool {
+    args().config.is_some()
+}
+
+fn load_with(overrides: bool, aliases: bool) -> anyhow::Result<Config> {
+    let a = args();
+    let location =
+        m3_config::locate(a.config.as_deref(), &ProcessEnv).map_err(anyhow::Error::msg)?;
+    let set = match (&a.set, overrides) {
+        (Some(text), true) => m3_config::parse_set(text, &KEYS)?,
+        _ => Overrides::default(),
+    };
+    let alias_env: Option<Box<dyn m3_config::Env>> = if aliases {
+        Some(Box::new(ProcessEnv))
+    } else {
+        None
+    };
+    Ok(Config::load(
+        location,
+        set,
+        alias_env,
+        Some(Box::new(ProcessEnv)),
+    )?)
+}
+
+/// This process's settings: `--set`, the file, the legacy environment names.
+pub fn load() -> anyhow::Result<Config> {
+    load_with(true, true)
+}
+
+/// What a supervised service will see: the file only. launchd, systemd and
+/// the SCM start it with no `--set` and without this shell's environment.
+pub fn load_service_view() -> anyhow::Result<Config> {
+    load_with(false, false)
+}
+
+/// The m3_config.toml this invocation reads, for a message; never fails.
+pub fn located_file() -> String {
+    match m3_config::locate(args().config.as_deref(), &ProcessEnv) {
+        Ok(l) => format!("{} (located by {})", l.file.display(), l.tier),
+        Err(e) => format!("<m3_config.toml could not be located: {e}>"),
+    }
+}
+
+/// What `install` pins into the service's command line: `--config <file>`,
+/// after checking the service can start from that file alone. Refused when
+/// this shell sets something (a legacy environment name) the service would
+/// not see, or when the file does not give the service a working config.
+pub fn service_args() -> anyhow::Result<(Vec<String>, PathBuf)> {
+    let cli = load()?;
+    let svc = load_service_view()?;
+    let file = svc.location().file.clone();
+    let unseen = unseen_by_service(&cli, &svc)?;
+    if !unseen.is_empty() {
+        anyhow::bail!(
+            "refusing to install: the service reads only {} and would run with other settings than \
+             this shell gives:\n  - {}\nRecord them in the file, then install again",
+            file.display(),
+            unseen.join("\n  - ")
+        );
+    }
+    resolve(&svc).map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to install: the service could not start from {}: {e:#}",
+            file.display()
+        )
+    })?;
+    Ok((
+        vec!["--config".into(), file.to_string_lossy().into_owned()],
+        file,
+    ))
+}
+
+// ── Resolution ──────────────────────────────────────────────────────────────
+/// Fully-resolved runtime config.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub gguf: String,
-    /// Where `gguf` came from (`M3_EMBED_GGUF` or the file), for the startup log.
+    /// Where `gguf` came from, for the startup log.
     pub gguf_source: String,
     pub port: u16,
     pub host: String,
@@ -78,11 +229,273 @@ pub struct ResolvedConfig {
     pub coalesce_ms: u64,
     pub max_batch_tokens: usize,
     pub security: crate::security::SecurityConfig,
+    /// The m3_config.toml read, the tier that located it, and whether it existed.
+    pub config_file: PathBuf,
+    pub config_tier: &'static str,
+    pub config_present: bool,
+    /// `key <- source` for every value not at its default.
+    pub sources: Vec<String>,
 }
 
+/// Default worker-context count, chosen by the COMPILED backend.
+///
+/// Each stream materialises its own compute graph on first use, sized for a
+/// worst-case `n_ctx` batch, and holds it for the process lifetime. Measured
+/// 2026-09-16 on bge-m3 at `n_ctx=8192`: **~3.85 GiB per stream on CUDA and
+/// ~4.0 GiB on a CPU-only build** — the cost is a property of the model and
+/// `n_ctx`, not of the backend. It is linear in `streams` and quadratic in
+/// `n_ctx`.
+///
+/// * **GPU builds (cuda / vulkan / metal) -> 2.** A machine with a discrete GPU
+///   or Apple unified memory is very likely to have the headroom.
+/// * **CPU-only -> 1.** The modest-hardware case almost by definition; ~4 GiB
+///   for a second graph is a large fraction of such a machine.
+///
+/// ⚠ This trades THROUGHPUT for memory: at `streams = 1` concurrent callers
+/// queue. `queue_depth` on `/metrics` is the signal. It is a DEFAULT, not a
+/// cap: `[embed.server] streams` wins. The resolved value is logged at startup.
+const fn default_streams() -> usize {
+    if cfg!(any(
+        feature = "embedded-cuda",
+        feature = "embedded-vulkan",
+        feature = "embedded-metal"
+    )) {
+        2
+    } else {
+        1
+    }
+}
+
+fn note(sources: &mut Vec<String>, key: &Key, from: &Source) {
+    if *from != Source::Default {
+        sources.push(format!("{} <- {from}", key.name));
+    }
+}
+
+fn int<T: TryFrom<i64> + Copy>(
+    cfg: &Config,
+    key: &Key,
+    default: T,
+    sources: &mut Vec<String>,
+) -> anyhow::Result<T> {
+    let (v, from) = cfg.int_or(key, default)?;
+    note(sources, key, &from);
+    Ok(v)
+}
+
+/// Resolve the server's settings. Errors when a value is invalid or `embed.gguf`
+/// is unresolved (it has no default).
+pub fn resolve(cfg: &Config) -> anyhow::Result<ResolvedConfig> {
+    let file = cfg.location().file.clone();
+    let mut sources = Vec::new();
+    let (gguf, from) =
+        cfg.path(&GGUF)?.ok_or_else(|| {
+            anyhow::anyhow!(
+            "embed.gguf is not set: {} ({}; located by {}) has no [embed] gguf, and no --set or \
+             M3_EMBED_GGUF gives one. Set it: m3 config set embed.gguf <model.gguf>{}",
+            file.display(),
+            if cfg.file_present() { "present" } else { "absent" },
+            cfg.location().tier,
+            if config_given() {
+                ""
+            } else {
+                ". A supervised service must be started with --config <your m3_config.toml> \
+                 (`m3-embed-server --config <file> install` records it)"
+            }
+        )
+        })?;
+    note(&mut sources, &GGUF, &from);
+    let gguf_source = from.to_string();
+    let gguf = gguf.to_string_lossy().into_owned();
+    if !Path::new(&gguf).exists() {
+        anyhow::bail!("GGUF path does not exist: {gguf} (from {gguf_source})");
+    }
+    let (host, host_from) = cfg
+        .string(&HOST)?
+        .unwrap_or_else(|| (DEFAULT_HOST.to_string(), Source::Default));
+    note(&mut sources, &HOST, &host_from);
+    let port = int(cfg, &PORT, DEFAULT_PORT, &mut sources)?;
+    let streams = int(cfg, &STREAMS, default_streams(), &mut sources)?;
+    let n_ctx = int(cfg, &CTX, DEFAULT_CTX, &mut sources)?;
+    let seq_max = int(cfg, &SEQ_MAX, DEFAULT_SEQ_MAX, &mut sources)?;
+    let n_batch = int(cfg, &N_BATCH, DEFAULT_N_BATCH, &mut sources)?;
+    let n_ubatch = int(cfg, &N_UBATCH, DEFAULT_N_UBATCH, &mut sources)?;
+    let coalesce_ms = int(cfg, &COALESCE_MS, DEFAULT_COALESCE_MS, &mut sources)?;
+    let max_batch_tokens = int(
+        cfg,
+        &MAX_BATCH_TOKENS,
+        DEFAULT_MAX_BATCH_TOKENS,
+        &mut sources,
+    )?;
+    let security = security_config(cfg, true)?;
+    for (key, from) in [
+        (&FIPS_MODE, &security.fips_mode_source),
+        (&FIPS_STRICT, &security.fips_strict_source),
+    ] {
+        note(&mut sources, key, from);
+    }
+    Ok(ResolvedConfig {
+        gguf,
+        gguf_source,
+        port,
+        host,
+        host_source: host_from.to_string(),
+        streams,
+        n_ctx,
+        seq_max,
+        n_batch,
+        n_ubatch,
+        coalesce_ms,
+        max_batch_tokens,
+        security,
+        config_file: file,
+        config_tier: cfg.location().tier.as_str(),
+        config_present: cfg.file_present(),
+        sources,
+    })
+}
+
+/// The transport-security settings. The token digest is read from the secrets
+/// file only when `read_token` and a listener for other machines is
+/// configured: a loopback-only server never depends on the secrets file.
+pub fn security_config(
+    cfg: &Config,
+    read_token: bool,
+) -> anyhow::Result<crate::security::SecurityConfig> {
+    let (fips_mode, fips_mode_source) = cfg.bool_or(&FIPS_MODE, false)?;
+    let (fips_strict, fips_strict_source) = cfg.bool_or(&FIPS_STRICT, false)?;
+    let remote_listen = cfg.string(&REMOTE_LISTEN)?.map(|(v, _)| v);
+    let (secrets_path, _) = secrets::secrets_file(cfg)?;
+    let token_from = format!(
+        "{TOKEN_SECRET} in the secrets file {}",
+        secrets_path.display()
+    );
+    let token_sha256 = if read_token && remote_listen.is_some() {
+        secrets::read_secret(&secrets_path, TOKEN_SECRET)?
+    } else {
+        None
+    };
+    Ok(crate::security::SecurityConfig {
+        remote_listen,
+        tls_cert: cfg.path(&TLS_CERT)?.map(|(p, _)| p),
+        tls_key: cfg.path(&TLS_KEY)?.map(|(p, _)| p),
+        token_sha256,
+        fips_mode,
+        fips_strict,
+        config_path: cfg.location().file.clone(),
+        fips_mode_from: fips_mode_source.to_string(),
+        fips_strict_from: fips_strict_source.to_string(),
+        fips_mode_source,
+        fips_strict_source,
+        token_from,
+    })
+}
+
+/// The settings this shell would give the server that a supervised service
+/// would NOT see: a legacy environment value that differs from what the
+/// file (or the default) gives. `install` refuses them: the service would
+/// silently run with something else.
+pub fn unseen_by_service(cli: &Config, service: &Config) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for key in KEYS.iter() {
+        let Some((value, Source::LegacyEnv { name, .. })) = cli.get(key)? else {
+            continue;
+        };
+        let svc = service
+            .get(key)?
+            .map(|(v, _)| v)
+            .or_else(|| default_of(key));
+        if svc.as_ref() == Some(&value) {
+            continue;
+        }
+        let shown = match &svc {
+            Some(v) => format!("would use {}", show(v)),
+            None => "would have none".to_string(),
+        };
+        out.push(format!(
+            "{name} sets {} = {} here, but the service does not see this environment and {shown}. \
+             Record it: m3 config set {} {}",
+            key.name,
+            show(&value),
+            key.name,
+            show(&value)
+        ));
+    }
+    Ok(out)
+}
+
+fn show(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Str(s) => format!("{s:?}"),
+        Value::Path(p) => format!("{:?}", p.to_string_lossy()),
+    }
+}
+
+/// Where the SUPERVISED service listens: the file's host and port, or the
+/// defaults. A wildcard bind is reached on loopback.
+#[cfg(not(windows))]
+pub fn service_addr() -> anyhow::Result<(String, u16)> {
+    let cfg = load_service_view()?;
+    let host = cfg
+        .string(&HOST)?
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| DEFAULT_HOST.into());
+    let host = if host == "0.0.0.0" {
+        DEFAULT_HOST.into()
+    } else {
+        host
+    };
+    Ok((host, cfg.int_or(&PORT, DEFAULT_PORT)?.0))
+}
+
+// ── The retired per-server file ─────────────────────────────────────────────
+/// Where earlier versions kept the server's own config.toml.
+pub fn legacy_config_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
+        PathBuf::from(base)
+            .join("m3-embed-server")
+            .join("config.toml")
+    }
+    #[cfg(not(windows))]
+    {
+        user_config_base()
+            .join("m3-embed-server")
+            .join("config.toml")
+    }
+}
+
+/// The warning for a retired config.toml still at `legacy`, or `None` when
+/// there is none.
+pub fn legacy_file_notice(legacy: &Path, m3_config: &Path) -> Option<String> {
+    if !legacy.is_file() {
+        return None;
+    }
+    Some(format!(
+        "observed: {} exists, but m3-embed-server no longer reads it; its values are NOT in effect. \
+         They belong in m3_config.toml ({}): [embed] gguf, ctx; [embed.server] host, port, streams, \
+         seq_max, n_batch, n_ubatch, coalesce_ms, max_batch_tokens, remote_listen, tls_cert, tls_key; \
+         [crypto] fips_mode, fips_strict; token_sha256 becomes {TOKEN_SECRET} in the secrets file. \
+         m3 migrates them and removes the old file (`m3 embedder` commands); until then compare the \
+         two by hand",
+        legacy.display(),
+        m3_config.display()
+    ))
+}
+
+/// Log [`legacy_file_notice`] once, for the file this server runs with.
+pub fn warn_legacy_file(cfg: &Config) {
+    if let Some(msg) = legacy_file_notice(&legacy_config_path(), &cfg.location().file) {
+        log::warn!("{msg}");
+    }
+}
+
+// ── OS paths (locators; the per-user service model) ─────────────────────────
 /// Per-user base directory for config (`$XDG_CONFIG_HOME` or `~/.config` on
-/// Linux, `~/Library/Application Support` on macOS). Falls back to the current
-/// directory only if `$HOME` is somehow unset.
+/// Linux, `~/Library/Application Support` on macOS).
 #[cfg(not(windows))]
 fn user_config_base() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -101,10 +514,9 @@ fn user_config_base() -> PathBuf {
 /// Per-user base directory for logs/state (`$XDG_STATE_HOME` or
 /// `~/.local/state` on Linux, `~/Library/Logs` on macOS).
 ///
-/// `allow(dead_code)`: only `default_log_path` calls this, and that in turn is
-/// consumed by the Windows service and the macOS launchd agent — not the Linux
-/// systemd path (which logs to the journal, no file path). So a Linux build
-/// legitimately leaves both unused.
+/// `allow(dead_code)`: only `default_log_path` calls this, consumed by the
+/// Windows service and the macOS launchd agent, not the Linux systemd path
+/// (which logs to the journal).
 #[cfg(not(windows))]
 #[allow(dead_code)]
 fn user_state_base() -> PathBuf {
@@ -128,133 +540,11 @@ fn home() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-static CONFIG_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// `--config <path>`: use this file instead of the default. Foreground and
-/// `secure` only (main.rs refuses it elsewhere), so a test or a second instance
-/// never reads or rewrites the installed service's file.
-pub fn set_config_override(path: PathBuf) {
-    let _ = CONFIG_OVERRIDE.set(path);
-}
-
-/// Whether `--config` replaced the default path.
-pub fn config_overridden() -> bool {
-    CONFIG_OVERRIDE.get().is_some()
-}
-
-/// The four keys that make up the listener for other machines.
-#[derive(Debug, Default)]
-pub struct SecurityKeys<'a> {
-    pub remote_listen: Option<&'a str>,
-    pub tls_cert: Option<&'a str>,
-    pub tls_key: Option<&'a str>,
-    pub token_sha256: Option<&'a str>,
-}
-
-/// Set (`Some`) or remove (`None`) the transport-security keys in `[embed]`,
-/// editing the file in place so every comment and other key survives.
-pub fn write_security_keys(path: &Path, keys: &SecurityKeys) -> anyhow::Result<()> {
-    edit_embed(path, |embed| {
-        for (k, v) in [
-            ("remote_listen", keys.remote_listen),
-            ("tls_cert", keys.tls_cert),
-            ("tls_key", keys.tls_key),
-            ("token_sha256", keys.token_sha256),
-        ] {
-            match v {
-                Some(v) => embed[k] = toml_edit::value(v),
-                None => {
-                    embed.remove(k);
-                }
-            }
-        }
-    })
-}
-
-/// Apply `edit` to `[embed]` in place. A file that exists but cannot be read
-/// or parsed is refused, never replaced: it holds settings (gguf, the remote
-/// listener, comments) that a rewrite would silently discard.
-fn edit_embed(path: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> anyhow::Result<()> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => anyhow::bail!(
-            "refusing to rewrite config file {}: it cannot be read ({e}), and rewriting it would \
-             discard what it holds. Fix its permissions (or remove it), then retry",
-            path.display()
-        ),
-    };
-    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
-        anyhow::anyhow!(
-            "refusing to rewrite config file {}: it is not valid TOML ({e}), and rewriting it would \
-             discard what it holds. Correct it (or remove it), then retry",
-            path.display()
-        )
-    })?;
-    if !doc.contains_table("embed") {
-        doc["embed"] = toml_edit::table();
-    }
-    let embed = doc["embed"].as_table_mut().ok_or_else(|| {
-        anyhow::anyhow!(
-            "[embed] in {} is not a table; correct the file, then retry",
-            path.display()
-        )
-    })?;
-    edit(embed);
-    // The io::Error stays in the chain (render with {:#}) so a caller can tell
-    // permission denied from other failures.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            anyhow::Error::new(e).context(format!(
-                "cannot create config directory {}",
-                parent.display()
-            ))
-        })?;
-    }
-    std::fs::write(path, doc.to_string()).map_err(|e| {
-        anyhow::Error::new(e).context(format!("cannot write config file {}", path.display()))
-    })?;
-    Ok(())
-}
-
-/// Whether `e` was caused by a permission refusal anywhere in its chain.
-pub fn is_permission_denied(e: &anyhow::Error) -> bool {
-    e.chain().any(|c| {
-        c.downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
-    })
-}
-
-/// Default location for the service config file. The Unix service runs as a
-/// *per-user* agent (launchd / systemd --user), so config lives under the
-/// user's config dir — `%PROGRAMDATA%\m3-embed-server\config.toml` on Windows,
-/// `~/.config/m3-embed-server/config.toml` (Linux) or
-/// `~/Library/Application Support/m3-embed-server/config.toml` (macOS).
-pub fn default_config_path() -> PathBuf {
-    if let Some(p) = CONFIG_OVERRIDE.get() {
-        return p.clone();
-    }
-    #[cfg(windows)]
-    {
-        let base = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
-        PathBuf::from(base)
-            .join("m3-embed-server")
-            .join("config.toml")
-    }
-    #[cfg(not(windows))]
-    {
-        user_config_base()
-            .join("m3-embed-server")
-            .join("config.toml")
-    }
-}
-
 /// Default location for the service log file. Per-user on Unix to match the
-/// per-user service model (no root-owned `/var/log` write).
+/// per-user service model.
 ///
-/// `allow(dead_code)`: consumed by the Windows service (`service.rs`) and the
-/// macOS launchd agent (`StandardOutPath`), but not the Linux systemd unit,
-/// which logs to the journal — so a Linux build leaves this unused.
+/// `allow(dead_code)`: consumed by the Windows service and the macOS launchd
+/// agent, but not the Linux systemd unit, which logs to the journal.
 #[allow(dead_code)]
 pub fn default_log_path() -> PathBuf {
     #[cfg(windows)]
@@ -272,452 +562,332 @@ pub fn default_log_path() -> PathBuf {
     }
 }
 
-pub fn load_file_config(path: &Path) -> anyhow::Result<FileConfig> {
-    if !path.exists() {
-        return Ok(FileConfig::default());
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("cannot read config file {}: {e}", path.display()))?;
-    let cfg: FileConfig = toml::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("cannot parse config file {}: {e}", path.display()))?;
-    Ok(cfg)
-}
-
-fn env_str(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
-}
-
-/// A set but unparseable value is NOT the same as an unset one: say so, then
-/// fall back, so a typo (`M3_EMBED_STREAMS=2x`) is not silently the default.
-fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
-    let raw = env_str(key)?;
-    match raw.parse() {
-        Ok(v) => Some(v),
-        Err(_) => {
-            log::warn!(
-                "ignoring {key}={raw:?}: not a valid {}; using the configured or default value",
-                std::any::type_name::<T>()
-            );
-            None
-        }
-    }
-}
-
-/// Default worker-context count, chosen by the COMPILED backend.
-///
-/// Each stream materialises its own compute graph on first use, sized for a
-/// worst-case `n_ctx` batch, and holds it for the process lifetime. Measured
-/// 2026-09-16 on bge-m3 at `n_ctx=8192`: **~3.85 GiB per stream on CUDA and
-/// ~4.0 GiB on a CPU-only build** — the cost is a property of the model and
-/// `n_ctx`, not of the backend, so a CPU box pays exactly as much per stream as
-/// a GPU box. It is linear in `streams` and quadratic in `n_ctx`.
-///
-/// The split is therefore about the HARDWARE the backend implies, not the
-/// backend's own cost:
-///
-/// * **GPU builds (cuda / vulkan / metal) -> 2.** A machine with a discrete GPU
-///   or Apple unified memory is very likely to have the headroom, and the second
-///   context buys concurrency for bulk ingest.
-/// * **CPU-only -> 1.** A CPU-only deployment is the modest-hardware case
-///   almost by definition, and ~4 GiB for a second graph is a large fraction of
-///   such a machine. Better to ship something that runs than something fast that
-///   will not fit.
-///
-/// ⚠ **This trades THROUGHPUT for memory, it is not a free win.** One context
-/// serves one embedding batch at a time, so at `streams = 1` concurrent callers
-/// queue rather than running in parallel — most visible during bulk ingest.
-/// `queue_depth` on `/metrics` is the signal: sustained non-zero means callers
-/// are waiting and the host would benefit from another stream if it has ~4 GiB
-/// spare.
-///
-/// ⚠ This is a DEFAULT, not a cap. `M3_EMBED_STREAMS` and the `[embed].streams`
-/// key both still win, so a CPU box with plenty of RAM can raise it and a small
-/// GPU box can lower it. The resolved value is logged at startup.
-const fn default_streams() -> usize {
-    if cfg!(any(
-        feature = "embedded-cuda",
-        feature = "embedded-vulkan",
-        feature = "embedded-metal"
-    )) {
-        // GPU build (cuda / vulkan / metal): 2 contexts.
-        2
-    } else {
-        // CPU-ONLY build: 1 context. This is the modest-hardware case, and a
-        // second compute graph costs ~4 GiB it probably does not have.
-        1
-    }
-}
-
-/// Resolve config with priority: env var > file value > default.
-/// Returns an error only if `gguf` is unresolved (it has no default).
-pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
-    let (gguf, source) = match env_str("M3_EMBED_GGUF") {
-        Some(g) => (g, "M3_EMBED_GGUF".to_string()),
-        None => match file.embed.gguf.clone() {
-            Some(g) => (
-                g,
-                format!("[embed].gguf in {}", default_config_path().display()),
-            ),
-            None => anyhow::bail!(
-                "M3_EMBED_GGUF is unset and {} has no [embed].gguf — set the env \
-                 var, or run `m3-embed-server install` with it set",
-                default_config_path().display()
-            ),
-        },
-    };
-
-    if !Path::new(&gguf).exists() {
-        anyhow::bail!("GGUF path does not exist: {gguf} (from {source})");
-    }
-
-    let (host, host_source) = match (env_str("M3_EMBED_SERVER_HOST"), file.embed.host.clone()) {
-        (Some(h), _) => (h, "M3_EMBED_SERVER_HOST".to_string()),
-        (None, Some(h)) => (
-            h,
-            format!("[embed].host in {}", default_config_path().display()),
-        ),
-        (None, None) => (DEFAULT_HOST.to_string(), "the default".to_string()),
-    };
-
-    Ok(ResolvedConfig {
-        gguf,
-        gguf_source: source,
-        port: env_parse("M3_EMBED_SERVER_PORT")
-            .or(file.embed.port)
-            .unwrap_or(DEFAULT_PORT),
-        host,
-        host_source,
-        streams: env_parse("M3_EMBED_STREAMS")
-            .or(file.embed.streams)
-            .unwrap_or_else(default_streams),
-        n_ctx: env_parse("M3_EMBED_CTX").or(file.embed.ctx).unwrap_or(8192),
-        seq_max: env_parse("M3_EMBED_SEQ_MAX")
-            .or(file.embed.seq_max)
-            .unwrap_or(32),
-        n_batch: env_parse("M3_EMBED_N_BATCH")
-            .or(file.embed.n_batch)
-            .unwrap_or(2048),
-        n_ubatch: env_parse("M3_EMBED_N_UBATCH")
-            .or(file.embed.n_ubatch)
-            .unwrap_or(512),
-        coalesce_ms: env_parse("M3_EMBED_COALESCE_MS")
-            .or(file.embed.coalesce_ms)
-            .unwrap_or(3),
-        max_batch_tokens: env_parse("M3_EMBED_MAX_BATCH_TOKENS")
-            .or(file.embed.max_batch_tokens)
-            .unwrap_or(2048),
-        security: security_config(&file.embed),
-    })
-}
-
-/// The transport-security settings: TLS and token from the file only, the FIPS
-/// flags from m3's environment variables first, then the file.
-pub fn security_config(e: &EmbedSection) -> crate::security::SecurityConfig {
-    let path = default_config_path();
-    // The environment wins over the file; record which one decided.
-    let flag = |var: &str, key: &str, file: Option<bool>| match (env_flag(var), file) {
-        (Some(v), _) => (v, var.to_string()),
-        (None, Some(v)) => (v, format!("[embed].{key} in {}", path.display())),
-        (None, None) => (false, "the default".to_string()),
-    };
-    let (fips_mode, fips_mode_from) = flag("M3_FIPS_MODE", "fips_mode", e.fips_mode);
-    let (fips_strict, fips_strict_from) = flag("M3_FIPS_STRICT", "fips_strict", e.fips_strict);
-    crate::security::SecurityConfig {
-        remote_listen: e.remote_listen.clone(),
-        tls_cert: e.tls_cert.clone().map(PathBuf::from),
-        tls_key: e.tls_key.clone().map(PathBuf::from),
-        token_sha256: e.token_sha256.clone(),
-        fips_mode,
-        fips_strict,
-        config_path: path.clone(),
-        fips_mode_from,
-        fips_strict_from,
-    }
-}
-
-/// m3's boolean spelling (1/true/yes/on, 0/false/no/off). A set value that is
-/// neither is said, then treated as unset.
-fn env_flag(key: &str) -> Option<bool> {
-    let raw = env_str(key)?;
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => {
-            log::warn!(
-                "ignoring {key}={raw:?}: not a boolean (1/true/yes/on or 0/false/no/off); using the \
-                 configured or default value"
-            );
-            None
-        }
-    }
-}
-
-/// Capture the current shell's env vars and serialize them as a starter
-/// config.toml. Called by the Windows `install` subcommand so the SYSTEM-account
-/// service inherits the operator's intended settings.
-///
-/// Windows writes it whole; the Unix installers merge it into the file
-/// (`merge_env_into_file`), since their unit pins only `M3_EMBED_GGUF`.
-pub fn snapshot_env_to_file() -> FileConfig {
-    FileConfig {
-        embed: EmbedSection {
-            gguf: env_str("M3_EMBED_GGUF"),
-            port: env_parse("M3_EMBED_SERVER_PORT"),
-            host: env_str("M3_EMBED_SERVER_HOST"),
-            streams: env_parse("M3_EMBED_STREAMS"),
-            ctx: env_parse("M3_EMBED_CTX"),
-            seq_max: env_parse("M3_EMBED_SEQ_MAX"),
-            n_batch: env_parse("M3_EMBED_N_BATCH"),
-            n_ubatch: env_parse("M3_EMBED_N_UBATCH"),
-            coalesce_ms: env_parse("M3_EMBED_COALESCE_MS"),
-            max_batch_tokens: env_parse("M3_EMBED_MAX_BATCH_TOKENS"),
-            remote_listen: None,
-            tls_cert: None,
-            tls_key: None,
-            token_sha256: None,
-            fips_mode: env_flag("M3_FIPS_MODE"),
-            fips_strict: env_flag("M3_FIPS_STRICT"),
-        },
-    }
-}
-
-/// Record the settings given to `install` in config.toml, keeping any value the
-/// file already has that the environment does not set. The Unix installers pin
-/// only M3_EMBED_GGUF into the unit, and a supervised service starts without the
-/// caller's environment, so a port (or host, streams...) handed to `install` was
-/// dropped and the service bound the default.
-#[cfg_attr(windows, allow(dead_code))] // the Unix installers call it
-pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
-    // A file the server could not load is refused here too, rather than
-    // replaced by one holding only what this environment sets.
-    load_file_config(path).map_err(|e| {
-        anyhow::anyhow!("refusing to record install settings: {e:#}. Correct the file (or remove it), then retry")
-    })?;
-    let env = snapshot_env_to_file().embed;
-    let int = |v: Option<u64>| {
-        v.and_then(|v| i64::try_from(v).ok())
-            .map(toml_edit::Value::from)
-    };
-    let set: [(&str, Option<toml_edit::Value>); 12] = [
-        ("gguf", env.gguf.map(toml_edit::Value::from)),
-        ("port", int(env.port.map(u64::from))),
-        ("host", env.host.map(toml_edit::Value::from)),
-        ("streams", int(env.streams.map(|v| v as u64))),
-        ("ctx", int(env.ctx.map(u64::from))),
-        ("seq_max", int(env.seq_max.map(u64::from))),
-        ("n_batch", int(env.n_batch.map(u64::from))),
-        ("n_ubatch", int(env.n_ubatch.map(u64::from))),
-        ("coalesce_ms", int(env.coalesce_ms)),
-        (
-            "max_batch_tokens",
-            int(env.max_batch_tokens.map(|v| v as u64)),
-        ),
-        ("fips_mode", env.fips_mode.map(toml_edit::Value::from)),
-        ("fips_strict", env.fips_strict.map(toml_edit::Value::from)),
-    ];
-    // In place: only keys the environment sets change; comments survive.
-    edit_embed(path, |embed| {
-        for (k, v) in set {
-            if let Some(v) = v {
-                embed[k] = toml_edit::Item::Value(v);
-            }
-        }
-    })
-}
-
-// Its one caller is the Windows service installer (service.rs is cfg(windows)),
-// so on other platforms it is dead code and clippy -D warnings rejects it.
-#[cfg(windows)]
-pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let s = toml::to_string_pretty(cfg)?;
-    std::fs::write(path, s)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    //! Every root points at a temp dir and every environment is a map: no test
+    //! reads ~/.m3, ~/.config/m3-embed-server or %PROGRAMDATA%.
     use super::*;
+    use m3_config::{Location, MapEnv, Tier};
 
-    /// The backend-dependent default must actually DIFFER by backend.
-    ///
-    /// A `cfg!` chain that silently always takes one arm looks correct, compiles
-    /// clean, and quietly ships the wrong default to half the fleet. This pins
-    /// the value for whichever backend the test binary was built with, so a
-    /// mis-edited feature name fails here rather than in a user's RAM.
+    struct Fixture {
+        dir: tempfile::TempDir,
+        gguf: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let gguf = dir.path().join("model.gguf");
+            std::fs::write(&gguf, b"not a real gguf; resolve() only stats it").unwrap();
+            Fixture { dir, gguf }
+        }
+
+        fn gguf_toml(&self) -> String {
+            format!("{:?}", self.gguf.to_string_lossy())
+        }
+
+        /// m3_config.toml with `text`, read with `env` as the legacy names'
+        /// environment and `set` as the --set table.
+        fn config(&self, text: &str, env: MapEnv, set: Option<&str>) -> Config {
+            let file = self.dir.path().join("m3_config.toml");
+            std::fs::write(&file, text).unwrap();
+            let loc = Location {
+                file,
+                root: self.dir.path().to_path_buf(),
+                tier: Tier::Arg,
+            };
+            let set = set
+                .map(|s| m3_config::parse_set(s, &KEYS).unwrap())
+                .unwrap_or_default();
+            Config::load(loc, set, Some(Box::new(env)), None).unwrap()
+        }
+    }
+
+    /// The trigger: a FIPS setting made in m3_config.toml must reach the server,
+    /// outrank the legacy environment name, and be reported as the file's.
     #[test]
-    fn default_streams_matches_the_compiled_backend() {
+    fn fips_flags_set_only_in_m3_config_take_effect_and_outrank_the_env() {
+        let f = Fixture::new();
+        let env = MapEnv::new()
+            .with("M3_FIPS_MODE", "0")
+            .with("M3_FIPS_STRICT", "false");
+        let cfg = f.config(
+            &format!(
+                "[embed]\ngguf = {}\n[crypto]\nfips_mode = true\nfips_strict = true\n",
+                f.gguf_toml()
+            ),
+            env,
+            None,
+        );
+        let r = resolve(&cfg).unwrap();
+        assert!(r.security.fips_mode && r.security.fips_strict);
+        assert!(
+            r.security
+                .fips_mode_from
+                .starts_with("[crypto].fips_mode in ")
+                && r.security.fips_mode_from.ends_with("m3_config.toml"),
+            "{}",
+            r.security.fips_mode_from
+        );
+        assert!(
+            r.security
+                .fips_strict_from
+                .starts_with("[crypto].fips_strict in "),
+            "{}",
+            r.security.fips_strict_from
+        );
+    }
+
+    #[test]
+    fn port_and_gguf_set_only_in_m3_config_take_effect_and_outrank_the_env() {
+        let f = Fixture::new();
+        let env = MapEnv::new()
+            .with("M3_EMBED_SERVER_PORT", "9999")
+            .with("M3_EMBED_GGUF", "/elsewhere/other.gguf");
+        let cfg = f.config(
+            &format!(
+                "[embed]\ngguf = {}\n[embed.server]\nport = 8093\n",
+                f.gguf_toml()
+            ),
+            env,
+            None,
+        );
+        let r = resolve(&cfg).unwrap();
+        assert_eq!(r.port, 8093);
+        assert_eq!(Path::new(&r.gguf), f.gguf);
+        assert!(
+            r.gguf_source.starts_with("[embed].gguf in "),
+            "{}",
+            r.gguf_source
+        );
+        assert!(
+            r.sources
+                .iter()
+                .any(|s| s.starts_with("embed.server.port <- [embed.server].port in ")),
+            "{:?}",
+            r.sources
+        );
+    }
+
+    #[test]
+    fn the_legacy_env_names_apply_below_the_file_and_set_wins_over_all() {
+        let f = Fixture::new();
+        let env = MapEnv::new()
+            .with("M3_EMBED_SERVER_PORT", "8094")
+            .with("M3_FIPS_MODE", "1")
+            .with("M3_EMBED_GGUF", &f.gguf.to_string_lossy());
+        let r = resolve(&f.config("", env.clone(), None)).unwrap();
+        assert_eq!(r.port, 8094);
+        assert!(r.security.fips_mode);
+        assert!(
+            r.security.fips_mode_from.contains("M3_FIPS_MODE"),
+            "{}",
+            r.security.fips_mode_from
+        );
+        assert!(r.gguf_source.contains("M3_EMBED_GGUF"), "{}", r.gguf_source);
+
+        let r = resolve(&f.config(
+            "[embed.server]\nport = 8095\n",
+            env,
+            Some("{embed.server.port=8096, crypto.fips_mode=false}"),
+        ))
+        .unwrap();
+        assert_eq!(r.port, 8096);
+        assert!(!r.security.fips_mode);
+        assert_eq!(r.security.fips_mode_from, "--set crypto.fips_mode");
+    }
+
+    #[test]
+    fn the_server_only_knobs_are_read_under_embed_server() {
+        let f = Fixture::new();
+        let cfg = f.config(
+            &format!(
+                "[embed]\ngguf = {}\nctx = 4096\n[embed.server]\nstreams = 4\nseq_max = 8\n\
+                 n_batch = 4096\nn_ubatch = 1024\ncoalesce_ms = 0\nmax_batch_tokens = 9000\n",
+                f.gguf_toml()
+            ),
+            MapEnv::new(),
+            None,
+        );
+        let r = resolve(&cfg).unwrap();
+        assert_eq!(
+            (
+                r.n_ctx,
+                r.streams,
+                r.seq_max,
+                r.n_batch,
+                r.n_ubatch,
+                r.coalesce_ms,
+                r.max_batch_tokens
+            ),
+            (4096, 4, 8, 4096, 1024, 0, 9000)
+        );
+    }
+
+    /// The backend-dependent default must actually DIFFER by backend, and the
+    /// file must still be able to raise it (a default, never a cap).
+    #[test]
+    fn streams_default_follows_the_backend_and_the_file_beats_it() {
         let expected = if cfg!(any(
             feature = "embedded-cuda",
             feature = "embedded-vulkan",
             feature = "embedded-metal"
         )) {
-            2 // GPU build: headroom assumed
+            2
         } else {
-            1 // CPU-only: ~4 GiB per extra graph is too much for modest hardware
+            1
         };
+        assert_eq!(default_streams(), expected);
+        let f = Fixture::new();
+        let gguf = format!("[embed]\ngguf = {}\n", f.gguf_toml());
         assert_eq!(
-            default_streams(),
-            expected,
-            "default_streams() disagrees with the compiled backend"
+            resolve(&f.config(&gguf, MapEnv::new(), None))
+                .unwrap()
+                .streams,
+            expected
+        );
+        let raised = format!("{gguf}[embed.server]\nstreams = 4\n");
+        assert_eq!(
+            resolve(&f.config(&raised, MapEnv::new(), None))
+                .unwrap()
+                .streams,
+            4
         );
     }
 
-    /// A CPU-only box with spare RAM must still be able to ask for more.
-    /// The default is a floor for the common case, never a cap.
     #[test]
-    fn file_value_overrides_the_backend_default() {
-        let (file, _guard) = file_config_with_real_gguf(Some(4));
-        let resolved = temp_env_without_streams(|| resolve(&file).expect("resolve"));
-        assert_eq!(resolved.streams, 4, "[embed].streams must beat the default");
-    }
-
-    /// Guard the *other* direction too: with nothing set anywhere, the resolved
-    /// value is the backend default rather than an accidental hardcode.
-    #[test]
-    fn unset_falls_back_to_the_backend_default() {
-        let (file, _guard) = file_config_with_real_gguf(None);
-        let resolved = temp_env_without_streams(|| resolve(&file).expect("resolve"));
-        assert_eq!(resolved.streams, default_streams());
-    }
-
-    /// `resolve()` rejects a non-existent GGUF, so these tests need a real file.
-    /// Returns the config plus a guard whose Drop removes the temp file — the
-    /// path must stay alive for the duration of the call.
-    fn file_config_with_real_gguf(streams: Option<usize>) -> (FileConfig, TempGguf) {
-        let guard = TempGguf::new();
-        let mut file = FileConfig::default();
-        file.embed.gguf = Some(guard.path.to_string_lossy().into_owned());
-        file.embed.streams = streams;
-        (file, guard)
-    }
-
-    struct TempGguf {
-        path: PathBuf,
-    }
-
-    impl TempGguf {
-        fn new() -> Self {
-            // Unique per test: the suite runs threads in one process.
-            let path = std::env::temp_dir().join(format!(
-                "m3-streams-test-{}-{:?}.gguf",
-                std::process::id(),
-                std::thread::current().id(),
-            ));
-            std::fs::write(&path, b"not a real gguf; resolve() only stats it")
-                .expect("write temp gguf");
-            Self { path }
+    fn the_token_digest_comes_from_the_secrets_file_named_by_secrets_file() {
+        let f = Fixture::new();
+        let secrets = f.dir.path().join("private").join("s.toml");
+        std::fs::create_dir_all(secrets.parent().unwrap()).unwrap();
+        let digest = "ab".repeat(32);
+        std::fs::write(
+            &secrets,
+            format!("[secrets]\n{TOKEN_SECRET} = \"{digest}\"\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-    }
-
-    impl Drop for TempGguf {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    /// Run `f` with `M3_EMBED_STREAMS` removed, restoring it afterwards.
-    ///
-    /// Tests share a process, so a stray env var from the developer's shell
-    /// would make these pass or fail for the wrong reason.
-    /// A port given to `install` reaches config.toml, where the supervised
-    /// service reads it; values already in the file and not in the env stay.
-    #[test]
-    fn install_records_a_given_port_and_keeps_file_values() {
-        let dir = std::env::temp_dir().join(format!("m3-embed-merge-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(&path, "[embed]\ngguf = \"/m/bge.gguf\"\nstreams = 3\n").unwrap();
-        let saved: Vec<(&str, Option<String>)> =
-            ["M3_EMBED_SERVER_PORT", "M3_EMBED_GGUF", "M3_EMBED_STREAMS"]
-                .iter()
-                .map(|k| (*k, std::env::var(k).ok()))
-                .collect();
-        for (k, _) in &saved {
-            std::env::remove_var(k);
-        }
-        std::env::set_var("M3_EMBED_SERVER_PORT", "8083");
-        merge_env_into_file(&path).unwrap();
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        let cfg = load_file_config(&path).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(cfg.embed.port, Some(8083));
-        assert_eq!(cfg.embed.gguf.as_deref(), Some("/m/bge.gguf"));
-        assert_eq!(cfg.embed.streams, Some(3));
-    }
-
-    /// `secure` edits the operator's file: comments and other keys survive,
-    /// Windows paths round-trip, and `--off` removes exactly the three keys.
-    #[test]
-    fn security_keys_are_edited_in_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let original = "[embed]\n# why one stream: measured\nstreams = 1\nport = 8082\n";
-        std::fs::write(&path, original).unwrap();
-        let cert = r"C:\Users\x\.m3\config\tls\cert.pem";
-        let digest = "a".repeat(64);
-        let keys = SecurityKeys {
-            remote_listen: Some("100.100.50.63"),
-            tls_cert: Some(cert),
-            tls_key: Some("/k.pem"),
-            token_sha256: Some(&digest),
-        };
-        write_security_keys(&path, &keys).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# why one stream: measured"), "{text}");
-        let cfg = load_file_config(&path).unwrap();
-        assert_eq!(cfg.embed.tls_cert.as_deref(), Some(cert));
-        assert_eq!(cfg.embed.remote_listen.as_deref(), Some("100.100.50.63"));
-        assert_eq!(cfg.embed.streams, Some(1));
-        assert_eq!(cfg.embed.token_sha256.as_deref(), Some(digest.as_str()));
-
-        write_security_keys(&path, &SecurityKeys::default()).unwrap();
-        let cfg = load_file_config(&path).unwrap();
-        assert!(cfg.embed.remote_listen.is_none() && cfg.embed.tls_cert.is_none());
-        assert!(cfg.embed.tls_key.is_none() && cfg.embed.token_sha256.is_none());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-    }
-
-    /// `install` must not replace a config file it cannot load: that file holds
-    /// the model path and the remote listener. A loadable one keeps its comments.
-    #[test]
-    fn install_refuses_a_broken_config_and_keeps_comments_in_a_good_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        let broken = "[embed]\ngguf = \"/m/bge.gguf\"\nremote_listen = \"100.1.2.3\n";
-        std::fs::write(&path, broken).unwrap();
-        let e = merge_env_into_file(&path).unwrap_err().to_string();
-        assert!(e.contains("refusing") && e.contains("config.toml"), "{e}");
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            broken,
-            "a refused file is left untouched"
+        let cfg = f.config(
+            &format!(
+                "[embed]\ngguf = {}\n[embed.server]\nremote_listen = \"100.64.0.9\"\n\
+                 [secrets]\nfile = \"private/s.toml\"\n",
+                f.gguf_toml()
+            ),
+            MapEnv::new(),
+            None,
         );
-
-        let good = "[embed]\n# chosen for this box\nstreams = 3\n";
-        std::fs::write(&path, good).unwrap();
-        merge_env_into_file(&path).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let sec = resolve(&cfg).unwrap().security;
+        assert_eq!(sec.token_sha256.as_deref(), Some(digest.as_str()));
         assert!(
-            text.contains("# chosen for this box") && text.contains("streams = 3"),
-            "{text}"
+            sec.token_from.contains(&secrets.display().to_string()),
+            "{}",
+            sec.token_from
+        );
+        // A digest left in m3_config.toml is not a source.
+        let cfg = f.config(
+            &format!(
+                "[embed]\ngguf = {}\n[embed.server]\nremote_listen = \"100.64.0.9\"\n",
+                f.gguf_toml()
+            ),
+            MapEnv::new(),
+            None,
+        );
+        assert_eq!(resolve(&cfg).unwrap().security.token_sha256, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_readable_secrets_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let secrets = f.dir.path().join("m3_secrets.toml");
+        std::fs::write(
+            &secrets,
+            format!("[secrets]\n{TOKEN_SECRET} = \"{}\"\n", "ab".repeat(32)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let cfg = f.config(
+            &format!(
+                "[embed]\ngguf = {}\n[embed.server]\nremote_listen = \"100.64.0.9\"\n",
+                f.gguf_toml()
+            ),
+            MapEnv::new(),
+            None,
+        );
+        let e = format!("{:#}", resolve(&cfg).unwrap_err());
+        assert!(e.contains("user-only") && e.contains("chmod 600"), "{e}");
+    }
+
+    #[test]
+    fn a_loopback_only_server_does_not_read_the_secrets_file() {
+        let f = Fixture::new();
+        // Not TOML at all: reading it would fail.
+        std::fs::write(f.dir.path().join("m3_secrets.toml"), "[[[").unwrap();
+        let cfg = f.config(
+            &format!("[embed]\ngguf = {}\n", f.gguf_toml()),
+            MapEnv::new(),
+            None,
+        );
+        assert!(resolve(&cfg).unwrap().security.token_sha256.is_none());
+    }
+
+    #[test]
+    fn a_missing_gguf_names_the_file_and_the_fix() {
+        let f = Fixture::new();
+        let e = resolve(&f.config("", MapEnv::new(), None))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("embed.gguf is not set") && e.contains("m3_config.toml"),
+            "{e}"
+        );
+        assert!(e.contains("m3 config set embed.gguf"), "{e}");
+    }
+
+    #[test]
+    fn install_refuses_env_settings_the_service_will_not_see() {
+        let f = Fixture::new();
+        let text = format!("[embed]\ngguf = {}\n", f.gguf_toml());
+        // The same port as the default and the same model as the file: fine.
+        let env = MapEnv::new()
+            .with("M3_EMBED_SERVER_PORT", "8082")
+            .with("M3_EMBED_GGUF", &f.gguf.to_string_lossy());
+        let cli = f.config(&text, env, None);
+        let svc = f.config(&text, MapEnv::new(), None);
+        assert!(unseen_by_service(&cli, &svc).unwrap().is_empty());
+        // A different port only in the environment: refused, with the fix.
+        let cli = f.config(
+            &text,
+            MapEnv::new().with("M3_EMBED_SERVER_PORT", "8083"),
+            None,
+        );
+        let found = unseen_by_service(&cli, &svc).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].contains("M3_EMBED_SERVER_PORT")
+                && found[0].contains("would use 8082")
+                && found[0].contains("m3 config set embed.server.port 8083"),
+            "{found:?}"
         );
     }
 
-    fn temp_env_without_streams<T>(f: impl FnOnce() -> T) -> T {
-        let saved = std::env::var("M3_EMBED_STREAMS").ok();
-        std::env::remove_var("M3_EMBED_STREAMS");
-        let out = f();
-        if let Some(v) = saved {
-            std::env::set_var("M3_EMBED_STREAMS", v);
-        }
-        out
+    #[test]
+    fn the_retired_config_toml_is_warned_about_not_read() {
+        let d = tempfile::tempdir().unwrap();
+        let old = d.path().join("config.toml");
+        let m3 = d.path().join("m3_config.toml");
+        assert!(
+            legacy_file_notice(&old, &m3).is_none(),
+            "no file, no warning"
+        );
+        std::fs::write(&old, "[embed]\nport = 9000\n").unwrap();
+        let msg = legacy_file_notice(&old, &m3).unwrap();
+        assert!(msg.contains(&old.display().to_string()) && msg.contains("no longer reads it"));
+        assert!(msg.contains(&m3.display().to_string()) && msg.contains(TOKEN_SECRET));
     }
 }

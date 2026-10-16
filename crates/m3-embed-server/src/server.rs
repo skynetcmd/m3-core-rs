@@ -23,7 +23,7 @@ use m3_dispatcher::{BreakerCfg, BreakerStatus, Dispatcher, DispatcherConfig};
 use m3_embed_llamacpp::{EmbeddedBackend, Tokenizer};
 use m3_resilience::ceil_secs;
 
-use crate::config::{self, ResolvedConfig};
+use crate::config::ResolvedConfig;
 use crate::security;
 
 /// Which GPU backend this binary was COMPILED with.
@@ -162,20 +162,29 @@ where
     //   * streams/n_ctx — the two knobs that decide the process footprint.
     //   * n_batch/n_ubatch — these are RAISED to n_ctx at the FFI, so a value set
     //              here is not necessarily the value in force.
-    let config_path = config::default_config_path();
     log::info!(
-        "m3-embed-server starting: host={} port={} backend={} gguf={} (from {}) config={} ({})",
+        "m3-embed-server starting: host={} port={} backend={} gguf={} (from {}) config={} ({}, located \
+         by {})",
         cfg.host,
         cfg.port,
         compiled_backend(),
         cfg.gguf,
         cfg.gguf_source,
-        config_path.display(),
-        if config_path.exists() {
+        cfg.config_file.display(),
+        if cfg.config_present {
             "present"
         } else {
-            "absent: environment and defaults only"
+            "absent: --set, environment and defaults only"
         },
+        cfg.config_tier,
+    );
+    log::info!(
+        "settings not at their default: {}",
+        if cfg.sources.is_empty() {
+            "none".to_string()
+        } else {
+            cfg.sources.join("; ")
+        }
     );
     log::info!(
         "embed params: streams={} n_ctx={} seq_max={} n_batch={} n_ubatch={} \
@@ -196,8 +205,8 @@ where
         "footprint: {} compute graph(s), allocated lazily on the first \
          {} request(s) and held for the process lifetime. Scales linearly with \
          streams and QUADRATICALLY with n_ctx. Anchor: bge-m3 at n_ctx=8192 \
-         measured ~3.85 GiB per stream. Reduce with M3_EMBED_STREAMS or \
-         M3_EMBED_CTX.",
+         measured ~3.85 GiB per stream. Reduce with embed.server.streams or \
+         embed.ctx in m3_config.toml.",
         cfg.streams,
         cfg.streams,
     );

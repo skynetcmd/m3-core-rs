@@ -210,12 +210,19 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     let port_in_use = std::cell::Cell::new(false);
     let refused = std::cell::Cell::new(false);
     let run_result: Result<(), String> = (|| {
-        // Resolve config from %PROGRAMDATA% file (env vars unlikely to be set
-        // under SYSTEM, but `resolve` honors them when present).
-        let file_cfg = config::load_file_config(&config::default_config_path())
-            .map_err(|e| format!("{e:#}"))?;
-        let cfg =
-            config::resolve(&file_cfg).map_err(|e| format!("config resolve failed: {e:#}"))?;
+        // The m3_config.toml named by the `--config` that `install` pinned into
+        // the service's command line: LocalSystem cannot discover the user's.
+        let loaded = config::load().and_then(|c| {
+            config::warn_legacy_file(&c);
+            config::resolve(&c)
+        });
+        let cfg = loaded.map_err(|e| {
+            refused.set(
+                e.chain()
+                    .any(|c| c.downcast_ref::<m3_config::ConfigError>().is_some()),
+            );
+            format!("config resolve failed: {e:#}")
+        })?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -296,8 +303,8 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             log::error!(
                 "service stopped ({meaning}): {msg}. Usual causes: the GGUF model is missing or \
                  unreadable by the service account, or the model failed to load. Inspect {} \
-                 ([embed].gguf, [embed].port) and the lines above this one",
-                config::default_config_path().display()
+                 ([embed] gguf, [embed.server] port) and the lines above this one",
+                config::located_file()
             );
         }
     }
@@ -308,7 +315,38 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
 // Operator subcommands
 // ---------------------------------------------------------------------------
 
+/// The service's command line as SCM stores it: whether it already runs `exe`
+/// with `args` (each appears verbatim; windows-service quotes a word only when
+/// it holds spaces or quotes, which leaves the text inside unchanged).
+fn command_line_matches(stored: &str, exe: &std::path::Path, args: &[String]) -> bool {
+    let exe = exe.to_string_lossy();
+    stored.contains(exe.as_ref())
+        && args.iter().all(|a| stored.contains(a.as_str()))
+        && stored.contains("run-as-service")
+}
+
 pub fn install() -> Result<(), Box<dyn std::error::Error>> {
+    // First, before touching SCM: the service will read only the file named
+    // here, as LocalSystem; refuse a setup it could not start from.
+    let (args, cfg_file) = config::service_args().map_err(|e| format!("{e:#}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        format!("cannot register the service: cannot resolve this executable's path: {e}")
+    })?;
+    let mut launch_arguments: Vec<OsString> = args.iter().map(OsString::from).collect();
+    launch_arguments.push(OsString::from("run-as-service"));
+    let service_info = ServiceInfo {
+        name: OsString::from(SERVICE_NAME),
+        display_name: OsString::from(SERVICE_DISPLAY),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe.clone(),
+        launch_arguments,
+        dependencies: vec![],
+        account_name: None, // Local System
+        account_password: None,
+    };
+
     // Connect with CONNECT only. Requesting CREATE_SERVICE here needs
     // Administrator, so unelevated this call failed outright and `?` returned
     // before the idempotency check below could run — the 3.7.27 wheel shipped
@@ -331,9 +369,31 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     // installed)" and told the operator to re-run elevated, while the service
     // was already registered, Automatic, and serving :8082. Re-registering is a
     // no-op, so report success rather than erroring.
-    if let Ok(existing) = service_manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+    if let Ok(existing) = service_manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+    ) {
         let state = existing.query_status().map(|s| s.current_state).ok();
         println!("service already installed: {SERVICE_NAME}");
+        // A registration from an earlier version (no --config) or another
+        // binary or file cannot start correctly: converge it. Changing it needs
+        // Administrator, so only when it differs.
+        let stored = existing
+            .query_config()
+            .map(|c| c.executable_path.to_string_lossy().into_owned())
+            .map_err(|e| open_failure("query", e))?;
+        if !command_line_matches(&stored, &exe, &args) {
+            let svc = service_manager
+                .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+                .map_err(|e| open_failure("install", e))?;
+            svc.change_config(&service_info)
+                .map_err(|e| open_failure("install", e))?;
+            println!(
+                "updated its command line to read {} (was: {stored}); restart it to apply: \
+                 m3-embed-server stop, then start",
+                cfg_file.display()
+            );
+        }
         match state {
             Some(ServiceState::Running) => println!("state: running (nothing to do)"),
             Some(ServiceState::Stopped) => {
@@ -373,22 +433,6 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         })
     })?;
 
-    let exe = std::env::current_exe().map_err(|e| {
-        format!("cannot register the service: cannot resolve this executable's path: {e}")
-    })?;
-    let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from(SERVICE_DISPLAY),
-        service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: exe,
-        launch_arguments: vec![OsString::from("run-as-service")],
-        dependencies: vec![],
-        account_name: None, // Local System
-        account_password: None,
-    };
-
     let service = service_manager
         .create_service(
             &service_info,
@@ -413,36 +457,15 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         ),
     }
 
-    // Snapshot current env into the config file so SYSTEM-account service
-    // can find the GGUF. Don't clobber an existing file.
-    let cfg_path = config::default_config_path();
-    if !cfg_path.exists() {
-        let snapshot = config::snapshot_env_to_file();
-        config::write_config_file(&cfg_path, &snapshot).map_err(|e| {
-            format!(
-                "{SERVICE_NAME} IS registered, but its starter config {} could not be written: {e:#}. \
-                 It cannot start until that file sets [embed].gguf: write it from an Administrator \
-                 terminal, or run `m3-embed-server uninstall` and then `install` again",
-                cfg_path.display()
-            )
-        })?;
-        println!("wrote starter config: {}", cfg_path.display());
-    } else {
-        println!(
-            "config already exists, not overwritten: {}",
-            cfg_path.display()
-        );
-    }
-
     println!("service installed: {SERVICE_NAME}");
     println!("log files:         {}", log_files_hint());
     println!();
-    println!("Next steps:");
     println!(
-        "  1. Edit {} to confirm [embed].gguf is set.",
-        cfg_path.display()
+        "config file:       {} (pinned with --config)",
+        cfg_file.display()
     );
-    println!("  2. Start it:  m3-embed-server start    (or: sc start {SERVICE_NAME})");
+    println!();
+    println!("Start it:  m3-embed-server start    (or: sc start {SERVICE_NAME})");
     Ok(())
 }
 
@@ -539,8 +562,8 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
         println!("service removed: {SERVICE_NAME}");
     }
     println!(
-        "config file left in place: {} (delete manually if desired)",
-        config::default_config_path().display()
+        "m3_config.toml is m3's and is left in place: {}",
+        config::located_file()
     );
     Ok(())
 }
@@ -796,4 +819,24 @@ pub fn status() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| open_failure("query", e))?;
     println!("{}", state_word(st.current_state));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_registration_without_the_config_file_is_not_a_match() {
+        let exe = std::path::Path::new(r"C:\Program Files\m3\m3-embed-server.exe");
+        let args = vec![
+            "--config".to_string(),
+            r"C:\Users\u\.m3\config\m3_config.toml".to_string(),
+        ];
+        let new = r#""C:\Program Files\m3\m3-embed-server.exe" --config C:\Users\u\.m3\config\m3_config.toml run-as-service"#;
+        let old = r#""C:\Program Files\m3\m3-embed-server.exe" run-as-service"#;
+        assert!(command_line_matches(new, exe, &args));
+        assert!(!command_line_matches(old, exe, &args));
+        let other = std::path::Path::new(r"C:\old\m3-embed-server.exe");
+        assert!(!command_line_matches(new, other, &args));
+    }
 }

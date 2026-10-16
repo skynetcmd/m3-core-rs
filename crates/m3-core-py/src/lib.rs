@@ -1,9 +1,11 @@
 //! PyO3 bindings for m3-core-rs.
 //!
-//! The only crate Python sees. This is also the ONLY crate that reads `M3_*`
-//! env vars (per plan §9.6) — it translates them into the typed config structs
-//! the generic crates consume. Generic crates never call `std::env::var` and
-//! never depend on pyo3.
+//! The only crate Python sees. Settings arrive as constructor / function
+//! PARAMETERS that m3 reads from its registry (m3_config.toml); this crate
+//! turns them into the typed config structs the generic crates consume
+//! (src/config.rs). A legacy `M3_*` environment name is honoured for one
+//! release when a parameter is not given. Generic crates never call
+//! `std::env::var` and never depend on pyo3.
 
 use pyo3::exceptions::{PyException, PyOSError, PyValueError};
 use pyo3::prelude::*;
@@ -1384,7 +1386,7 @@ fn decode_spans(
 }
 
 // ---------------------------------------------------------------------------
-// m3-dispatcher + M3_* env config
+// m3-dispatcher + settings
 // ---------------------------------------------------------------------------
 
 /// Conservative BGE-M3 token count that never under-counts:
@@ -1418,10 +1420,10 @@ fn compile_fts_query(query: &str, mode: &str) -> (String, bool) {
     m3_fts::compile_fts_query(query, mode)
 }
 
-/// Typed dispatcher configuration. Construction precedence is
-/// kwarg > `M3_*` env var > crate default (plan §9.7). The `Dispatcher` itself
-/// is async/generic and not bound — this class demonstrates the §9.6 config
-/// pattern and is introspectable from Python.
+/// Typed dispatcher configuration. Per setting: the keyword argument > its
+/// legacy `M3_*` environment name (deprecated) > the crate default. `ctx` only
+/// feeds the `max_batch_tokens` default (`streams * ctx`). The `Dispatcher`
+/// itself is async/generic and not bound; this class is introspectable.
 #[pyclass(name = "DispatcherConfig")]
 struct PyDispatcherConfig {
     inner: m3_dispatcher::DispatcherConfig,
@@ -1430,24 +1432,23 @@ struct PyDispatcherConfig {
 #[pymethods]
 impl PyDispatcherConfig {
     #[new]
-    #[pyo3(signature = (streams=None, coalesce_window_ms=None, max_batch_tokens=None))]
+    #[pyo3(signature = (streams=None, coalesce_window_ms=None, max_batch_tokens=None, ctx=None))]
     fn new(
         streams: Option<usize>,
         coalesce_window_ms: Option<u64>,
         max_batch_tokens: Option<usize>,
+        ctx: Option<u32>,
     ) -> Self {
-        // env layer first, then any provided kwarg overrides it.
-        let mut cfg = config::dispatcher_config_from_env();
-        if let Some(s) = streams {
-            cfg.streams = s;
+        let settings = config::resolve(config::EmbedParams {
+            streams,
+            ctx,
+            coalesce_ms: coalesce_window_ms,
+            max_batch_tokens,
+            ..Default::default()
+        });
+        PyDispatcherConfig {
+            inner: config::dispatcher_config(&settings),
         }
-        if let Some(c) = coalesce_window_ms {
-            cfg.coalesce_window_ms = c;
-        }
-        if let Some(m) = max_batch_tokens {
-            cfg.max_batch_tokens = m;
-        }
-        PyDispatcherConfig { inner: cfg }
     }
 
     #[getter]
@@ -1487,21 +1488,20 @@ fn embed_backend_label() -> &'static str {
     m3_embed_llamacpp::COMPILED_BACKEND
 }
 
-/// Resolved `M3_*` config snapshot — what the env layer produced before any
-/// kwarg overrides. Lets Python introspect the §9.6 env wiring.
+/// DEPRECATED: the settings an `EmbeddedEmbedder` built with no parameters
+/// would use (legacy environment names, else defaults), under the legacy
+/// names. m3 passes the parameters instead; kept for one release.
 #[pyfunction]
 fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let s = config::resolve(config::EmbedParams::default());
     let d = PyDict::new(py);
-    d.set_item("M3_EMBED_STREAMS", config::embed_streams())?;
-    d.set_item("M3_EMBED_COALESCE_MS", config::embed_coalesce_ms())?;
-    d.set_item(
-        "M3_EMBED_MAX_BATCH_TOKENS",
-        config::embed_max_batch_tokens(),
-    )?;
-    d.set_item("M3_EMBED_CTX", config::embed_ctx())?;
-    d.set_item("M3_EMBED_SEQ_MAX", config::embed_seq_max())?;
-    d.set_item("M3_EMBED_N_BATCH", config::embed_n_batch())?;
-    d.set_item("M3_EMBED_N_UBATCH", config::embed_n_ubatch())?;
+    d.set_item("M3_EMBED_STREAMS", s.streams)?;
+    d.set_item("M3_EMBED_COALESCE_MS", s.coalesce_ms)?;
+    d.set_item("M3_EMBED_MAX_BATCH_TOKENS", s.max_batch_tokens)?;
+    d.set_item("M3_EMBED_CTX", s.ctx)?;
+    d.set_item("M3_EMBED_SEQ_MAX", s.seq_max)?;
+    d.set_item("M3_EMBED_N_BATCH", s.n_batch)?;
+    d.set_item("M3_EMBED_N_UBATCH", s.n_ubatch)?;
     // The provider is fixed at build time; report what is ACTIVE, under the
     // key callers already read. config::hash_provider() warns if the env
     // var asks for something else.
@@ -1571,7 +1571,7 @@ fn format_log(
 ///
 /// `embed` no longer calls `EmbeddedBackend::run` directly — it routes through
 /// `m3_dispatcher::Dispatcher<EmbeddedBackend>`, the same coalescer the HTTP
-/// path uses. The stream count flows env var -> `DispatcherConfig::streams` ->
+/// path uses. The stream count flows `streams=` -> `DispatcherConfig::streams` ->
 /// `EmbeddedBackend` context-pool size, so the dispatcher's slot semaphore and
 /// the backend's worker-thread pool always agree (no point in a 4-context pool
 /// behind an 8-slot dispatcher). For introspection / `embedding_dim` a handle
@@ -1595,12 +1595,38 @@ impl PyEmbeddedEmbedder {
     /// only pays the per-batch cost. Pass `warmup=False` to keep the legacy
     /// lazy behavior (cold cost paid on first `embed`/`embedding_dim`).
     ///
-    /// The dispatcher config is built from the `M3_*` env layer; `streams`
-    /// (`M3_EMBED_STREAMS`) sizes both the dispatcher and the backend's
-    /// context pool.
+    /// The settings are keyword arguments m3 reads from m3_config.toml:
+    /// `streams` (embed.streams; sizes both the dispatcher and the backend's
+    /// context pool), `ctx` (embed.ctx), `seq_max` (embed.seq_max), `n_batch`
+    /// (embed.n_batch), `n_ubatch` (embed.n_ubatch), `coalesce_ms`
+    /// (embed.coalesce_ms), `max_batch_tokens` (embed.max_batch_tokens). One
+    /// not given falls back to its legacy `M3_EMBED_*` environment name
+    /// (deprecated, warned once), then the default.
     #[new]
-    #[pyo3(signature = (model_path, warmup=None))]
-    fn new(model_path: &str, warmup: Option<bool>) -> PyResult<Self> {
+    #[pyo3(signature = (
+        model_path,
+        warmup=None,
+        *,
+        streams=None,
+        ctx=None,
+        seq_max=None,
+        n_batch=None,
+        n_ubatch=None,
+        coalesce_ms=None,
+        max_batch_tokens=None
+    ))]
+    #[allow(clippy::too_many_arguments)] // one keyword argument per setting, as Python sees them
+    fn new(
+        model_path: &str,
+        warmup: Option<bool>,
+        streams: Option<usize>,
+        ctx: Option<u32>,
+        seq_max: Option<u32>,
+        n_batch: Option<u32>,
+        n_ubatch: Option<u32>,
+        coalesce_ms: Option<u64>,
+        max_batch_tokens: Option<usize>,
+    ) -> PyResult<Self> {
         // Multi-thread runtime: the embed worker pool blocks on
         // `spawn_blocking`, and `Dispatcher::new` spawns a scheduler task.
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1609,17 +1635,25 @@ impl PyEmbeddedEmbedder {
             .build()
             .map_err(|e| backend_err(format!("failed to build the embedder tokio runtime: {e}")))?;
 
-        let cfg = config::dispatcher_config_from_env();
-        let streams = cfg.streams;
-        let n_ctx = config::embed_ctx();
-        let seq_max = config::embed_seq_max();
-        let n_batch = config::embed_n_batch();
-        let n_ubatch = config::embed_n_ubatch();
-        // env var -> DispatcherConfig::streams -> EmbeddedBackend pool size.
-        // n_ctx flows from M3_EMBED_CTX (default 8192) — total token budget per decode call.
-        // seq_max flows from M3_EMBED_SEQ_MAX (default 32) — sequences packed per decode call.
-        // n_batch / n_ubatch flow from M3_EMBED_N_BATCH / M3_EMBED_N_UBATCH,
-        // both defaulting to M3_EMBED_CTX. The BERT encoder asserts
+        let settings = config::resolve(config::EmbedParams {
+            streams,
+            ctx,
+            seq_max,
+            n_batch,
+            n_ubatch,
+            coalesce_ms,
+            max_batch_tokens,
+        });
+        let cfg = config::dispatcher_config(&settings);
+        let streams = settings.streams;
+        let n_ctx = settings.ctx;
+        let seq_max = settings.seq_max;
+        let n_batch = settings.n_batch;
+        let n_ubatch = settings.n_ubatch;
+        // streams -> DispatcherConfig::streams -> EmbeddedBackend pool size.
+        // n_ctx (default 8192) is the total token budget per decode call;
+        // seq_max (default 32) the sequences packed per decode call;
+        // n_batch / n_ubatch both default to n_ctx. The BERT encoder asserts
         // `n_ubatch >= n_tokens` over the whole decode batch (a chunk can hold
         // up to n_ctx tokens), so n_ctx is the only encoder-safe default; the
         // embed crate floors any smaller value up to n_ctx.
@@ -1734,7 +1768,7 @@ impl PyEmbeddedEmbedder {
         map_err(self.backend.runtime_backend())
     }
 
-    /// Configured concurrent stream count (`M3_EMBED_STREAMS`). Equal to both
+    /// Configured concurrent stream count (`streams=`). Equal to both
     /// the dispatcher's slot count and the backend's context-pool size.
     fn streams(&self) -> usize {
         self.backend.streams()
@@ -1758,6 +1792,9 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // With neither set the filter is WARN: env_logger's own default is ERROR,
     // which silently dropped every warning the core emits (an ignored env
     // value, a skipped corrupt blob, a GPU build running on the CPU).
+    // Both stay environment variables: RUST_LOG is env_logger's own, and
+    // M3_DEBUG is m3's diagnostic switch, read before any config loads (m3's
+    // registry lists it under NOT_SETTINGS for that reason).
     let debug = std::env::var("M3_DEBUG").is_ok_and(|v| {
         let v = v.to_ascii_lowercase();
         !v.is_empty() && v != "0" && v != "false" && v != "no"

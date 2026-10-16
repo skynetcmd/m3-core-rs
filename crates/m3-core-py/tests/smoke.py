@@ -155,6 +155,26 @@ def test_dispatcher_and_env() -> None:
     assert m.estimate_tokens("") == 2
     assert m.estimate_tokens("\u6570" * 10) == 12  # 30 bytes // 3 = 10 = chars
 
+    # Settings are parameters (m3 passes them from m3_config.toml); the
+    # derived default max_batch_tokens follows the given streams and ctx.
+    cfg3 = m.DispatcherConfig(streams=3, ctx=4096)
+    assert (cfg3.streams, cfg3.max_batch_tokens) == (3, 3 * 4096), cfg3
+
+    # A parameter outranks the legacy environment name.
+    os.environ["M3_EMBED_STREAMS"] = "16"
+    assert m.DispatcherConfig(streams=5).streams == 5
+    del os.environ["M3_EMBED_STREAMS"]
+
+    if hasattr(m, "EmbeddedEmbedder"):
+        # warmup=False defers the model load, so no GGUF is needed to see the
+        # parameter reach the backend's context pool.
+        os.environ["M3_EMBED_STREAMS"] = "16"
+        emb = m.EmbeddedEmbedder("not-loaded.gguf", warmup=False, streams=3, ctx=4096)
+        assert emb.streams() == 3, emb.streams()
+        # Not given: the deprecated environment name still applies, this release.
+        assert m.EmbeddedEmbedder("not-loaded.gguf", warmup=False).streams() == 16
+        del os.environ["M3_EMBED_STREAMS"]
+
     # defaults (assuming no M3_* env vars set)
     cfg = m.DispatcherConfig()
     assert cfg.streams >= 1
@@ -219,7 +239,7 @@ def test_dispatcher_and_env() -> None:
     assert m.env_config_summary()["M3_EMBED_MAX_BATCH_TOKENS"] == 1024
     del os.environ["M3_EMBED_MAX_BATCH_TOKENS"]
 
-    # env var is picked up when set
+    # The deprecated env name is still picked up when no parameter is given.
     os.environ["M3_EMBED_STREAMS"] = "16"
     assert m.env_config_summary()["M3_EMBED_STREAMS"] == 16
     assert m.DispatcherConfig().streams == 16

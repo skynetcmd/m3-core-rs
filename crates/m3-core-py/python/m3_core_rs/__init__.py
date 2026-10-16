@@ -70,6 +70,9 @@ def _register_dll_dirs() -> None:
         candidates.append(_os.path.join(cp, "bin"))         # CUDA 12.x and older
 
     # Operator override: M3_EMBED_DLL_DIRS=<dir>;<dir>;... (Windows ; separator).
+    # Stays an environment variable, not an m3_config.toml key: it is a DLL
+    # search-path locator read before the extension loads, so nothing that
+    # reads m3's config can run first, and no caller can pass it as a parameter.
     extra = _os.environ.get("M3_EMBED_DLL_DIRS", "").strip()
     if extra:
         for d in extra.split(_os.pathsep):

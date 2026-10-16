@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 m3-error = { workspace = true }
+m3-config = { workspace = true }
 m3-hash = { workspace = true }
 m3-vector = { workspace = true }
 m3-dispatcher = { workspace = true }

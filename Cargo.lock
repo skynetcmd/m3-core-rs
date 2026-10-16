@@ -1185,6 +1185,7 @@ dependencies = [
  "bytemuck",
  "env_logger",
  "log",
+ "m3-config",
  "m3-dispatcher",
  "m3-embed-llamacpp",
  "m3-error",

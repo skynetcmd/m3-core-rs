@@ -273,6 +273,9 @@ def estimate_tokens(text: str) -> int:
     ...
 
 class DispatcherConfig:
+    """Per setting: the argument > its legacy M3_* environment name (deprecated) > default.
+    ctx only feeds the max_batch_tokens default (streams * ctx)."""
+
     streams: int
     coalesce_window_ms: int
     max_batch_tokens: int
@@ -282,10 +285,13 @@ class DispatcherConfig:
         streams: Optional[int] = ...,
         coalesce_window_ms: Optional[int] = ...,
         max_batch_tokens: Optional[int] = ...,
+        ctx: Optional[int] = ...,
     ) -> None: ...
     def __repr__(self) -> str: ...
 
-def env_config_summary() -> dict[str, object]: ...
+def env_config_summary() -> dict[str, object]:
+    """DEPRECATED: what an EmbeddedEmbedder built with no setting arguments would use."""
+    ...
 def embed_backend_label() -> str:
     """The COMPILED backend; see EmbeddedEmbedder.runtime_backend for the observed one."""
     ...
@@ -299,8 +305,27 @@ def embed_backend_label() -> str:
 class EmbeddedEmbedder:
     """In-process GGUF embedding model via linked llama.cpp."""
 
-    def __init__(self, model_path: str, warmup: Optional[bool] = None) -> None:
-        """warmup (default True) loads the model and warms every context now."""
+    def __init__(
+        self,
+        model_path: str,
+        warmup: Optional[bool] = None,
+        *,
+        streams: Optional[int] = None,
+        ctx: Optional[int] = None,
+        seq_max: Optional[int] = None,
+        n_batch: Optional[int] = None,
+        n_ubatch: Optional[int] = None,
+        coalesce_ms: Optional[int] = None,
+        max_batch_tokens: Optional[int] = None,
+    ) -> None:
+        """warmup (default True) loads the model and warms every context now.
+
+        The settings come from m3_config.toml: streams (embed.streams), ctx
+        (embed.ctx), seq_max (embed.seq_max), n_batch (embed.n_batch), n_ubatch
+        (embed.n_ubatch), coalesce_ms (embed.coalesce_ms), max_batch_tokens
+        (embed.max_batch_tokens). One not given falls back to its legacy
+        M3_EMBED_* environment name (deprecated, warned once), then the default.
+        """
         ...
     def embed(self, texts: list[str]) -> list[list[float]]:
         """One embedding row per input text, each of length embedding_dim()."""

@@ -3,7 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -54,6 +55,27 @@ pub fn router(hub: Arc<Hub>) -> Router {
 /// An error reply, always JSON so a client parses one shape.
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
+/// `Json`, with its rejections (malformed JSON, wrong field types, a missing
+/// content type) answered in the same JSON shape as every other error; axum's
+/// own are plain text.
+struct ApiJson<T>(T);
+
+#[axum::async_trait]
+impl<T, S> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(ApiJson(v)),
+            Err(rej) => Err((rej.status(), Json(serde_json::json!({ "error": rej.body_text() })))),
+        }
+    }
+}
+
 fn bad(msg: String) -> ApiError {
     (
         StatusCode::BAD_REQUEST,
@@ -63,13 +85,28 @@ fn bad(msg: String) -> ApiError {
 
 async fn ring(
     State(hub): State<Arc<Hub>>,
-    Json(req): Json<RingRequest>,
+    ApiJson(req): ApiJson<RingRequest>,
 ) -> Result<StatusCode, ApiError> {
     if req.recipients.is_empty() || req.recipients.len() > MAX_RECIPIENTS {
         return Err(bad(format!(
             "recipients: 1..={MAX_RECIPIENTS} required; got {}",
             req.recipients.len()
         )));
+    }
+    // An empty id rings nobody: all-empty answered 204 for a ring that never
+    // happened. Mixed ones still ring the rest (a writer's partial list stays
+    // useful), and the skip is said.
+    let empty = req.recipients.iter().filter(|r| r.is_empty()).count();
+    if empty == req.recipients.len() {
+        return Err(bad(format!(
+            "recipients: all {empty} are empty strings, so nothing would ring; give non-empty agent ids"
+        )));
+    }
+    if empty > 0 {
+        log::warn!(
+            "ring: skipped {empty} empty recipient(s) of {}; rang the rest",
+            req.recipients.len()
+        );
     }
     if let Some(o) = &req.origin {
         if o.is_empty() || o.len() > MAX_ORIGIN || o.chars().any(char::is_control) {
@@ -85,7 +122,7 @@ async fn ring(
 
 async fn wait(
     State(hub): State<Arc<Hub>>,
-    Json(req): Json<WaitRequest>,
+    ApiJson(req): ApiJson<WaitRequest>,
 ) -> Result<Json<Wake>, ApiError> {
     if req.readers.iter().all(|r| r.is_empty()) {
         return Err(bad(

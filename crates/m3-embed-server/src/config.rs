@@ -45,20 +45,27 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 /// `M3_EMBED_GGUF` in its environment, so it binds from config.toml or the
 /// defaults; the calling shell's `M3_EMBED_SERVER_*` are not the service's.
 #[cfg(not(windows))]
-pub fn service_addr() -> (String, u16) {
-    let file = load_file_config(&default_config_path()).unwrap_or_default();
+pub fn service_addr() -> anyhow::Result<(String, u16)> {
+    // A broken file is an error, not the defaults: the service cannot start
+    // from it either, and probing the default port would report on the wrong
+    // server.
+    let file = load_file_config(&default_config_path())?;
     let host = file.embed.host.unwrap_or_else(|| DEFAULT_HOST.into());
     // A wildcard bind is reached on loopback.
     let host = if host == "0.0.0.0" { DEFAULT_HOST.into() } else { host };
-    (host, file.embed.port.unwrap_or(DEFAULT_PORT))
+    Ok((host, file.embed.port.unwrap_or(DEFAULT_PORT)))
 }
 
 /// Fully-resolved runtime config (after env/toml/default merge).
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub gguf: String,
+    /// Where `gguf` came from (`M3_EMBED_GGUF` or the file), for the startup log.
+    pub gguf_source: String,
     pub port: u16,
     pub host: String,
+    /// Where `host` came from, so a bad value names the setting to fix.
+    pub host_source: String,
     pub streams: usize,
     pub n_ctx: u32,
     pub seq_max: u32,
@@ -126,6 +133,11 @@ pub fn set_config_override(path: PathBuf) {
     let _ = CONFIG_OVERRIDE.set(path);
 }
 
+/// Whether `--config` replaced the default path.
+pub fn config_overridden() -> bool {
+    CONFIG_OVERRIDE.get().is_some()
+}
+
 /// The four keys that make up the listener for other machines.
 #[derive(Debug, Default)]
 pub struct SecurityKeys<'a> {
@@ -138,34 +150,66 @@ pub struct SecurityKeys<'a> {
 /// Set (`Some`) or remove (`None`) the transport-security keys in `[embed]`,
 /// editing the file in place so every comment and other key survives.
 pub fn write_security_keys(path: &Path, keys: &SecurityKeys) -> anyhow::Result<()> {
-    let raw = if path.exists() { std::fs::read_to_string(path)? } else { String::new() };
-    let mut doc: toml_edit::DocumentMut = raw
-        .parse()
-        .map_err(|e| anyhow::anyhow!("cannot parse config file {}: {e}", path.display()))?;
+    edit_embed(path, |embed| {
+        for (k, v) in [
+            ("remote_listen", keys.remote_listen),
+            ("tls_cert", keys.tls_cert),
+            ("tls_key", keys.tls_key),
+            ("token_sha256", keys.token_sha256),
+        ] {
+            match v {
+                Some(v) => embed[k] = toml_edit::value(v),
+                None => {
+                    embed.remove(k);
+                }
+            }
+        }
+    })
+}
+
+/// Apply `edit` to `[embed]` in place. A file that exists but cannot be read
+/// or parsed is refused, never replaced: it holds settings (gguf, the remote
+/// listener, comments) that a rewrite would silently discard.
+fn edit_embed(path: &Path, edit: impl FnOnce(&mut toml_edit::Table)) -> anyhow::Result<()> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!(
+            "refusing to rewrite config file {}: it cannot be read ({e}), and rewriting it would \
+             discard what it holds. Fix its permissions (or remove it), then retry",
+            path.display()
+        ),
+    };
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "refusing to rewrite config file {}: it is not valid TOML ({e}), and rewriting it would \
+             discard what it holds. Correct it (or remove it), then retry",
+            path.display()
+        )
+    })?;
     if !doc.contains_table("embed") {
         doc["embed"] = toml_edit::table();
     }
     let embed = doc["embed"]
         .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("[embed] in {} is not a table", path.display()))?;
-    for (k, v) in [
-        ("remote_listen", keys.remote_listen),
-        ("tls_cert", keys.tls_cert),
-        ("tls_key", keys.tls_key),
-        ("token_sha256", keys.token_sha256),
-    ] {
-        match v {
-            Some(v) => embed[k] = toml_edit::value(v),
-            None => {
-                embed.remove(k);
-            }
-        }
-    }
+        .ok_or_else(|| anyhow::anyhow!("[embed] in {} is not a table; correct the file, then retry", path.display()))?;
+    edit(embed);
+    // The io::Error stays in the chain (render with {:#}) so a caller can tell
+    // permission denied from other failures.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            anyhow::Error::new(e).context(format!("cannot create config directory {}", parent.display()))
+        })?;
     }
-    std::fs::write(path, doc.to_string())?;
+    std::fs::write(path, doc.to_string())
+        .map_err(|e| anyhow::Error::new(e).context(format!("cannot write config file {}", path.display())))?;
     Ok(())
+}
+
+/// Whether `e` was caused by a permission refusal anywhere in its chain.
+pub fn is_permission_denied(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied))
 }
 
 /// Default location for the service config file. The Unix service runs as a
@@ -231,7 +275,10 @@ fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
     match raw.parse() {
         Ok(v) => Some(v),
         Err(_) => {
-            log::warn!("ignoring {key}={raw:?}: not a valid value; using the configured or default value");
+            log::warn!(
+                "ignoring {key}={raw:?}: not a valid {}; using the configured or default value",
+                std::any::type_name::<T>()
+            );
             None
         }
     }
@@ -301,14 +348,20 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
         anyhow::bail!("GGUF path does not exist: {gguf} (from {source})");
     }
 
+    let (host, host_source) = match (env_str("M3_EMBED_SERVER_HOST"), file.embed.host.clone()) {
+        (Some(h), _) => (h, "M3_EMBED_SERVER_HOST".to_string()),
+        (None, Some(h)) => (h, format!("[embed].host in {}", default_config_path().display())),
+        (None, None) => (DEFAULT_HOST.to_string(), "the default".to_string()),
+    };
+
     Ok(ResolvedConfig {
         gguf,
+        gguf_source: source,
         port: env_parse("M3_EMBED_SERVER_PORT")
             .or(file.embed.port)
             .unwrap_or(DEFAULT_PORT),
-        host: env_str("M3_EMBED_SERVER_HOST")
-            .or_else(|| file.embed.host.clone())
-            .unwrap_or_else(|| DEFAULT_HOST.into()),
+        host,
+        host_source,
         streams: env_parse("M3_EMBED_STREAMS")
             .or(file.embed.streams)
             .unwrap_or_else(default_streams),
@@ -335,13 +388,25 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
 /// The transport-security settings: TLS and token from the file only, the FIPS
 /// flags from m3's environment variables first, then the file.
 pub fn security_config(e: &EmbedSection) -> crate::security::SecurityConfig {
+    let path = default_config_path();
+    // The environment wins over the file; record which one decided.
+    let flag = |var: &str, key: &str, file: Option<bool>| match (env_flag(var), file) {
+        (Some(v), _) => (v, var.to_string()),
+        (None, Some(v)) => (v, format!("[embed].{key} in {}", path.display())),
+        (None, None) => (false, "the default".to_string()),
+    };
+    let (fips_mode, fips_mode_from) = flag("M3_FIPS_MODE", "fips_mode", e.fips_mode);
+    let (fips_strict, fips_strict_from) = flag("M3_FIPS_STRICT", "fips_strict", e.fips_strict);
     crate::security::SecurityConfig {
         remote_listen: e.remote_listen.clone(),
         tls_cert: e.tls_cert.clone().map(PathBuf::from),
         tls_key: e.tls_key.clone().map(PathBuf::from),
         token_sha256: e.token_sha256.clone(),
-        fips_mode: env_flag("M3_FIPS_MODE").or(e.fips_mode).unwrap_or(false),
-        fips_strict: env_flag("M3_FIPS_STRICT").or(e.fips_strict).unwrap_or(false),
+        fips_mode,
+        fips_strict,
+        config_path: path.clone(),
+        fips_mode_from,
+        fips_strict_from,
     }
 }
 
@@ -353,7 +418,10 @@ fn env_flag(key: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => {
-            log::warn!("ignoring {key}={raw:?}: not a boolean; using the configured or default value");
+            log::warn!(
+                "ignoring {key}={raw:?}: not a boolean (1/true/yes/on or 0/false/no/off); using the \
+                 configured or default value"
+            );
             None
         }
     }
@@ -395,22 +463,35 @@ pub fn snapshot_env_to_file() -> FileConfig {
 /// dropped and the service bound the default.
 #[cfg_attr(windows, allow(dead_code))] // the Unix installers call it
 pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
-    let mut file = load_file_config(path).unwrap_or_default();
+    // A file the server could not load is refused here too, rather than
+    // replaced by one holding only what this environment sets.
+    load_file_config(path).map_err(|e| {
+        anyhow::anyhow!("refusing to record install settings: {e:#}. Correct the file (or remove it), then retry")
+    })?;
     let env = snapshot_env_to_file().embed;
-    let e = &mut file.embed;
-    e.gguf = env.gguf.or(e.gguf.take());
-    e.port = env.port.or(e.port);
-    e.host = env.host.or(e.host.take());
-    e.streams = env.streams.or(e.streams);
-    e.ctx = env.ctx.or(e.ctx);
-    e.seq_max = env.seq_max.or(e.seq_max);
-    e.n_batch = env.n_batch.or(e.n_batch);
-    e.n_ubatch = env.n_ubatch.or(e.n_ubatch);
-    e.coalesce_ms = env.coalesce_ms.or(e.coalesce_ms);
-    e.max_batch_tokens = env.max_batch_tokens.or(e.max_batch_tokens);
-    e.fips_mode = env.fips_mode.or(e.fips_mode);
-    e.fips_strict = env.fips_strict.or(e.fips_strict);
-    write_config_file(path, &file)
+    let int = |v: Option<u64>| v.and_then(|v| i64::try_from(v).ok()).map(toml_edit::Value::from);
+    let set: [(&str, Option<toml_edit::Value>); 12] = [
+        ("gguf", env.gguf.map(toml_edit::Value::from)),
+        ("port", int(env.port.map(u64::from))),
+        ("host", env.host.map(toml_edit::Value::from)),
+        ("streams", int(env.streams.map(|v| v as u64))),
+        ("ctx", int(env.ctx.map(u64::from))),
+        ("seq_max", int(env.seq_max.map(u64::from))),
+        ("n_batch", int(env.n_batch.map(u64::from))),
+        ("n_ubatch", int(env.n_ubatch.map(u64::from))),
+        ("coalesce_ms", int(env.coalesce_ms)),
+        ("max_batch_tokens", int(env.max_batch_tokens.map(|v| v as u64))),
+        ("fips_mode", env.fips_mode.map(toml_edit::Value::from)),
+        ("fips_strict", env.fips_strict.map(toml_edit::Value::from)),
+    ];
+    // In place: only keys the environment sets change; comments survive.
+    edit_embed(path, |embed| {
+        for (k, v) in set {
+            if let Some(v) = v {
+                embed[k] = toml_edit::Item::Value(v);
+            }
+        }
+    })
 }
 
 pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
@@ -567,6 +648,25 @@ mod tests {
         assert!(cfg.embed.remote_listen.is_none() && cfg.embed.tls_cert.is_none());
         assert!(cfg.embed.tls_key.is_none() && cfg.embed.token_sha256.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// `install` must not replace a config file it cannot load: that file holds
+    /// the model path and the remote listener. A loadable one keeps its comments.
+    #[test]
+    fn install_refuses_a_broken_config_and_keeps_comments_in_a_good_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let broken = "[embed]\ngguf = \"/m/bge.gguf\"\nremote_listen = \"100.1.2.3\n";
+        std::fs::write(&path, broken).unwrap();
+        let e = merge_env_into_file(&path).unwrap_err().to_string();
+        assert!(e.contains("refusing") && e.contains("config.toml"), "{e}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken, "a refused file is left untouched");
+
+        let good = "[embed]\n# chosen for this box\nstreams = 3\n";
+        std::fs::write(&path, good).unwrap();
+        merge_env_into_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# chosen for this box") && text.contains("streams = 3"), "{text}");
     }
 
     fn temp_env_without_streams<T>(f: impl FnOnce() -> T) -> T {

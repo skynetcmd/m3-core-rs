@@ -84,6 +84,22 @@ async fn a_ring_with_an_origin_reaches_a_waiter() {
     .unwrap();
     assert_eq!(status, 400, "an empty origin is refused");
 
+    // Nothing to ring is refused, not answered 204.
+    let (status, body) = post(&ep, "/ring", &serde_json::json!({ "recipients": [""] }))
+        .await
+        .unwrap();
+    assert_eq!(status, 400);
+    let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(err["error"].as_str().unwrap().contains("empty"), "{err}");
+
+    // A body of the wrong shape is answered in the same JSON error shape.
+    let (status, body) = post(&ep, "/ring", &serde_json::json!({ "recipients": 5 }))
+        .await
+        .unwrap();
+    assert!((400..500).contains(&status), "{status}");
+    let err: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error body");
+    assert!(err["error"].is_string(), "{err}");
+
     let _ = stop_tx.send(());
     server.await.unwrap().unwrap();
 }

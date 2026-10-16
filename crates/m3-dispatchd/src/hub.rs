@@ -44,6 +44,9 @@ struct State {
     cursors: HashMap<String, u64>,
     waiting: HashMap<String, usize>,
     wakes: HashMap<String, u64>,
+    /// Per reader set: rings it would have seen that were trimmed from the log
+    /// before a wait collected them. Its next wait answers `Resync`.
+    lost: HashMap<String, usize>,
 }
 
 /// What a wait returns.
@@ -120,7 +123,15 @@ impl Hub {
                     .front()
                     .is_some_and(|r| now.duration_since(r.at) > self.keep)
             {
-                st.log.pop_front();
+                let Some(gone) = st.log.pop_front() else { break };
+                // A trimmed ring a reader set had not collected is a ring that
+                // set would never hear about; mark it so it resyncs.
+                let State { cursors, lost, .. } = &mut *st;
+                for (key, cursor) in cursors.iter() {
+                    if gone.seq > *cursor && key.split('\n').any(|rd| sees(rd, &gone.recipient)) {
+                        *lost.entry(key.clone()).or_default() += 1;
+                    }
+                }
             }
         }
         if n > 0 {
@@ -154,6 +165,9 @@ impl Hub {
                 st.cursors.insert(key, seq);
                 return Wake::Resync;
             }
+            if self.resync_if_lost(&mut st, &key) {
+                return Wake::Resync;
+            }
             *st.waiting.entry(key.clone()).or_default() += 1;
         }
         let out = self.wait_known(&key, readers, deadline).await;
@@ -162,6 +176,26 @@ impl Hub {
             *w = w.saturating_sub(1);
         }
         out
+    }
+
+    /// When rings this reader set would have seen were trimmed before it
+    /// collected them, move its cursor to now and report it: the answer is
+    /// `Resync` (read the inbox), since a count of what is left would be short.
+    fn resync_if_lost(&self, st: &mut State, key: &str) -> bool {
+        let Some(n) = st.lost.remove(key) else {
+            return false;
+        };
+        let seq = st.seq;
+        st.cursors.insert(key.to_string(), seq);
+        log::warn!(
+            "{n} ring(s) for reader set [{}] were trimmed from the log before a wait collected them \
+             (the log keeps {}s and at most {} rings); answering resync so the waiter reads its inbox. \
+             Raise --keep-s if waiters are routinely away longer",
+            key.replace('\n', ","),
+            self.keep.as_secs(),
+            self.max_log
+        );
+        true
     }
 
     fn first_match(&self, key: &str, readers: &[String]) -> Option<Instant> {
@@ -178,6 +212,9 @@ impl Hub {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            if self.resync_if_lost(&mut self.lock(), key) {
+                return Wake::Resync;
+            }
             if let Some(first_at) = self.first_match(key, readers) {
                 let ready = first_at + self.window;
                 if Instant::now() < ready {
@@ -197,6 +234,10 @@ impl Hub {
 
     fn take(&self, key: &str, readers: &[String]) -> Wake {
         let mut st = self.lock();
+        // Rings can be trimmed while a waiter sleeps through its window.
+        if self.resync_if_lost(&mut st, key) {
+            return Wake::Resync;
+        }
         let cursor = st.cursors.get(key).copied().unwrap_or(0);
         let mut count = 0;
         let mut last = cursor;
@@ -244,6 +285,7 @@ impl Hub {
                     "oldest_pending_ms": pending.first().map(|r| now.duration_since(r.at).as_millis() as u64),
                     "waiting": st.waiting.get(key).copied().unwrap_or(0),
                     "wakes": st.wakes.get(key).copied().unwrap_or(0),
+                    "aged_out": st.lost.get(key).copied().unwrap_or(0),
                 }),
             );
         }
@@ -367,10 +409,32 @@ mod tests {
         h.ring(r(&["a"]), None);
         tokio::time::advance(Duration::from_secs(120)).await;
         h.ring(r(&["z"]), None); // a later ring trims the log
-        assert_eq!(
-            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
-            Wake::Timeout
-        );
+        // The trimmed ring was "a"'s and uncollected: a count would be short
+        // (here zero), so the waiter is told to read its inbox.
+        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Resync);
+        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Timeout, "resync once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trimming_rings_a_reader_set_never_saw_does_not_resync_it() {
+        let h = Arc::new(Hub::new(Duration::from_millis(10), Duration::from_secs(60)));
+        h.wait(&r(&["a"]), Duration::ZERO).await;
+        h.ring(r(&["b"]), None);
+        tokio::time::advance(Duration::from_secs(120)).await;
+        h.ring(r(&["z"]), None);
+        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Timeout);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ring_trimmed_past_max_log_resyncs_the_reader_that_missed_it() {
+        let mut hub = Hub::new(Duration::from_millis(10), Duration::from_secs(3600));
+        hub.max_log = 3;
+        let h = Arc::new(hub);
+        h.wait(&r(&["a"]), Duration::ZERO).await;
+        h.ring(r(&["a"]), None);
+        h.ring(r(&["z", "z", "z"]), None); // pushes "a"'s ring out
+        assert_eq!(h.status()["readers"]["a"]["aged_out"], 1);
+        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Resync);
     }
 
     #[tokio::test(start_paused = true)]

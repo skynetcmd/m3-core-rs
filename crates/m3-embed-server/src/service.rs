@@ -39,20 +39,47 @@ pub const SERVICE_DESC: &str =
 define_windows_service!(ffi_service_main, service_main);
 
 fn service_main(args: Vec<OsString>) {
+    // run_service logs a failure of the server itself, with its exit code; what
+    // reaches here failed before that: talking to the SCM. stderr goes nowhere
+    // under the SCM, so the log file is the only record.
     if let Err(e) = run_service(args) {
-        // We can't log to stderr usefully under SCM; the env_logger sink
-        // (set up by run_dispatcher) will already be pointed at the log file.
-        // That makes this the LAST thing written before the service dies, and
-        // the only record an operator gets — so it names what failed and where
-        // to look rather than echoing the error alone.
         log::error!(
-            "observed: service startup failed ({e}). \
-             possible: the configured port is already bound, the GGUF model is \
-             missing or unreadable, or the account the service runs as cannot \
-             reach its config. \
-             inspect: %PROGRAMDATA%\\m3-embed-server\\config.toml for [embed].gguf \
-             and [embed].port; the service log beside it for the lines above this one."
+            "service could not start: the Service Control Manager refused a registration or status \
+             report ({e}). Inspect: `sc.exe query {SERVICE_NAME}` and the System event log"
         );
+    }
+}
+
+/// The service's log files: `tracing_appender::rolling::daily` writes one per
+/// UTC day as `service.log.YYYY-MM-DD`, never `service.log` itself. Names the
+/// newest when there is one.
+pub fn log_files_hint() -> String {
+    let base = config::default_log_path();
+    let dir = base.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let newest = std::fs::read_dir(&dir).ok().and_then(|rd| {
+        rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("service.log."))
+            .max_by_key(|e| e.file_name())
+            .map(|e| e.path())
+    });
+    match newest {
+        Some(p) => format!("{} (newest of the daily service.log.YYYY-MM-DD files)", p.display()),
+        None => format!("{}.YYYY-MM-DD (one file per UTC day; none written yet)", base.display()),
+    }
+}
+
+/// What the service's own exit code means; the server sets these (main.rs).
+fn exit_code_meaning(code: ServiceExitCode) -> String {
+    match code {
+        ServiceExitCode::ServiceSpecific(c) if c == crate::server::EXIT_PORT_IN_USE as u32 => {
+            format!("service exit code {c}: the listen port is taken by another program")
+        }
+        ServiceExitCode::ServiceSpecific(c) if c == crate::security::EXIT_CONFIG_REFUSED as u32 => {
+            format!("service exit code {c}: the configuration was refused")
+        }
+        ServiceExitCode::ServiceSpecific(c) => format!("service exit code {c}: startup failed"),
+        ServiceExitCode::Win32(0) => "Windows exit code 0: it stopped without reporting a failure".into(),
+        ServiceExitCode::Win32(c) => format!("Windows exit code {c}"),
     }
 }
 
@@ -171,8 +198,8 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         // Resolve config from %PROGRAMDATA% file (env vars unlikely to be set
         // under SYSTEM, but `resolve` honors them when present).
         let file_cfg = config::load_file_config(&config::default_config_path())
-            .map_err(|e| e.to_string())?;
-        let cfg = config::resolve(&file_cfg).map_err(|e| format!("config resolve failed: {e}"))?;
+            .map_err(|e| format!("{e:#}"))?;
+        let cfg = config::resolve(&file_cfg).map_err(|e| format!("config resolve failed: {e:#}"))?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -209,7 +236,7 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| {
                 port_in_use.set(e.downcast_ref::<crate::server::PortInUse>().is_some());
                 refused.set(e.downcast_ref::<crate::security::ConfigRefused>().is_some());
-                e.to_string()
+                format!("{e:#}")
             })
     })();
 
@@ -238,7 +265,23 @@ fn run_service(_args: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
         log::error!("could not report Stopped to SCM: {e}");
     }
 
-    run_result.map_err(Box::<dyn std::error::Error>::from)
+    // The last line before the service dies and the only record an operator
+    // gets. A taken port and a refused config carry their own fix; only an
+    // unclassified failure gets the list of usual causes.
+    if let Err(msg) = &run_result {
+        let meaning = exit_code_meaning(exit_code);
+        if port_in_use.get() || refused.get() {
+            log::error!("service stopped ({meaning}): {msg}");
+        } else {
+            log::error!(
+                "service stopped ({meaning}): {msg}. Usual causes: the GGUF model is missing or \
+                 unreadable by the service account, or the model failed to load. Inspect {} \
+                 ([embed].gguf, [embed].port) and the lines above this one",
+                config::default_config_path().display()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -293,16 +336,23 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .map_err(|e| {
-        Box::<dyn std::error::Error>::from(format!(
-            "cannot register the service: {e}\n  \
-             Registering a Windows Service requires Administrator rights.\n  \
-             Open an *Administrator* terminal and run: m3-embed-server install\n  \
-             (The service is NOT currently registered — this is not the \
-             already-installed case.)"
-        ))
+        Box::<dyn std::error::Error>::from(match win32_code(&e) {
+            Some(ERROR_ACCESS_DENIED) => "cannot register the service: access denied (Windows error 5).\n  \
+                 Registering a Windows Service requires Administrator rights.\n  \
+                 Open an *Administrator* terminal and run: m3-embed-server install\n  \
+                 (The service is NOT currently registered — this is not the \
+                 already-installed case.)"
+                .to_string(),
+            Some(c) => format!(
+                "cannot register the service: opening the Service Control Manager failed with \
+                 Windows error {c} ({e}). The service is NOT registered"
+            ),
+            None => format!("cannot register the service: {e}. The service is NOT registered"),
+        })
     })?;
 
-    let exe = std::env::current_exe()?;
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot register the service: cannot resolve this executable's path: {e}"))?;
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(SERVICE_DISPLAY),
@@ -316,9 +366,14 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
         account_password: None,
     };
 
-    let service =
-        service_manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
-    service.set_description(SERVICE_DESC)?;
+    let service = service_manager
+        .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+        .map_err(|e| open_failure("install", e))?;
+    // Registered from here on: every later failure must say so, or the
+    // operator retries an install that already happened.
+    if let Err(e) = service.set_description(SERVICE_DESC) {
+        eprintln!("WARN: {SERVICE_NAME} is registered, but setting its description failed: {e}");
+    }
 
     // Best-effort: configure SCM recovery actions. `windows-service` 0.8
     // doesn't expose `ChangeServiceConfig2`, so we shell out to sc.exe (base
@@ -337,14 +392,21 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = config::default_config_path();
     if !cfg_path.exists() {
         let snapshot = config::snapshot_env_to_file();
-        config::write_config_file(&cfg_path, &snapshot)?;
+        config::write_config_file(&cfg_path, &snapshot).map_err(|e| {
+            format!(
+                "{SERVICE_NAME} IS registered, but its starter config {} could not be written: {e:#}. \
+                 It cannot start until that file sets [embed].gguf: write it from an Administrator \
+                 terminal, or run `m3-embed-server uninstall` and then `install` again",
+                cfg_path.display()
+            )
+        })?;
         println!("wrote starter config: {}", cfg_path.display());
     } else {
         println!("config already exists, not overwritten: {}", cfg_path.display());
     }
 
     println!("service installed: {SERVICE_NAME}");
-    println!("log file:          {}", config::default_log_path().display());
+    println!("log files:         {}", log_files_hint());
     println!();
     println!("Next steps:");
     println!("  1. Edit {} to confirm [embed].gguf is set.", cfg_path.display());
@@ -392,7 +454,7 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     // ERROR_SERVICE_DOES_NOT_EXIST (1060) arm was unreachable. Uninstalling a
     // service that is already absent is the desired end state, but it reported
     // the opaque "IO error in winapi call" and exit 1 instead.
-    if !service_exists(&service_manager) {
+    if !service_exists(&service_manager).map_err(|e| open_failure("query", e))? {
         println!("service not installed: {SERVICE_NAME}");
         return Ok(());
     }
@@ -417,10 +479,10 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = service.stop() {
                 eprintln!("WARN: could not stop {SERVICE_NAME} before removing it: {e}");
             }
-            if let Some(s) = wait_for(&service, ServiceState::Stopped, 10) {
-                if s != ServiceState::Stopped {
-                    eprintln!("WARN: {SERVICE_NAME} still {} after 10s", state_word(s));
-                }
+            match wait_for(&service, ServiceState::Stopped, 10).map(|s| s.current_state) {
+                Some(ServiceState::Stopped) => {}
+                Some(s) => eprintln!("WARN: {SERVICE_NAME} still {} after 10s", state_word(s)),
+                None => eprintln!("WARN: could not read {SERVICE_NAME}'s state while waiting for it to stop"),
             }
         }
     }
@@ -429,7 +491,13 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     drop(service);
 
     // Report what SCM now says, not that the delete call returned.
-    if service_exists(&service_manager) {
+    let still = service_exists(&service_manager).map_err(|e| {
+        format!(
+            "{SERVICE_NAME} was deleted, but whether SCM has removed it could not be read: {}",
+            open_failure("query", e)
+        )
+    })?;
+    if still {
         println!(
             "{SERVICE_NAME} marked for deletion; SCM removes it once the process exits \
              (or at the next reboot). `m3-embed-server status` shows when it is gone."
@@ -487,13 +555,16 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 /// used to share one "requires Administrator rights" text, which told an
 /// operator to elevate for a service that simply was not installed.
 fn open_failure(verb: &str, e: windows_service::Error) -> Box<dyn std::error::Error> {
-    let code = match &e {
-        windows_service::Error::Winapi(io) => io.raw_os_error(),
-        _ => None,
-    };
-    Box::<dyn std::error::Error>::from(match code {
+    Box::<dyn std::error::Error>::from(match win32_code(&e) {
         Some(ERROR_SERVICE_DOES_NOT_EXIST) => format!(
             "service not installed: {SERVICE_NAME} — run `m3-embed-server install` first"
+        ),
+        // Reading status needs no elevation (see the privilege map), so a
+        // refusal there is a restricted descriptor, not a missing right.
+        Some(ERROR_ACCESS_DENIED) if verb == "query" => format!(
+            "cannot query the service: access denied, although reading a service's status needs no \
+             Administrator rights. Its security descriptor may have been restricted; inspect it with \
+             `sc.exe sdshow {SERVICE_NAME}`"
         ),
         Some(ERROR_ACCESS_DENIED) => format!(
             "cannot {verb} the service: access denied. Changing a Windows Service needs \
@@ -521,12 +592,12 @@ fn state_word(state: ServiceState) -> &'static str {
 /// Poll until the service reaches `want` or `secs` pass; returns the last
 /// observed state. A start or stop REQUEST is not its outcome.
 fn wait_for(service: &windows_service::service::Service, want: ServiceState, secs: u64)
-    -> Option<ServiceState>
+    -> Option<ServiceStatus>
 {
     let mut last = None;
     for _ in 0..(secs * 4) {
-        last = service.query_status().ok().map(|s| s.current_state);
-        if last == Some(want) {
+        last = service.query_status().ok();
+        if last.as_ref().map(|s| s.current_state) == Some(want) {
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -534,12 +605,24 @@ fn wait_for(service: &windows_service::service::Service, want: ServiceState, sec
     last
 }
 
-/// True when the service is registered at all. QUERY_STATUS only, so it works
-/// unelevated — unlike an open that asks for DELETE.
-fn service_exists(manager: &ServiceManager) -> bool {
-    manager
-        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)
-        .is_ok()
+/// Whether the service is registered at all. QUERY_STATUS only, so it works
+/// unelevated — unlike an open that asks for DELETE. Only
+/// ERROR_SERVICE_DOES_NOT_EXIST means absent; any other failure is unknown,
+/// not "not installed".
+fn service_exists(manager: &ServiceManager) -> Result<bool, windows_service::Error> {
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(_) => Ok(true),
+        Err(e) if win32_code(&e) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// The Win32 error code inside a `windows-service` error, if it has one.
+fn win32_code(e: &windows_service::Error) -> Option<i32> {
+    match e {
+        windows_service::Error::Winapi(io) => io.raw_os_error(),
+        _ => None,
+    }
 }
 
 /// True when the service is already in `want`. Uses QUERY_STATUS only, which an
@@ -591,13 +674,15 @@ pub fn start() -> Result<(), Box<dyn std::error::Error>> {
 
     // Report what the service DID, not that a request was sent: SCM accepts
     // the request before the model loads, so a bad GGUF still "started".
-    match wait_for(&service, ServiceState::Running, 10) {
+    let last = wait_for(&service, ServiceState::Running, 10);
+    match last.as_ref().map(|s| s.current_state) {
         Some(ServiceState::Running) => println!("{SERVICE_NAME}: running"),
         Some(ServiceState::Stopped) => {
+            let meaning = last.map(|s| exit_code_meaning(s.exit_code)).unwrap_or_default();
             return Err(Box::<dyn std::error::Error>::from(format!(
-                "{SERVICE_NAME} started and then stopped. The reason is in the service \
-                 log: {}",
-                config::default_log_path().display()
+                "{SERVICE_NAME} started and then stopped ({meaning}). The reason is the last line of \
+                 the service log: {}",
+                log_files_hint()
             )))
         }
         Some(other) => println!(
@@ -636,13 +721,13 @@ pub fn stop() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The server drains in-flight requests before exiting; report the outcome.
-    match wait_for(&service, ServiceState::Stopped, 20) {
+    match wait_for(&service, ServiceState::Stopped, 20).map(|s| s.current_state) {
         Some(ServiceState::Stopped) => println!("{SERVICE_NAME}: stopped"),
         Some(other) => {
             return Err(Box::<dyn std::error::Error>::from(format!(
                 "{SERVICE_NAME} did not stop within 20s (state: {}); see {}",
                 state_word(other),
-                config::default_log_path().display()
+                log_files_hint()
             )))
         }
         None => println!("{SERVICE_NAME}: stop requested; state could not be read"),

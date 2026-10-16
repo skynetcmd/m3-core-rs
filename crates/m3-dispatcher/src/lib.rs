@@ -193,11 +193,43 @@ const BREAKER_CLOSED: u8 = 0;
 const BREAKER_OPEN: u8 = 1;
 const BREAKER_HALF_OPEN: u8 = 2;
 
+/// What the circuit breaker is doing, for a health probe or an error reply.
+#[derive(Debug, Clone, Default)]
+pub struct BreakerStatus {
+    /// Calls are being refused: open, and the cooldown has not elapsed.
+    pub open: bool,
+    /// Backend failures since the last success.
+    pub consecutive_failures: usize,
+    /// Cooldown left before a half-open probe is allowed; `None` unless `open`.
+    pub retry_after: Option<Duration>,
+    /// The most recent backend failure since the last success.
+    pub last_error: Option<String>,
+}
+
+/// A client error, not a backend fault: it must not open the breaker, or a
+/// caller sending over-long texts would take the backend away from everyone.
+fn is_client_error(e: &M3Error) -> bool {
+    matches!(e, M3Error::InputTooLong { .. })
+}
+
+/// One error for each of several waiters (`M3Error` is not `Clone`). Keeps the
+/// typed `InputTooLong` so the HTTP layer can still answer 413, and keeps a
+/// `Backend` message as is rather than prefixing "backend error: " twice.
+fn share_err(e: &M3Error) -> M3Error {
+    match e {
+        M3Error::InputTooLong { tokens, n_ctx } => M3Error::InputTooLong { tokens: *tokens, n_ctx: *n_ctx },
+        M3Error::Backend(m) => M3Error::Backend(m.clone()),
+        other => M3Error::Backend(other.to_string()),
+    }
+}
+
 /// N consecutive failures open the breaker; after `open_secs` a single
 /// half-open probe is allowed, and a success closes it again.
 pub struct CircuitBreaker {
     cfg: BreakerCfg,
     state: Mutex<(BreakerState, usize, Option<Instant>)>,
+    /// The latest failure's message, cleared on success. Locked after `state`.
+    last_error: std::sync::Mutex<Option<String>>,
     /// Fix #28 — lock-free state for the Closed-fast-path.
     state_fast: AtomicU8,
     /// Fix #28 — debug-only counter incremented when `check()` returns via
@@ -211,6 +243,7 @@ impl CircuitBreaker {
         Self {
             cfg,
             state: Mutex::new((BreakerState::Closed, 0, None)),
+            last_error: std::sync::Mutex::new(None),
             state_fast: AtomicU8::new(BREAKER_CLOSED),
             #[cfg(test)]
             fast_path_hits: AtomicUsize::new(0),
@@ -234,20 +267,35 @@ impl CircuitBreaker {
             BreakerState::Closed | BreakerState::HalfOpen => Ok(()),
             BreakerState::Open => {
                 let elapsed = g.2.map(|t| t.elapsed()).unwrap_or_default();
-                if elapsed >= Duration::from_secs(self.cfg.open_secs) {
+                let cooldown = Duration::from_secs(self.cfg.open_secs);
+                if elapsed >= cooldown {
                     g.0 = BreakerState::HalfOpen;
                     self.state_fast.store(BREAKER_HALF_OPEN, Ordering::Release);
                     Ok(())
                 } else {
-                    Err(M3Error::Backend("circuit breaker open".into()))
+                    // The refusal names why and for how long; "circuit breaker
+                    // open" alone hid the failure that opened it.
+                    let last = self.last_error();
+                    Err(M3Error::Backend(format!(
+                        "circuit breaker open after {} consecutive backend failures; refusing calls for \
+                         another {}s; last failure: {}",
+                        g.1,
+                        (cooldown - elapsed).as_secs() + 1,
+                        last.as_deref().unwrap_or("(not recorded)"),
+                    )))
                 }
             }
         }
     }
 
+    fn last_error(&self) -> Option<String> {
+        self.last_error.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
     pub async fn record_success(&self) {
         let mut g = self.state.lock().await;
         *g = (BreakerState::Closed, 0, None);
+        *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
         self.state_fast.store(BREAKER_CLOSED, Ordering::Release);
     }
 
@@ -258,6 +306,33 @@ impl CircuitBreaker {
             g.0 = BreakerState::Open;
             g.2 = Some(Instant::now());
             self.state_fast.store(BREAKER_OPEN, Ordering::Release);
+        }
+    }
+
+    /// `record_failure`, keeping `why` for the refusal message and `status`.
+    pub async fn record_failure_because(&self, why: &M3Error) {
+        let why = match why {
+            M3Error::Backend(m) => m.clone(),
+            other => other.to_string(),
+        };
+        *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(why);
+        self.record_failure().await;
+    }
+
+    /// The breaker as a caller would meet it now. Open past its cooldown reads
+    /// as not open: the next call is let through as the half-open probe.
+    pub async fn status(&self) -> BreakerStatus {
+        let g = self.state.lock().await;
+        let left = match (g.0, g.2) {
+            (BreakerState::Open, Some(t)) => Duration::from_secs(self.cfg.open_secs).checked_sub(t.elapsed()),
+            _ => None,
+        }
+        .filter(|d| !d.is_zero());
+        BreakerStatus {
+            open: left.is_some(),
+            consecutive_failures: g.1,
+            retry_after: left,
+            last_error: self.last_error(),
         }
     }
 }
@@ -491,7 +566,9 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
                 Ok(out.rows)
             }
             Err(e) => {
-                self.breaker.record_failure().await;
+                if !is_client_error(&e) {
+                    self.breaker.record_failure_because(&e).await;
+                }
                 Err(e)
             }
         }
@@ -542,7 +619,9 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
                 Ok(out.rows)
             }
             Err(e) => {
-                self.breaker.record_failure().await;
+                if !is_client_error(&e) {
+                    self.breaker.record_failure_because(&e).await;
+                }
                 Err(e)
             }
         }
@@ -555,6 +634,11 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
     /// double-instantiation of the backend.
     pub fn backend(&self) -> &Arc<B> {
         &self.backend
+    }
+
+    /// Whether the circuit breaker is refusing calls, for how long, and why.
+    pub async fn breaker_status(&self) -> BreakerStatus {
+        self.breaker.status().await
     }
 
     pub fn stats(&self) -> DispatcherStats {
@@ -702,7 +786,7 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
 
             if let Err(e) = breaker.check().await {
                 for j in jobs {
-                    let _ = j.reply.send(Err(M3Error::Backend(format!("{e}"))));
+                    let _ = j.reply.send(Err(share_err(&e)));
                 }
                 continue;
             }
@@ -744,10 +828,11 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
                         }
                     }
                     Err(e) => {
-                        breaker.record_failure().await;
-                        let msg = format!("{e}");
+                        if !is_client_error(&e) {
+                            breaker.record_failure_because(&e).await;
+                        }
                         for reply in replies {
-                            let _ = reply.send(Err(M3Error::Backend(msg.clone())));
+                            let _ = reply.send(Err(share_err(&e)));
                         }
                     }
                 }

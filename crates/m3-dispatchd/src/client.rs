@@ -26,9 +26,20 @@ impl std::fmt::Display for ClientError {
 
 #[cfg(unix)]
 async fn connect(endpoint: &str) -> Result<tokio::net::UnixStream, ClientError> {
-    tokio::net::UnixStream::connect(endpoint)
-        .await
-        .map_err(|e| ClientError::NoDaemon(format!("{endpoint}: {e}")))
+    use std::io::ErrorKind;
+    // Only a missing socket or a refused one means "no daemon": the caller
+    // then polls. Access denied is a daemon this user may not use, which
+    // polling would hide.
+    tokio::net::UnixStream::connect(endpoint).await.map_err(|e| match e.kind() {
+        ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
+            ClientError::NoDaemon(format!("{endpoint}: {e}"))
+        }
+        ErrorKind::PermissionDenied => ClientError::Failed(format!(
+            "{endpoint}: {e}. The socket exists but this user may not connect: it is mode 0600 for \
+             the user who started m3-dispatchd, so another user's daemon may hold this path"
+        )),
+        _ => ClientError::Failed(format!("connecting to {endpoint}: {e}")),
+    })
 }
 
 #[cfg(windows)]
@@ -36,16 +47,27 @@ async fn connect(
     endpoint: &str,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, ClientError> {
     use tokio::net::windows::named_pipe::ClientOptions;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_PIPE_BUSY: i32 = 231;
     // Every instance busy is transient (the server creates the next instance
-    // as it accepts); a missing pipe means no daemon.
+    // as it accepts); only a missing pipe means no daemon.
     for _ in 0..50 {
         match ClientOptions::new().open(endpoint) {
             Ok(c) => return Ok(c),
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await
             }
-            Err(e) => return Err(ClientError::NoDaemon(format!("{endpoint}: {e}"))),
+            Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => {
+                return Err(ClientError::NoDaemon(format!("{endpoint}: {e}")))
+            }
+            Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+                return Err(ClientError::Failed(format!(
+                    "{endpoint}: {e}. The pipe exists but this user may not open it: its DACL admits \
+                     only the user who started m3-dispatchd, so another user's daemon may hold this name"
+                )))
+            }
+            Err(e) => return Err(ClientError::Failed(format!("opening {endpoint}: {e}"))),
         }
     }
     Err(ClientError::Failed(format!(
@@ -60,7 +82,9 @@ pub async fn post(
     body: &serde_json::Value,
 ) -> Result<(u16, Bytes), ClientError> {
     let stream = connect(endpoint).await?;
-    let fail = |what: &str, e: &dyn std::fmt::Display| ClientError::Failed(format!("{what}: {e}"));
+    let fail = |what: &str, e: &dyn std::fmt::Display| {
+        ClientError::Failed(format!("{what} (POST {path} on {endpoint}): {e}"))
+    };
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| fail("handshake", &e))?;

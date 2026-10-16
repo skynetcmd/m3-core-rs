@@ -60,6 +60,15 @@ fn main() -> anyhow::Result<()> {
         config::set_config_override(std::path::PathBuf::from(path));
     }
     let sub = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    // Every subcommand reads config and may warn (an unparseable env value, a
+    // half-configured listener); with no logger those warnings vanished. The
+    // service path is the exception: it installs its own file logger, and
+    // `log` takes only the first logger installed.
+    if sub != "run-as-service" {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .try_init()
+            .ok();
+    }
 
     match sub {
         "" => run_foreground(),
@@ -131,8 +140,13 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
     let file = config::load_file_config(&path)?;
     let write = |keys: &config::SecurityKeys| {
         config::write_security_keys(&path, keys).map_err(|e| {
-            let hint = if cfg!(windows) { " (the file is under %PROGRAMDATA%: use an elevated prompt)" } else { "" };
-            anyhow::anyhow!("cannot write {}: {e}{hint}", path.display())
+            // Elevation fixes only a refusal on the default (%PROGRAMDATA%) file.
+            let hint = if cfg!(windows) && !config::config_overridden() && config::is_permission_denied(&e) {
+                ". The file is under %PROGRAMDATA%, writable by Administrators: run this from an elevated prompt"
+            } else {
+                ""
+            };
+            anyhow::anyhow!("{e:#}{hint}")
         })
     };
     if args.iter().any(|a| a == "--off") {
@@ -156,8 +170,13 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
         };
         *slot = Some(it.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value\n{usage}"))?.clone());
     }
+    let missing: Vec<&str> = [("--listen", &listen), ("--cert", &cert), ("--key", &key), ("--token-sha256", &token)]
+        .into_iter()
+        .filter(|(_, v)| v.is_none())
+        .map(|(name, _)| name)
+        .collect();
     let (Some(listen), Some(cert), Some(key), Some(token)) = (listen, cert, key, token) else {
-        anyhow::bail!("{usage}");
+        anyhow::bail!("secure is missing {}\n{usage}", missing.join(", "));
     };
     // Absolute, because the service does not start in this directory.
     let cert = std::path::absolute(&cert)?;
@@ -175,12 +194,16 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
         tls_key: Some(&key.display().to_string()),
         token_sha256: sec.token_sha256.as_deref(),
     })?;
+    // Recorded, not verified: nothing listens there until the server restarts,
+    // and reachability depends on the network in between.
+    let remote = remote.map(|a| a.to_string()).unwrap_or_default();
     println!(
-        "other machines can reach https://{} with the bearer token (TLS certificate {}); recorded in {}. \
-         Restart the server to apply.",
-        remote.map(|a| a.to_string()).unwrap_or_default(),
+        "recorded remote_listen {remote} (TLS certificate {}, bearer token required) in {}. After a \
+         restart the server listens there for other machines. Verify from one of them: \
+         curl --cacert {} https://{remote}/health",
         cert.display(),
-        path.display()
+        path.display(),
+        cert.display()
     );
     Ok(())
 }
@@ -191,10 +214,6 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
 
 #[cfg(feature = "embedded")]
 fn run_foreground() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .try_init()
-        .ok();
-
     // Foreground reads env first, but will still pick up a config.toml if
     // present (handy for testing the service config without installing).
     // A missing file is the empty default; a broken one is an error, not that.
@@ -238,14 +257,28 @@ async fn shutdown_signal() {
                  inspect: whether the process is running under a restricted \
                  signal mask or a sandbox that blocks signal registration."
             );
-            let _ = tokio::signal::ctrl_c().await;
+            ctrl_c_or_never().await;
             log::info!("ctrl-c received, draining...");
             return;
         }
     };
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => log::info!("ctrl-c received, draining..."),
-        _ = term.recv()             => log::info!("SIGTERM received, draining..."),
+        _ = ctrl_c_or_never() => log::info!("ctrl-c received, draining..."),
+        _ = term.recv()       => log::info!("SIGTERM received, draining..."),
+    }
+}
+
+/// Resolves on Ctrl-C. A handler that cannot be installed is warned about and
+/// never resolves: an `Err` here is not a stop request, and treating it as one
+/// shut the server down the moment it started.
+#[cfg(feature = "embedded")]
+async fn ctrl_c_or_never() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        log::warn!(
+            "the Ctrl-C handler could not be installed ({e}); Ctrl-C will not drain this process, \
+             so stop it through its other stop signals or its service manager"
+        );
+        std::future::pending::<()>().await;
     }
 }
 
@@ -265,9 +298,18 @@ async fn shutdown_signal() {
 
     // Each listener is independent; if one cannot be installed we still honor
     // the others rather than losing graceful shutdown entirely.
-    let mut close = windows::ctrl_close().ok();
-    let mut shutdown = windows::ctrl_shutdown().ok();
-    let mut logoff = windows::ctrl_logoff().ok();
+    fn installed<T>(what: &str, r: std::io::Result<T>) -> Option<T> {
+        r.map_err(|e| {
+            log::warn!(
+                "the {what} handler could not be installed ({e}); that event will end this process \
+                 without draining in-flight requests"
+            )
+        })
+        .ok()
+    }
+    let mut close = installed("console-close", windows::ctrl_close());
+    let mut shutdown = installed("system-shutdown", windows::ctrl_shutdown());
+    let mut logoff = installed("logoff", windows::ctrl_logoff());
 
     // Helper: a future that never resolves, standing in for a listener we could
     // not install, so `select!` still compiles with a uniform shape.
@@ -276,7 +318,7 @@ async fn shutdown_signal() {
     }
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => log::info!("ctrl-c received, draining..."),
+        _ = ctrl_c_or_never() => log::info!("ctrl-c received, draining..."),
         _ = async { match close.as_mut() { Some(s) => { s.recv().await; }, None => never().await } } =>
             log::info!("console close received, draining..."),
         _ = async { match shutdown.as_mut() { Some(s) => { s.recv().await; }, None => never().await } } =>

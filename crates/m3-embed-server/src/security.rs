@@ -69,6 +69,22 @@ pub struct SecurityConfig {
     pub token_sha256: Option<String>,
     pub fips_mode: bool,
     pub fips_strict: bool,
+    /// The config file these came from, for messages ("" = not given).
+    pub config_path: PathBuf,
+    /// Where `fips_mode` / `fips_strict` were set (the environment wins over
+    /// the file), so a refusal names the setting to change.
+    pub fips_mode_from: String,
+    pub fips_strict_from: String,
+}
+
+impl SecurityConfig {
+    fn file(&self) -> String {
+        if self.config_path.as_os_str().is_empty() {
+            "config.toml".into()
+        } else {
+            self.config_path.display().to_string()
+        }
+    }
 }
 
 /// The listener for other machines, ready to serve.
@@ -120,16 +136,27 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
     let tls_pair = match (&cfg.tls_cert, &cfg.tls_key) {
         (None, None) => None,
         (Some(cert), Some(key)) => Some((cert, key)),
-        _ => anyhow::bail!(
-            "tls_cert and tls_key must be set together (one is missing). Set both with \
-             `m3 embedder secure`, or remove both with `m3 embedder secure --off`"
+        (cert, _) => anyhow::bail!(
+            "{} has {} but not {}: tls_cert and tls_key must be set together. Set both with \
+             `m3 embedder secure`, or remove both with `m3 embedder secure --off`",
+            cfg.file(),
+            if cert.is_some() { "tls_cert" } else { "tls_key" },
+            if cert.is_some() { "tls_key" } else { "tls_cert" },
         ),
     };
     let Some(remote) = cfg.remote_listen.as_deref() else {
-        if tls_pair.is_some() || token_digest.is_some() {
+        let unused = match (tls_pair.is_some(), token_digest.is_some()) {
+            (true, true) => Some("TLS (tls_cert, tls_key) and a token (token_sha256) are"),
+            (true, false) => Some("TLS (tls_cert, tls_key) is"),
+            (false, true) => Some("a token (token_sha256) is"),
+            (false, false) => None,
+        };
+        if let Some(unused) = unused {
             log::warn!(
-                "TLS or a token is configured but remote_listen is not, so only loopback is served \
-                 and they are unused. Set the address with `m3 embedder secure --listen <address>`"
+                "{unused} configured in {} but remote_listen is not, so only loopback is served and \
+                 they are unused. Set the address with `m3 embedder secure --listen <address>`, or \
+                 remove them with `m3 embedder secure --off`",
+                cfg.file()
             );
         }
         return Ok(Security { remote: None });
@@ -139,22 +166,32 @@ pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security>
         anyhow::bail!("remote_listen {addr} is the local listener's own address; choose another address or port");
     }
     let (Some((cert, key)), Some(token_digest)) = (tls_pair, token_digest) else {
+        let missing = match (tls_pair.is_some(), token_digest.is_some()) {
+            (false, false) => "has neither TLS (tls_cert, tls_key) nor a bearer token (token_sha256)",
+            (false, true) => "has no TLS certificate and key (tls_cert, tls_key)",
+            _ => "has no bearer token (token_sha256)",
+        };
         anyhow::bail!(
-            "remote_listen {addr} needs both a TLS certificate and a bearer token; there is no plaintext \
-             listener for other machines. Run `m3 embedder secure`"
+            "remote_listen {addr} needs both a TLS certificate and a bearer token; {} {missing}. \
+             There is no plaintext listener for other machines. Run `m3 embedder secure`",
+            cfg.file()
         );
     };
     if cfg.fips_strict && !provider_is_fips() {
         anyhow::bail!(
-            "crypto.fips_strict is on, but this m3-embed-server was built without AWS-LC's FIPS module, so \
-             its TLS is not a validated module. Use the FIPS build of m3-embed-server, or remove \
-             remote_listen to serve this machine only"
+            "crypto.fips_strict is on (set by {}), but this m3-embed-server was built without AWS-LC's \
+             FIPS module, so its TLS is not a validated module. Use the FIPS build of m3-embed-server, \
+             or remove remote_listen to serve this machine only",
+            cfg.fips_strict_from
         );
     }
     if cfg.fips_mode && !provider_is_fips() {
-        log::info!(
-            "crypto.fips_mode: TLS here is restricted to approved algorithms but runs on aws-lc-rs without \
-             its FIPS module; crypto.fips_strict would refuse it"
+        // A real compliance gap, though one the operator may accept: warn.
+        log::warn!(
+            "crypto.fips_mode is on (set by {}): TLS here is restricted to approved algorithms but runs \
+             on aws-lc-rs without its FIPS module, so it is not a validated module; crypto.fips_strict \
+             would refuse it. Use the FIPS build of m3-embed-server to close the gap",
+            cfg.fips_mode_from
         );
     }
     let tls = Arc::new(server_tls_config(cert, key)?);
@@ -175,20 +212,29 @@ pub fn parse_listen(s: &str, default_port: u16) -> anyhow::Result<SocketAddr> {
 
 fn parse_digest(hex: &str) -> anyhow::Result<[u8; 32]> {
     let hex = hex.trim();
-    let bad = || {
-        anyhow::anyhow!(
+    // ⚠ Position only, never the character: the likeliest cause is the token
+    // itself pasted in place of its digest, and the message reaches logs.
+    if let Some(pos) = hex.chars().position(|c| !c.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "token_sha256 has a non-hexadecimal character at position {} (of {}); it must be the \
+             SHA-256 of the token as 64 hexadecimal characters. Did you paste the token itself instead \
+             of its SHA-256? Re-run `m3 embedder secure`",
+            pos + 1,
+            hex.chars().count()
+        );
+    }
+    if hex.len() != 64 {
+        anyhow::bail!(
             "token_sha256 must be 64 hexadecimal characters (the SHA-256 of the token), got {} \
              characters. Re-run `m3 embedder secure`",
             hex.len()
-        )
-    };
-    if hex.len() != 64 {
-        return Err(bad());
+        );
     }
     let mut out = [0u8; 32];
     for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
-        let s = std::str::from_utf8(pair).map_err(|_| bad())?;
-        out[i] = u8::from_str_radix(s, 16).map_err(|_| bad())?;
+        // All ASCII hex digits by now, so neither step can fail.
+        let s = std::str::from_utf8(pair).expect("ASCII");
+        out[i] = u8::from_str_radix(s, 16).expect("hex digits");
     }
     Ok(out)
 }
@@ -224,10 +270,32 @@ pub fn server_tls_config(cert: &Path, key: &Path) -> anyhow::Result<rustls::Serv
         .collect::<Result<_, _>>()
         .map_err(|e| anyhow::anyhow!("cannot parse TLS certificate {}: {e}", cert.display()))?;
     if certs.is_empty() {
-        anyhow::bail!("no certificate found in {} (expected PEM)", cert.display());
+        anyhow::bail!(
+            "no certificate found in {} (expected a PEM CERTIFICATE block; check that tls_cert and \
+             tls_key are not swapped)",
+            cert.display()
+        );
     }
-    let key_der = PrivateKeyDer::from_pem_file(key)
-        .map_err(|e| anyhow::anyhow!("cannot read TLS private key {}: {e}", key.display()))?;
+    let key_der = PrivateKeyDer::from_pem_file(key).map_err(|e| {
+        use rustls::pki_types::pem::Error as P;
+        // ⚠ Not `{e}` for a parse error: IllegalSectionStart quotes the
+        // offending line, which here is private-key material.
+        let why = match &e {
+            P::Io(io) => return anyhow::anyhow!("cannot read TLS private key {}: {io}", key.display()),
+            P::NoItemsFound => {
+                return anyhow::anyhow!(
+                    "no private key found in {} (expected a PEM PRIVATE KEY block; check that tls_cert \
+                     and tls_key are not swapped)",
+                    key.display()
+                )
+            }
+            P::MissingSectionEnd { .. } => "a PEM section has no END line",
+            P::IllegalSectionStart { .. } => "a PEM BEGIN line is malformed",
+            P::Base64Decode(_) => "a PEM section is not valid base64",
+            _ => "it is not valid PEM",
+        };
+        anyhow::anyhow!("cannot parse TLS private key {}: {why}", key.display())
+    })?;
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(approved_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| anyhow::anyhow!("TLS setup failed: {e}"))?
@@ -260,9 +328,77 @@ fn check_key_file_private(key: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Not checked: reading a Windows ACL needs the Win32 security API this crate
+/// does not link. Said once at startup, so a missing check is not mistaken for
+/// a passed one.
 #[cfg(not(unix))]
-fn check_key_file_private(_key: &Path) -> anyhow::Result<()> {
+fn check_key_file_private(key: &Path) -> anyhow::Result<()> {
+    log::info!(
+        "TLS private key {}: who can read it is not checked on Windows. Check its ACL with \
+         `icacls \"{}\"`: it should list only the account the server runs as and Administrators",
+        key.display(),
+        key.display()
+    );
     Ok(())
+}
+
+/// The TCP peer of a TLS connection, put on each request by `serve_tls`.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerAddr(pub SocketAddr);
+
+/// Why a request was refused a token check. Never carries token content.
+#[derive(Debug, PartialEq)]
+enum AuthFailure {
+    NoHeader,
+    NotBearer,
+    WrongToken,
+}
+
+impl AuthFailure {
+    fn reason(&self) -> &'static str {
+        match self {
+            AuthFailure::NoHeader => "no Authorization header",
+            AuthFailure::NotBearer => "the Authorization header is not a Bearer token",
+            AuthFailure::WrongToken => "the bearer token does not match this server's token_sha256",
+        }
+    }
+}
+
+fn check_bearer(value: Option<&header::HeaderValue>, want: &[u8; 32]) -> Result<(), AuthFailure> {
+    let value = value.ok_or(AuthFailure::NoHeader)?;
+    let value = value.to_str().map_err(|_| AuthFailure::NotBearer)?;
+    // The scheme is case-insensitive (RFC 9110 11.1).
+    let token = match value.split_once(' ') {
+        Some((scheme, t)) if scheme.eq_ignore_ascii_case("bearer") => t,
+        _ => return Err(AuthFailure::NotBearer),
+    };
+    let d = token_digest(token.trim().as_bytes());
+    constant_time::verify_slices_are_equal(&d, want).map_err(|_| AuthFailure::WrongToken)
+}
+
+/// At most one rejection warning per this many seconds; the rest are counted
+/// into the next one, so a scanner cannot flood the log.
+const REJECT_WARN_EVERY_S: u64 = 10;
+static LAST_REJECT_WARN_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REJECTS_UNREPORTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn warn_rejected(peer: &str, method: &axum::http::Method, path: &str, why: &AuthFailure) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_REJECT_WARN_S.load(Relaxed);
+    if now.saturating_sub(last) >= REJECT_WARN_EVERY_S
+        && LAST_REJECT_WARN_S.compare_exchange(last, now, Relaxed, Relaxed).is_ok()
+    {
+        let quiet = REJECTS_UNREPORTED.swap(0, Relaxed);
+        let more = if quiet > 0 { format!(" ({quiet} more rejected since the last report)") } else { String::new() };
+        log::warn!("rejected {method} {path} from {peer}: {}{more}", why.reason());
+    } else {
+        REJECTS_UNREPORTED.fetch_add(1, Relaxed);
+        log::debug!("rejected {method} {path} from {peer}: {}", why.reason());
+    }
 }
 
 /// Axum middleware: every route except `/health` needs `Authorization: Bearer`.
@@ -270,20 +406,23 @@ pub async fn require_bearer(State(want): State<Arc<[u8; 32]>>, req: Request, nex
     if req.uri().path() == "/health" {
         return next.run(req).await;
     }
-    let got = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| token_digest(t.trim().as_bytes()));
-    match got {
-        Some(d) if constant_time::verify_slices_are_equal(&d, want.as_ref()).is_ok() => next.run(req).await,
-        _ => {
-            log::info!("rejected {} {}: missing or wrong bearer token", req.method(), req.uri().path());
+    match check_bearer(req.headers().get(header::AUTHORIZATION), &want) {
+        Ok(()) => next.run(req).await,
+        Err(why) => {
+            let peer = req
+                .extensions()
+                .get::<PeerAddr>()
+                .map(|p| p.0.to_string())
+                .unwrap_or_else(|| "an unknown peer".into());
+            warn_rejected(&peer, req.method(), req.uri().path(), &why);
             (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],
-                "a bearer token is required: on the client, `m3 secret set M3_EMBED_SERVER_TOKEN`",
+                format!(
+                    "{}: a bearer token is required. On the client, set it with \
+                     `m3 secret set M3_EMBED_SERVER_TOKEN`",
+                    why.reason()
+                ),
             )
                 .into_response()
         }
@@ -311,6 +450,10 @@ where
 
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);
     let graceful = GracefulShutdown::new();
+    let local = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "the TLS listener".into());
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -319,19 +462,31 @@ where
                     Ok(x) => x,
                     Err(e) => {
                         // EMFILE and friends: back off instead of spinning.
-                        log::warn!("accept failed: {e}; retrying in 100 ms");
+                        log::warn!("accept on {local} failed: {e}; retrying in 100 ms");
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
                 let acceptor = acceptor.clone();
-                let svc = TowerToHyperService::new(app.clone());
+                // The peer rides on each request so a token rejection can name it.
+                let svc = TowerToHyperService::new(app.clone().layer(axum::Extension(PeerAddr(peer))));
                 let watcher = graceful.watcher();
                 tokio::spawn(async move {
                     let stream = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
-                            log::info!("TLS handshake from {peer} failed: {e}");
+                            let plaintext = e
+                                .get_ref()
+                                .and_then(|i| i.downcast_ref::<rustls::Error>())
+                                .is_some_and(|r| {
+                                    matches!(r, rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType))
+                                });
+                            let hint = if plaintext {
+                                " (the client did not speak TLS: it likely used http:// for this https:// listener)"
+                            } else {
+                                ""
+                            };
+                            log::info!("TLS handshake from {peer} failed: {e}{hint}");
                             return;
                         }
                         Err(_) => {
@@ -453,6 +608,59 @@ mod tests {
         assert!(plan(LOCAL, &bad).err().unwrap().to_string().contains("64 hexadecimal"));
         let non_hex = SecurityConfig { token_sha256: Some("z".repeat(64)), ..Default::default() };
         assert!(plan(LOCAL, &non_hex).is_err());
+    }
+
+    /// Wrong length and a non-hex character are different mistakes; the second
+    /// is named by position only, since the text may be the token itself.
+    #[test]
+    fn a_malformed_digest_says_which_mistake_without_echoing_it() {
+        let e = parse_digest(&format!("{}Q{}", "a".repeat(10), "b".repeat(53))).unwrap_err().to_string();
+        assert!(e.contains("position 11") && e.contains("paste the token itself"), "{e}");
+        assert!(!e.contains('Q') && !e.contains("got 64"), "{e}");
+        let e = parse_digest(&"a".repeat(63)).unwrap_err().to_string();
+        assert!(e.contains("got 63 characters") && !e.contains("position"), "{e}");
+        assert!(parse_digest(&"A".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn a_half_tls_pair_and_unused_keys_name_what_is_missing() {
+        let half = SecurityConfig { tls_key: Some("/k.pem".into()), config_path: "/c/config.toml".into(), ..Default::default() };
+        let e = plan(LOCAL, &half).err().unwrap().to_string();
+        assert!(e.contains("/c/config.toml has tls_key but not tls_cert"), "{e}");
+        let pem = self_signed();
+        let no_token = SecurityConfig { token_sha256: None, ..secured(&pem, "100.100.50.63") };
+        let e = plan(LOCAL, &no_token).err().unwrap().to_string();
+        assert!(e.contains("has no bearer token (token_sha256)"), "{e}");
+    }
+
+    #[test]
+    fn a_token_rejection_names_its_reason() {
+        let want = token_digest(b"right");
+        let h = |s: &str| header::HeaderValue::from_str(s).unwrap();
+        assert_eq!(check_bearer(None, &want), Err(AuthFailure::NoHeader));
+        assert_eq!(check_bearer(Some(&h("Basic dXNlcjpwdw==")), &want), Err(AuthFailure::NotBearer));
+        assert_eq!(check_bearer(Some(&h("Bearer wrong")), &want), Err(AuthFailure::WrongToken));
+        assert_eq!(check_bearer(Some(&h("Bearer right")), &want), Ok(()));
+        assert_eq!(check_bearer(Some(&h("bearer right")), &want), Ok(()), "the scheme is case-insensitive");
+    }
+
+    /// A plaintext client on the TLS port is recognisable, so the log can say
+    /// "http:// on an https:// listener" instead of a bare rustls error.
+    #[tokio::test]
+    async fn a_plaintext_client_is_recognised_in_the_handshake_error() {
+        use tokio::io::AsyncWriteExt;
+        let pem = self_signed();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_tls_config(&pem.cert, &pem.key).unwrap()));
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let Err(e) = acceptor.accept(server).await else {
+            panic!("a plaintext client completed a TLS handshake");
+        };
+        let r = e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>());
+        assert!(
+            matches!(r, Some(rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType))),
+            "{e:?}"
+        );
     }
 
     /// The `fips` feature, and only it, reports AWS-LC's FIPS module: a FIPS

@@ -100,6 +100,39 @@ async fn circuit_breaker_opens_after_n_failures() {
     let err = disp.embed("x".into()).await.unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("circuit breaker open"), "got: {msg}");
+    // The refusal carries the failure that opened it, once, and the cooldown.
+    assert!(msg.contains("last failure: boom") && msg.contains("3 consecutive"), "got: {msg}");
+    assert!(!msg.contains("backend error: backend error"), "got: {msg}");
+    let st = disp.breaker_status().await;
+    assert!(st.open && st.retry_after.is_some(), "{st:?}");
+    assert_eq!((st.consecutive_failures, st.last_error.as_deref()), (3, Some("boom")));
+}
+
+/// Fails every batch with a client length error.
+struct TooLongBackend;
+impl ModelBackend for TooLongBackend {
+    async fn run(&self, _batch: Batch) -> Result<BatchOutput> {
+        Err(M3Error::InputTooLong { tokens: 9000, n_ctx: 8192 })
+    }
+}
+
+/// Over-long input is the caller's error: it stays typed on the coalesced path
+/// (so the server answers 413, not 500) and never opens the breaker.
+#[tokio::test]
+async fn input_too_long_stays_typed_and_does_not_open_the_breaker() {
+    let cfg = DispatcherConfig {
+        coalesce_window_ms: 5,
+        circuit_breaker: BreakerCfg { failure_threshold: 2, open_secs: 30 },
+        ..Default::default()
+    };
+    let disp = Dispatcher::new(cfg, TooLongBackend);
+    for _ in 0..5 {
+        let e = disp.embed("x".into()).await.unwrap_err();
+        assert!(matches!(e, M3Error::InputTooLong { tokens: 9000, n_ctx: 8192 }), "{e}");
+        let e = disp.embed_batch(vec!["a".into(), "b".into()]).await.unwrap_err();
+        assert!(matches!(e, M3Error::InputTooLong { .. }), "{e}");
+    }
+    assert!(!disp.breaker_status().await.open);
 }
 
 /// Counts how many times the backend was actually invoked.

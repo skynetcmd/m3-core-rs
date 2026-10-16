@@ -39,21 +39,46 @@ pub async fn serve(
 
     let path = std::path::Path::new(endpoint);
     if path.exists() {
-        // A live daemon answers; a stale socket file from a crash does not.
-        if UnixStream::connect(path).await.is_ok() {
-            anyhow::bail!("another m3-dispatchd is already serving {endpoint}");
+        // A live daemon accepts; a stale socket file from a crash refuses.
+        // Anything else (EACCES: another user's socket) is not proof of
+        // staleness, so the file is left alone.
+        match UnixStream::connect(path).await {
+            Ok(_) => anyhow::bail!(
+                "another m3-dispatchd is already serving {endpoint} (it accepted a connection)"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path).map_err(|e| {
+                    anyhow::anyhow!("cannot remove the stale socket {endpoint} (nothing accepts on it): {e}")
+                })?;
+                log::info!("removed the stale socket {endpoint}: nothing was accepting connections on it");
+            }
+            Err(e) => anyhow::bail!(
+                "{endpoint} exists, and whether a daemon serves it cannot be told ({e}); it was left \
+                 in place. Check its owner and mode (ls -l {endpoint}), and remove it if no \
+                 m3-dispatchd runs"
+            ),
         }
-        std::fs::remove_file(path)?;
     }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).map_err(|e| {
+            anyhow::anyhow!("cannot create the socket's directory {}: {e}", dir.display())
+        })?;
     }
     // Create with a 0177 umask so the socket is never briefly wider than 0600.
     let old = unsafe { libc::umask(0o177) };
     let bound = UnixListener::bind(path);
     unsafe { libc::umask(old) };
-    let listener = bound?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = bound.map_err(|e| {
+        // sun_path holds 108 bytes on Linux and 104 on macOS, NUL included.
+        anyhow::anyhow!(
+            "cannot bind the unix socket {endpoint} ({} bytes; a socket path must stay under about \
+             104): {e}",
+            endpoint.len()
+        )
+    })?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        anyhow::anyhow!("cannot restrict {endpoint} to mode 0600: {e}")
+    })?;
     let me = unsafe { libc::geteuid() };
     log::info!("serving on unix socket {endpoint}");
     tokio::pin!(shutdown);
@@ -61,7 +86,16 @@ pub async fn serve(
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                // One failed accept (EMFILE, ECONNABORTED) must not end the
+                // daemon: back off and keep serving.
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        log::warn!("accept on {endpoint} failed: {e}; retrying in 100 ms");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 match stream.peer_cred() {
                     Ok(cred) if cred.uid() == me => { tokio::spawn(serve_one(stream, app.clone())); }
                     Ok(cred) => log::warn!("refused a connection from uid {} (serving uid {me})", cred.uid()),
@@ -183,9 +217,15 @@ pub async fn serve(
     };
     let mut server = create(true, &mut attrs).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
-            anyhow::anyhow!("another m3-dispatchd is already serving {endpoint}")
+            // Inferred, not observed: access denied on the FIRST instance is
+            // what an existing pipe of that name causes, ours or another user's.
+            anyhow::anyhow!(
+                "cannot create {endpoint}: access denied for the first pipe instance, which is what \
+                 an existing pipe of that name causes; another m3-dispatchd (this user's or another's) \
+                 is probably serving it ({e})"
+            )
         } else {
-            anyhow::anyhow!("cannot create {endpoint}: {e}")
+            anyhow::anyhow!("cannot create the named pipe {endpoint}: {e}")
         }
     })?;
     log::info!("serving on named pipe {endpoint} (user {sid} only, remote clients rejected)");
@@ -194,12 +234,52 @@ pub async fn serve(
         tokio::select! {
             _ = &mut shutdown => break,
             connected = server.connect() => {
-                connected?;
-                let client = server;
-                server = create(false, &mut attrs)?;
-                tokio::spawn(serve_one(client, app.clone()));
+                // One failed connect (a client that vanished mid-connect) must
+                // not end the daemon. The instance may be unusable after it,
+                // so it is replaced either way.
+                let client = match connected {
+                    Ok(()) => Some(server),
+                    Err(e) => {
+                        log::warn!("a connection on {endpoint} failed before it was served: {e}; replacing the pipe instance");
+                        None
+                    }
+                };
+                server = next_instance(&create, &mut attrs, endpoint).await?;
+                if let Some(client) = client {
+                    tokio::spawn(serve_one(client, app.clone()));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// The next pipe instance, retried for 5 s: a transient failure is warned
+/// about and survived, a lasting one ends the daemon with its cause.
+#[cfg(windows)]
+async fn next_instance<C>(
+    create: &C,
+    attrs: &mut win::Attrs,
+    endpoint: &str,
+) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeServer>
+where
+    C: Fn(bool, &mut win::Attrs) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer>,
+{
+    const TRIES: u32 = 50;
+    let mut last = None;
+    for _ in 0..TRIES {
+        match create(false, attrs) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                log::warn!("cannot create the next instance of {endpoint}: {e}; retrying in 100 ms");
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "cannot create a new instance of the named pipe {endpoint} after {TRIES} tries over 5 s ({}); \
+         m3-dispatchd stops serving",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    ))
 }

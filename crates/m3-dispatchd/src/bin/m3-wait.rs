@@ -4,7 +4,8 @@
 //! a Python process with m3 loaded. Without CMD it prints the wake as JSON. With
 //! CMD it runs CMD on each wake (the wake JSON in `M3_WAKE`, stdio inherited):
 //! CMD's exit 0 ends the wait, 75 (EX_TEMPFAIL: nothing new after all) waits
-//! again, and any other code is passed through. CMD is how m3 confirms and
+//! again, and any other code is passed through (except 2, 3, 4 and codes
+//! outside 0..=255, which become 1: see `passthrough`). CMD is how m3 confirms and
 //! stamps receipt in its store: the daemon issues no SQL.
 //!
 //! `--exit-when-stdin-closes`: exit (code 4) when stdin reaches end of file. A
@@ -89,8 +90,42 @@ fn run_then(then: &[String], wake: &str) -> Result<i32, String> {
         .stdin(std::process::Stdio::null())
         .status()
         .map_err(|e| format!("cannot run {}: {e}", then[0]))?;
-    // A child killed by a signal has no code; treat it as an error.
-    Ok(status.code().unwrap_or(1))
+    // A child killed by a signal has no code; it is an error, and said.
+    match status.code() {
+        Some(c) => Ok(c),
+        None => {
+            eprintln!("m3-wait: {} was killed by {}; exiting 1", then[0], signal_of(&status));
+            Ok(1)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|s| format!("signal {s}")).unwrap_or_else(|| "a signal".into())
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &std::process::ExitStatus) -> String {
+    "an unknown cause".into()
+}
+
+/// The exit code m3-wait gives for CMD's `code`. CMD's code passes through,
+/// except where it would read as one of m3-wait's own (2 timed out, 3 no
+/// daemon, 4 stdin closed) or does not fit an exit status: those become 1,
+/// with a note, so a caller never polls because CMD happened to exit 3.
+fn passthrough(code: i32, cmd: &str) -> u8 {
+    match u8::try_from(code) {
+        Ok(c) if ![2, 3, STDIN_CLOSED as u8].contains(&c) => c,
+        _ => {
+            eprintln!(
+                "m3-wait: {cmd} exited {code}, which would read as m3-wait's own status \
+                 (2 timed out, 3 no daemon, 4 stdin closed) or is out of range; exiting 1"
+            );
+            1
+        }
+    }
 }
 
 async fn run(args: Args) -> u8 {
@@ -138,7 +173,7 @@ async fn run(args: Args) -> u8 {
         match run_then(&args.then, &text) {
             Ok(0) => return 0,
             Ok(KEEP_WAITING) => continue,
-            Ok(code) => return u8::try_from(code).unwrap_or(1),
+            Ok(code) => return passthrough(code, &args.then[0]),
             Err(e) => {
                 eprintln!("m3-wait: {e}");
                 return 1;
@@ -193,6 +228,17 @@ mod tests {
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cmd_codes_that_collide_with_m3_waits_own_become_1() {
+        assert_eq!(passthrough(5, "c"), 5);
+        assert_eq!(passthrough(1, "c"), 1);
+        for own in [2, 3, 4] {
+            assert_eq!(passthrough(own, "c"), 1, "{own}");
+        }
+        assert_eq!(passthrough(-1, "c"), 1);
+        assert_eq!(passthrough(300, "c"), 1);
     }
 
     #[test]

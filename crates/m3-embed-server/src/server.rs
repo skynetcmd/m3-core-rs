@@ -184,15 +184,13 @@ where
     })?;
     // Decide transport security before binding, so a refused configuration
     // never holds the port or loads the model.
-    let sec = security::plan(addr.ip(), &cfg.security)
+    let sec = security::plan(addr, &cfg.security)
         .map_err(|e| anyhow::Error::new(security::ConfigRefused(format!("{e:#}"))))?;
-    log::info!("transport: {}", sec.describe());
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            return Err(anyhow::Error::new(PortInUse { addr }));
-        }
-        Err(e) => return Err(anyhow::anyhow!("cannot listen on {addr}: {e}")),
+    log::info!("listeners: {}", sec.describe(addr));
+    let listener = bind(addr).await?;
+    let remote = match sec.remote {
+        Some(r) => Some((bind(r.addr).await?, r)),
+        None => None,
     };
 
     let backend = EmbeddedBackend::with_streams_ctx_seqmax_batch(
@@ -240,28 +238,47 @@ where
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .with_state(state);
-    let app = match sec.token_digest {
-        Some(d) => app.layer(axum::middleware::from_fn_with_state(Arc::new(d), security::require_bearer)),
-        None => app,
-    };
 
-    match sec.tls {
-        Some(tls) => {
-            log::info!("listening on https://{addr}");
-            on_ready();
-            security::serve_tls(listener, app, tls, shutdown).await?;
-        }
-        None => {
-            log::info!("listening on http://{addr}");
-            on_ready();
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown)
-                .await?;
-        }
-    }
+    log::info!("listening on http://{addr}");
+    let Some((remote_listener, remote)) = remote else {
+        on_ready();
+        axum::serve(listener, app).with_graceful_shutdown(shutdown).await?;
+        log::info!("shutdown complete");
+        return Ok(());
+    };
+    log::info!("listening on https://{} (bearer token required)", remote.addr);
+    on_ready();
+    // One stop signal, both listeners.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = stop_tx.send(true);
+    });
+    let stopped = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|s| *s).await;
+    };
+    let remote_app = app
+        .clone()
+        .layer(axum::middleware::from_fn_with_state(Arc::new(remote.token_digest), security::require_bearer));
+    let local = async {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(stopped(stop_rx.clone()))
+            .await
+            .map_err(anyhow::Error::from)
+    };
+    let tls = security::serve_tls(remote_listener, remote_app, remote.tls, stopped(stop_rx.clone()));
+    tokio::try_join!(local, tls)?;
 
     log::info!("shutdown complete");
     Ok(())
+}
+
+async fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(anyhow::Error::new(PortInUse { addr })),
+        Err(e) => Err(anyhow::anyhow!("cannot listen on {addr}: {e}")),
+    }
 }
 
 /// The JSON type name of `v`, for error messages that must not echo `v` itself.

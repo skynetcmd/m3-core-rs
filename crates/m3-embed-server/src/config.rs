@@ -20,7 +20,9 @@ pub struct EmbedSection {
     pub coalesce_ms: Option<u64>,
     pub max_batch_tokens: Option<usize>,
     // Transport security (src/security.rs). File-only, written by
-    // `m3-embed-server secure`: no environment variable can switch TLS off.
+    // `m3-embed-server secure`: no environment variable opens or changes the
+    // listener for other machines.
+    pub remote_listen: Option<String>,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     pub token_sha256: Option<String>,
@@ -124,14 +126,18 @@ pub fn set_config_override(path: PathBuf) {
     let _ = CONFIG_OVERRIDE.set(path);
 }
 
+/// The four keys that make up the listener for other machines.
+#[derive(Debug, Default)]
+pub struct SecurityKeys<'a> {
+    pub remote_listen: Option<&'a str>,
+    pub tls_cert: Option<&'a str>,
+    pub tls_key: Option<&'a str>,
+    pub token_sha256: Option<&'a str>,
+}
+
 /// Set (`Some`) or remove (`None`) the transport-security keys in `[embed]`,
 /// editing the file in place so every comment and other key survives.
-pub fn write_security_keys(
-    path: &Path,
-    tls_cert: Option<&str>,
-    tls_key: Option<&str>,
-    token_sha256: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn write_security_keys(path: &Path, keys: &SecurityKeys) -> anyhow::Result<()> {
     let raw = if path.exists() { std::fs::read_to_string(path)? } else { String::new() };
     let mut doc: toml_edit::DocumentMut = raw
         .parse()
@@ -142,7 +148,12 @@ pub fn write_security_keys(
     let embed = doc["embed"]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[embed] in {} is not a table", path.display()))?;
-    for (k, v) in [("tls_cert", tls_cert), ("tls_key", tls_key), ("token_sha256", token_sha256)] {
+    for (k, v) in [
+        ("remote_listen", keys.remote_listen),
+        ("tls_cert", keys.tls_cert),
+        ("tls_key", keys.tls_key),
+        ("token_sha256", keys.token_sha256),
+    ] {
         match v {
             Some(v) => embed[k] = toml_edit::value(v),
             None => {
@@ -325,6 +336,7 @@ pub fn resolve(file: &FileConfig) -> anyhow::Result<ResolvedConfig> {
 /// flags from m3's environment variables first, then the file.
 pub fn security_config(e: &EmbedSection) -> crate::security::SecurityConfig {
     crate::security::SecurityConfig {
+        remote_listen: e.remote_listen.clone(),
         tls_cert: e.tls_cert.clone().map(PathBuf::from),
         tls_key: e.tls_key.clone().map(PathBuf::from),
         token_sha256: e.token_sha256.clone(),
@@ -366,6 +378,7 @@ pub fn snapshot_env_to_file() -> FileConfig {
             n_ubatch: env_parse("M3_EMBED_N_UBATCH"),
             coalesce_ms: env_parse("M3_EMBED_COALESCE_MS"),
             max_batch_tokens: env_parse("M3_EMBED_MAX_BATCH_TOKENS"),
+            remote_listen: None,
             tls_cert: None,
             tls_key: None,
             token_sha256: None,
@@ -533,17 +546,26 @@ mod tests {
         let original = "[embed]\n# why one stream: measured\nstreams = 1\nport = 8082\n";
         std::fs::write(&path, original).unwrap();
         let cert = r"C:\Users\x\.m3\config\tls\cert.pem";
-        write_security_keys(&path, Some(cert), Some("/k.pem"), Some(&"a".repeat(64))).unwrap();
+        let digest = "a".repeat(64);
+        let keys = SecurityKeys {
+            remote_listen: Some("100.100.50.63"),
+            tls_cert: Some(cert),
+            tls_key: Some("/k.pem"),
+            token_sha256: Some(&digest),
+        };
+        write_security_keys(&path, &keys).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# why one stream: measured"), "{text}");
         let cfg = load_file_config(&path).unwrap();
         assert_eq!(cfg.embed.tls_cert.as_deref(), Some(cert));
+        assert_eq!(cfg.embed.remote_listen.as_deref(), Some("100.100.50.63"));
         assert_eq!(cfg.embed.streams, Some(1));
-        assert_eq!(cfg.embed.token_sha256.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(cfg.embed.token_sha256.as_deref(), Some(digest.as_str()));
 
-        write_security_keys(&path, None, None, None).unwrap();
+        write_security_keys(&path, &SecurityKeys::default()).unwrap();
         let cfg = load_file_config(&path).unwrap();
-        assert!(cfg.embed.tls_cert.is_none() && cfg.embed.tls_key.is_none() && cfg.embed.token_sha256.is_none());
+        assert!(cfg.embed.remote_listen.is_none() && cfg.embed.tls_cert.is_none());
+        assert!(cfg.embed.tls_key.is_none() && cfg.embed.token_sha256.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 

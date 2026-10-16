@@ -1,15 +1,20 @@
 //! Transport security for the shared embed server: TLS and a bearer token.
 //!
 //! The server receives raw memory text and returns vectors that can be partly
-//! inverted back to it, so both directions are sensitive. The rule:
+//! inverted back to it, so both directions are sensitive. Two listeners:
 //!
-//! * A loopback address (the default 127.0.0.1) may serve plaintext: only this
-//!   machine can connect, the same boundary the agent doorbell relies on.
-//! * Any other address must have BOTH a TLS certificate and a bearer token, or
-//!   the server refuses to start. A private network (Tailscale is the
-//!   recommended one) decides who can reach the port; TLS and the token still
-//!   apply inside it, because WireGuard's algorithms are not FIPS-approved and
-//!   network reachability is not identity.
+//! * `host:port`, the local listener, must be a loopback address (default
+//!   127.0.0.1) and serves plaintext: only this machine can connect, the same
+//!   boundary the agent doorbell relies on. Local clients, probes and
+//!   installers keep using it unchanged.
+//! * `remote_listen`, optional, is for other machines and always requires BOTH
+//!   TLS and a bearer token; there is no plaintext form of it. A private
+//!   network (Tailscale is the recommended one) decides who can reach the
+//!   port; TLS and the token still apply inside it, because WireGuard's
+//!   algorithms are not FIPS-approved and network reachability is not identity.
+//!
+//! A non-loopback `host` is refused (it would be plaintext on the network),
+//! with the message pointing at `remote_listen`.
 //!
 //! TLS is rustls on aws-lc-rs, TLS 1.3 only, AES-GCM suites and the P-256/P-384
 //! groups (approved algorithms on every build). Only the `fips` feature links
@@ -21,7 +26,7 @@
 //! digest of a random 256-bit token is no use to whoever reads it. `/health`
 //! needs no token, so supervisors and probes can check liveness.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -55,6 +60,9 @@ impl std::error::Error for ConfigRefused {}
 /// The settings that decide transport security, as read from config.
 #[derive(Debug, Clone, Default)]
 pub struct SecurityConfig {
+    /// The listener for other machines: `IP` or `IP:port` (the port defaults
+    /// to the local listener's).
+    pub remote_listen: Option<String>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     /// Lowercase hex SHA-256 of the bearer token.
@@ -63,22 +71,28 @@ pub struct SecurityConfig {
     pub fips_strict: bool,
 }
 
+/// The listener for other machines, ready to serve.
+pub struct Remote {
+    pub addr: SocketAddr,
+    pub tls: Arc<rustls::ServerConfig>,
+    pub token_digest: [u8; 32],
+}
+
 /// What the server enforces, once the config has been checked.
 pub struct Security {
-    pub tls: Option<Arc<rustls::ServerConfig>>,
-    pub token_digest: Option<[u8; 32]>,
+    pub remote: Option<Remote>,
 }
 
 impl Security {
-    /// One line for the startup log: what protects this listener.
-    pub fn describe(&self) -> String {
-        let tls = match &self.tls {
-            Some(_) if provider_is_fips() => "TLS 1.3 (aws-lc-rs FIPS module)",
-            Some(_) => "TLS 1.3 (aws-lc-rs, not the FIPS module)",
-            None => "plaintext (loopback only)",
-        };
-        let auth = if self.token_digest.is_some() { "bearer token required" } else { "no token" };
-        format!("{tls}, {auth}")
+    /// One line for the startup log: what each listener is.
+    pub fn describe(&self, local: SocketAddr) -> String {
+        match &self.remote {
+            None => format!("{local} plaintext (loopback only); no listener for other machines"),
+            Some(r) => {
+                let module = if provider_is_fips() { "aws-lc-rs FIPS module" } else { "aws-lc-rs, not the FIPS module" };
+                format!("{local} plaintext (loopback only); {} TLS 1.3 ({module}) with a bearer token", r.addr)
+            }
+        }
     }
 }
 
@@ -87,50 +101,76 @@ pub fn provider_is_fips() -> bool {
     provider::default_provider().fips()
 }
 
-/// Check `cfg` against the listen address and build what the server enforces.
-/// Every refusal says what was observed and what fixes it.
-pub fn plan(ip: IpAddr, cfg: &SecurityConfig) -> anyhow::Result<Security> {
+/// Check `cfg` against the local listen address and build what the server
+/// enforces. Every refusal says what was observed and what fixes it.
+pub fn plan(local: SocketAddr, cfg: &SecurityConfig) -> anyhow::Result<Security> {
+    if !local.ip().is_loopback() {
+        anyhow::bail!(
+            "refusing to serve embeddings in plaintext on {}: the server receives raw memory text, and \
+             any address other than loopback can be reached from other machines. Set the host back to \
+             127.0.0.1; to serve other machines, add a TLS listener with a bearer token: \
+             `m3 embedder secure --listen <address>` (on a private network such as Tailscale as well)",
+            local.ip()
+        );
+    }
     let token_digest = match cfg.token_sha256.as_deref() {
         None => None,
         Some(hex) => Some(parse_digest(hex)?),
     };
-    let tls = match (&cfg.tls_cert, &cfg.tls_key) {
+    let tls_pair = match (&cfg.tls_cert, &cfg.tls_key) {
         (None, None) => None,
-        (Some(cert), Some(key)) => {
-            if cfg.fips_strict && !provider_is_fips() {
-                anyhow::bail!(
-                    "crypto.fips_strict is on, but this m3-embed-server was built without AWS-LC's FIPS \
-                     module, so its TLS is not a validated module. Use the FIPS build of m3-embed-server, \
-                     or serve on 127.0.0.1 only"
-                );
-            }
-            Some(Arc::new(server_tls_config(cert, key)?))
-        }
+        (Some(cert), Some(key)) => Some((cert, key)),
         _ => anyhow::bail!(
             "tls_cert and tls_key must be set together (one is missing). Set both with \
-             `m3 embedder secure`, or neither for a loopback-only server"
+             `m3 embedder secure`, or remove both with `m3 embedder secure --off`"
         ),
     };
-    if !ip.is_loopback() && (tls.is_none() || token_digest.is_none()) {
-        let missing = match (tls.is_none(), token_digest.is_none()) {
-            (true, true) => "TLS and a bearer token",
-            (true, false) => "TLS",
-            _ => "a bearer token",
-        };
+    let Some(remote) = cfg.remote_listen.as_deref() else {
+        if tls_pair.is_some() || token_digest.is_some() {
+            log::warn!(
+                "TLS or a token is configured but remote_listen is not, so only loopback is served \
+                 and they are unused. Set the address with `m3 embedder secure --listen <address>`"
+            );
+        }
+        return Ok(Security { remote: None });
+    };
+    let addr = parse_listen(remote, local.port())?;
+    if addr == local {
+        anyhow::bail!("remote_listen {addr} is the local listener's own address; choose another address or port");
+    }
+    let (Some((cert, key)), Some(token_digest)) = (tls_pair, token_digest) else {
         anyhow::bail!(
-            "refusing to serve embeddings on {ip} without {missing}: the server receives raw memory \
-             text, and any address other than loopback can be reached from other machines. Keep the \
-             default host 127.0.0.1, or run `m3 embedder secure` to add TLS and a token (put the \
-             server on a private network such as Tailscale as well)"
+            "remote_listen {addr} needs both a TLS certificate and a bearer token; there is no plaintext \
+             listener for other machines. Run `m3 embedder secure`"
+        );
+    };
+    if cfg.fips_strict && !provider_is_fips() {
+        anyhow::bail!(
+            "crypto.fips_strict is on, but this m3-embed-server was built without AWS-LC's FIPS module, so \
+             its TLS is not a validated module. Use the FIPS build of m3-embed-server, or remove \
+             remote_listen to serve this machine only"
         );
     }
-    if cfg.fips_mode && tls.is_some() && !provider_is_fips() {
+    if cfg.fips_mode && !provider_is_fips() {
         log::info!(
-            "crypto.fips_mode: TLS here is restricted to approved algorithms but runs on aws-lc-rs \
-             without its FIPS module; crypto.fips_strict would refuse it"
+            "crypto.fips_mode: TLS here is restricted to approved algorithms but runs on aws-lc-rs without \
+             its FIPS module; crypto.fips_strict would refuse it"
         );
     }
-    Ok(Security { tls, token_digest })
+    let tls = Arc::new(server_tls_config(cert, key)?);
+    Ok(Security { remote: Some(Remote { addr, tls, token_digest }) })
+}
+
+/// `IP` or `IP:port` (IPv6 as `[::1]:port`); a bare IP takes `default_port`.
+pub fn parse_listen(s: &str, default_port: u16) -> anyhow::Result<SocketAddr> {
+    let s = s.trim();
+    if let Ok(a) = s.parse::<SocketAddr>() {
+        return Ok(a);
+    }
+    if let Ok(ip) = s.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+    anyhow::bail!("remote_listen {s:?} is not an IP address or IP:port (a hostname is not accepted)")
 }
 
 fn parse_digest(hex: &str) -> anyhow::Result<[u8; 32]> {
@@ -321,6 +361,7 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     const LOOP: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const LOCAL: SocketAddr = SocketAddr::new(LOOP, 8082);
     const LAN: IpAddr = IpAddr::V4(Ipv4Addr::new(100, 100, 50, 63));
 
     fn hex(d: &[u8; 32]) -> String {
@@ -349,56 +390,90 @@ mod tests {
         Pem { ca_der: ck.cert.der().to_vec(), _dir: dir, cert, key }
     }
 
-    #[test]
-    fn loopback_may_serve_plaintext_without_a_token() {
-        let s = plan(LOOP, &SecurityConfig::default()).unwrap();
-        assert!(s.tls.is_none() && s.token_digest.is_none());
-        assert!(plan(IpAddr::V6(Ipv6Addr::LOCALHOST), &SecurityConfig::default()).is_ok());
+    fn secured(pem: &Pem, listen: &str) -> SecurityConfig {
+        SecurityConfig {
+            remote_listen: Some(listen.into()),
+            tls_cert: Some(pem.cert.clone()),
+            tls_key: Some(pem.key.clone()),
+            token_sha256: Some(hex(&token_digest(b"t"))),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn any_other_address_needs_tls_and_a_token() {
+    fn the_default_is_loopback_plaintext_with_no_remote_listener() {
+        assert!(plan(LOCAL, &SecurityConfig::default()).unwrap().remote.is_none());
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8082);
+        assert!(plan(v6, &SecurityConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn a_non_loopback_host_is_refused_and_pointed_at_remote_listen() {
         let pem = self_signed();
-        let token = Some(hex(&token_digest(b"t")));
-        let tls_only = SecurityConfig { tls_cert: Some(pem.cert.clone()), tls_key: Some(pem.key.clone()), ..Default::default() };
-        let token_only = SecurityConfig { token_sha256: token.clone(), ..Default::default() };
-        let both = SecurityConfig { token_sha256: token, ..tls_only.clone() };
-        for (cfg, missing) in [
-            (SecurityConfig::default(), "without TLS and a bearer token"),
-            (tls_only, "without a bearer token"),
-            (token_only, "without TLS:"),
-        ] {
-            let e = plan(LAN, &cfg).err().expect("must refuse").to_string();
-            assert!(e.contains(missing) && e.contains("m3 embedder secure"), "{e}");
+        for ip in [LAN, IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
+            // Refused even with TLS and a token configured: the host listener is plaintext.
+            let e = plan(SocketAddr::new(ip, 8082), &secured(&pem, "100.100.50.63")).err().unwrap().to_string();
+            assert!(e.contains("plaintext") && e.contains("--listen"), "{e}");
         }
-        for wildcard in [IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
-            assert!(plan(wildcard, &SecurityConfig::default()).is_err(), "a wildcard bind reaches the network");
+    }
+
+    #[test]
+    fn the_remote_listener_needs_tls_and_a_token() {
+        let pem = self_signed();
+        let full = secured(&pem, "100.100.50.63");
+        let r = plan(LOCAL, &full).unwrap().remote.expect("remote listener");
+        assert_eq!(r.addr, SocketAddr::new(LAN, 8082), "a bare IP takes the local port");
+        let no_token = SecurityConfig { token_sha256: None, ..full.clone() };
+        let no_tls = SecurityConfig { tls_cert: None, tls_key: None, ..full.clone() };
+        for cfg in [no_token, no_tls] {
+            let e = plan(LOCAL, &cfg).err().unwrap().to_string();
+            assert!(e.contains("needs both") && e.contains("m3 embedder secure"), "{e}");
         }
-        let s = plan(LAN, &both).unwrap();
-        assert!(s.tls.is_some() && s.token_digest.is_some());
+        let same = secured(&pem, "127.0.0.1:8082");
+        assert!(plan(LOCAL, &same).err().unwrap().to_string().contains("own address"));
+        let host = secured(&pem, "embed.example.ts.net");
+        assert!(plan(LOCAL, &host).err().unwrap().to_string().contains("hostname is not accepted"));
+        assert_eq!(parse_listen("[::1]:9", 1).unwrap().port(), 9);
+        assert_eq!(parse_listen("::1", 7).unwrap().port(), 7);
+    }
+
+    #[test]
+    fn tls_without_remote_listen_serves_loopback_only() {
+        let pem = self_signed();
+        let cfg = SecurityConfig { remote_listen: None, ..secured(&pem, "x") };
+        assert!(plan(LOCAL, &cfg).unwrap().remote.is_none());
     }
 
     #[test]
     fn half_a_tls_pair_and_a_malformed_digest_are_refused() {
         let pem = self_signed();
         let half = SecurityConfig { tls_cert: Some(pem.cert), ..Default::default() };
-        assert!(plan(LOOP, &half).err().unwrap().to_string().contains("set together"));
+        assert!(plan(LOCAL, &half).err().unwrap().to_string().contains("set together"));
         let bad = SecurityConfig { token_sha256: Some("abc".into()), ..Default::default() };
-        assert!(plan(LOOP, &bad).err().unwrap().to_string().contains("64 hexadecimal"));
+        assert!(plan(LOCAL, &bad).err().unwrap().to_string().contains("64 hexadecimal"));
         let non_hex = SecurityConfig { token_sha256: Some("z".repeat(64)), ..Default::default() };
-        assert!(plan(LOOP, &non_hex).is_err());
+        assert!(plan(LOCAL, &non_hex).is_err());
+    }
+
+    /// The `fips` feature, and only it, reports AWS-LC's FIPS module: a FIPS
+    /// build that silently linked the ordinary library would fail here.
+    #[test]
+    fn the_fips_feature_is_what_reports_fips() {
+        assert_eq!(provider_is_fips(), cfg!(feature = "fips"));
     }
 
     #[test]
     fn fips_strict_refuses_tls_from_a_build_without_the_fips_module() {
         let pem = self_signed();
-        let cfg = SecurityConfig { tls_cert: Some(pem.cert), tls_key: Some(pem.key), fips_strict: true, ..Default::default() };
-        let r = plan(LOOP, &cfg);
+        let cfg = SecurityConfig { fips_strict: true, ..secured(&pem, "100.100.50.63") };
+        let r = plan(LOCAL, &cfg);
         if provider_is_fips() {
             assert!(r.is_ok());
         } else {
             assert!(r.err().unwrap().to_string().contains("FIPS build"));
         }
+        // Loopback only needs no TLS, so strict mode does not refuse it.
+        assert!(plan(LOCAL, &SecurityConfig { fips_strict: true, ..Default::default() }).is_ok());
     }
 
     #[cfg(unix)]
@@ -427,21 +502,20 @@ mod tests {
         use axum::routing::get;
         let pem = self_signed();
         let token = "s3cret-token";
+        // A loopback remote listener on another port stands in for a tailnet address.
         let cfg = SecurityConfig {
-            tls_cert: Some(pem.cert.clone()),
-            tls_key: Some(pem.key.clone()),
             token_sha256: Some(hex(&token_digest(token.as_bytes()))),
-            ..Default::default()
+            ..secured(&pem, "127.0.0.1:1")
         };
-        let sec = plan(LOOP, &cfg).unwrap();
+        let remote = plan(LOCAL, &cfg).unwrap().remote.unwrap();
         let app = axum::Router::new()
             .route("/health", get(|| async { "ok" }))
             .route("/embedding", get(|| async { "vec" }))
-            .layer(axum::middleware::from_fn_with_state(Arc::new(sec.token_digest.unwrap()), require_bearer));
+            .layer(axum::middleware::from_fn_with_state(Arc::new(remote.token_digest), require_bearer));
         let listener = tokio::net::TcpListener::bind((LOOP, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let server = tokio::spawn(serve_tls(listener, app, sec.tls.unwrap(), async move {
+        let server = tokio::spawn(serve_tls(listener, app, remote.tls, async move {
             let _ = stop_rx.await;
         }));
 

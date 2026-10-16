@@ -111,41 +111,44 @@ fn print_help() {
            start         start the installed service\n  \
            stop          stop the installed service\n  \
            status        running / stopped / not installed\n  \
-           secure        --cert <pem> --key <pem> --token-sha256 <hex>: require TLS and a \
-bearer token (needed for any address but loopback); --off removes them\n  \
+           secure        --listen <ip[:port]> --cert <pem> --key <pem> --token-sha256 <hex>: \
+add a TLS listener with a bearer token for other machines; --off removes it\n  \
            help          show this message\n"
     );
 }
 
-/// `secure --cert PEM --key PEM --token-sha256 HEX` records TLS and the token
-/// digest in config.toml after checking them exactly as the server will at
-/// startup (FIPS flags included); `secure --off` removes them, after which the
-/// server serves loopback only. `m3 embedder secure` drives this.
+/// `secure --listen ADDR --cert PEM --key PEM --token-sha256 HEX` adds the
+/// listener for other machines (TLS and a bearer token) to config.toml, after
+/// checking it exactly as the server will at startup (FIPS flags included);
+/// `secure --off` removes it, leaving the loopback listener alone.
+/// `m3 embedder secure` drives this.
 #[cfg(feature = "embedded")]
 fn run_secure(args: &[String]) -> anyhow::Result<()> {
-    use std::net::{IpAddr, Ipv4Addr};
-    let usage = "usage: m3-embed-server secure --cert <pem> --key <pem> --token-sha256 <hex> | --off";
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let usage = "usage: m3-embed-server secure --listen <ip[:port]> --cert <pem> --key <pem> \
+                 --token-sha256 <hex> | --off";
     let path = config::default_config_path();
     let file = config::load_file_config(&path)?;
-    let write = |cert: Option<&str>, key: Option<&str>, token: Option<&str>| {
-        config::write_security_keys(&path, cert, key, token).map_err(|e| {
+    let write = |keys: &config::SecurityKeys| {
+        config::write_security_keys(&path, keys).map_err(|e| {
             let hint = if cfg!(windows) { " (the file is under %PROGRAMDATA%: use an elevated prompt)" } else { "" };
             anyhow::anyhow!("cannot write {}: {e}{hint}", path.display())
         })
     };
     if args.iter().any(|a| a == "--off") {
-        write(None, None, None)?;
+        write(&config::SecurityKeys::default())?;
         println!(
-            "removed TLS and the bearer token from {}; the server now serves loopback only. \
+            "removed the listener for other machines from {}; the server serves this machine only. \
              Restart it to apply.",
             path.display()
         );
         return Ok(());
     }
-    let (mut cert, mut key, mut token) = (None, None, None);
+    let (mut listen, mut cert, mut key, mut token) = (None, None, None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let slot = match a.as_str() {
+            "--listen" => &mut listen,
             "--cert" => &mut cert,
             "--key" => &mut key,
             "--token-sha256" => &mut token,
@@ -153,24 +156,29 @@ fn run_secure(args: &[String]) -> anyhow::Result<()> {
         };
         *slot = Some(it.next().ok_or_else(|| anyhow::anyhow!("{a} needs a value\n{usage}"))?.clone());
     }
-    let (Some(cert), Some(key), Some(token)) = (cert, key, token) else {
+    let (Some(listen), Some(cert), Some(key), Some(token)) = (listen, cert, key, token) else {
         anyhow::bail!("{usage}");
     };
     // Absolute, because the service does not start in this directory.
     let cert = std::path::absolute(&cert)?;
     let key = std::path::absolute(&key)?;
     let mut sec = config::security_config(&file.embed);
+    sec.remote_listen = Some(listen.trim().to_string());
     sec.tls_cert = Some(cert.clone());
     sec.tls_key = Some(key.clone());
     sec.token_sha256 = Some(token.trim().to_ascii_lowercase());
-    security::plan(IpAddr::V4(Ipv4Addr::LOCALHOST), &sec)?;
-    write(
-        Some(&cert.display().to_string()),
-        Some(&key.display().to_string()),
-        sec.token_sha256.as_deref(),
-    )?;
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), file.embed.port.unwrap_or(config::DEFAULT_PORT));
+    let remote = security::plan(local, &sec)?.remote.map(|r| r.addr);
+    write(&config::SecurityKeys {
+        remote_listen: sec.remote_listen.as_deref(),
+        tls_cert: Some(&cert.display().to_string()),
+        tls_key: Some(&key.display().to_string()),
+        token_sha256: sec.token_sha256.as_deref(),
+    })?;
     println!(
-        "TLS ({}) and a bearer token are now required; recorded in {}. Restart the server to apply.",
+        "other machines can reach https://{} with the bearer token (TLS certificate {}); recorded in {}. \
+         Restart the server to apply.",
+        remote.map(|a| a.to_string()).unwrap_or_default(),
         cert.display(),
         path.display()
     );

@@ -62,8 +62,8 @@ pub const MAX_BATCH_TOKENS: Key = Key::int(
 pub const REMOTE_LISTEN: Key = Key::string("embed.server.remote_listen", &[]);
 pub const TLS_CERT: Key = Key::path("embed.server.tls_cert", &[]);
 pub const TLS_KEY: Key = Key::path("embed.server.tls_key", &[]);
-pub const FIPS_MODE: Key = Key::bool("crypto.fips_mode", &["M3_FIPS_MODE"]);
-pub const FIPS_STRICT: Key = Key::bool("crypto.fips_strict", &["M3_FIPS_STRICT"]);
+// The FIPS keys and the tier rule belong to the security seam (m3_config::security).
+pub use m3_config::security::{FIPS_MODE, FIPS_STRICT};
 
 /// The SHA-256 of the bearer token, in the SECRETS file (not m3_config.toml: a
 /// digest of a guessable token can be brute-forced offline). A `[secrets]`
@@ -111,7 +111,7 @@ fn default_of(key: &Key) -> Option<Value> {
         // warned about on every start although nothing had been set.
         "embed.server.coalesce_ms" => Value::Int(DEFAULT_COALESCE_MS as i64),
         "embed.server.max_batch_tokens" => Value::Int(DEFAULT_MAX_BATCH_TOKENS as i64),
-        "crypto.fips_mode" | "crypto.fips_strict" => Value::Bool(false),
+        n if n == FIPS_MODE.name || n == FIPS_STRICT.name => Value::Bool(false),
         _ => return None,
     })
 }
@@ -361,8 +361,13 @@ pub fn security_config(
     cfg: &Config,
     read_token: bool,
 ) -> anyhow::Result<crate::security::SecurityConfig> {
-    let (fips_mode, fips_mode_source) = cfg.bool_or(&FIPS_MODE, false)?;
-    let (fips_strict, fips_strict_source) = cfg.bool_or(&FIPS_STRICT, false)?;
+    // The tier, as m3 Python computes it: strict implies mode.
+    let fips = m3_config::security::fips_tier(cfg)?;
+    let (fips_mode, fips_strict) = (
+        fips.tier.is_fips(),
+        fips.tier == m3_config::security::FipsTier::Strict,
+    );
+    let (fips_mode_source, fips_strict_source) = (fips.mode_source, fips.strict_source);
     let remote_listen = cfg.string(&REMOTE_LISTEN)?.map(|(v, _)| v);
     let (secrets_path, _) = secrets::secrets_file(cfg)?;
     let token_from = format!(

@@ -23,6 +23,7 @@
 pub mod env;
 pub mod roots;
 pub mod secrets;
+pub mod security;
 pub mod settings;
 
 // Compiled on every OS so its tests run everywhere; only the Windows privacy

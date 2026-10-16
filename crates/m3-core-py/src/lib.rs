@@ -268,6 +268,28 @@ fn hash_provider() -> &'static str {
     m3_hash::active_provider()
 }
 
+/// The FIPS tier the Rust core computes from m3_config.toml: `"off"`, `"mode"`
+/// or `"strict"`, the strings of m3's `crypto_provider.fips_tier()`. `config_file`
+/// names the file; None locates it as m3 does (M3_CONFIG_ROOT, then
+/// M3_MEMORY_ROOT/config, then ~/.m3/config). For m3's Python/Rust parity test:
+/// the same file must give the same tier in both languages.
+#[pyfunction]
+#[pyo3(signature = (config_file=None))]
+fn fips_tier_from_config(config_file: Option<std::path::PathBuf>) -> PyResult<&'static str> {
+    let env = m3_config::ProcessEnv;
+    let loc = m3_config::locate(config_file.as_deref(), &env).map_err(PyValueError::new_err)?;
+    let cfg = m3_config::Config::load(
+        loc,
+        m3_config::Overrides::default(),
+        Some(Box::new(m3_config::ProcessEnv)),
+        Some(Box::new(m3_config::ProcessEnv)),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let tier =
+        m3_config::security::fips_tier(&cfg).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(tier.tier.as_str())
+}
+
 // ---------------------------------------------------------------------------
 // m3-vector
 // ---------------------------------------------------------------------------
@@ -1836,6 +1858,7 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(sha256_hex_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(hash_provider, m)?)?;
+    m.add_function(wrap_pyfunction!(fips_tier_from_config, m)?)?;
     m.add_function(wrap_pyfunction!(format_log, m)?)?;
     m.add_function(wrap_pyfunction!(cosine, m)?)?;
     m.add_function(wrap_pyfunction!(cosine_batch, m)?)?;

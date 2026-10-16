@@ -15,6 +15,7 @@ m3-error = { workspace = true }
 bytemuck = "1"
 rayon = "1"
 wide = "0.7"
+log = "0.4"
 
 [dev-dependencies]
 proptest = "1"

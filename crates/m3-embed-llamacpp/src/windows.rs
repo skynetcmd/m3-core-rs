@@ -52,9 +52,12 @@ pub fn plan_windows(
         if end >= n_chars {
             return Ok(out);
         }
+        // `smallest_overlap_start` returns a value in (start, end] — its `hi`
+        // starts at `end > start` and only moves down to a `mid > lo >= start`
+        // — so every iteration advances, whatever the counter returns.
         let next = smallest_overlap_start(start, end, overlap, count)?;
-        // Always advance: a pathological count must not loop forever.
-        start = if next > start { next } else { end };
+        debug_assert!(next > start, "window planner stalled at char {start}");
+        start = next;
     }
 }
 
@@ -94,7 +97,10 @@ fn smallest_overlap_start(
     if overlap == 0 {
         return Ok(end);
     }
-    // Invariant: count(lo, end) > overlap (or lo == start), count(hi, end) <= overlap.
+    // `hi` is the best start found so far: count(hi, end) <= overlap, except
+    // that `hi == end` (an empty slice, nothing repeated) is accepted even when
+    // its BOS/EOS frame alone exceeds `overlap`. count(lo, end) > overlap, or
+    // lo == start.
     let (mut lo, mut hi) = (start, end);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;

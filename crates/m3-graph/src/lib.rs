@@ -136,6 +136,10 @@ impl GraphIndex {
     /// In the real system this pairs with a single batched SQL fetch of the
     /// surrounding turns; this crate is only the in-memory index half.
     pub fn expand(&self, seeds: &[&str], max_hops: usize, limit: usize) -> Vec<String> {
+        // The cap is checked after a push, so `limit == 0` would return one id.
+        if limit == 0 {
+            return Vec::new();
+        }
         let seed_set: HashSet<&str> = seeds.iter().copied().collect();
         let mut out = Vec::new();
         let mut emitted = HashSet::new();

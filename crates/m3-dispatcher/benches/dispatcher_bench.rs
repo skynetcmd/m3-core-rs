@@ -4,8 +4,7 @@
 //! (only `LengthBucketQueue::new` is `pub`). Benching the push/drain cycle
 //! externally is therefore not possible without modifying production code,
 //! which the wave-0 baseline harness explicitly forbids. The push/drain
-//! microbench lives unimplemented; this gap is recorded in
-//! `reports/bench_baseline.md`. We bench `estimate_tokens` here as the
+//! microbench lives unimplemented. We bench `estimate_tokens` here as the
 //! sanity micro the spec calls for.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};

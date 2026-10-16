@@ -72,12 +72,54 @@ impl VectorIndex {
         self.pos.contains_key(&key)
     }
 
+    /// Reject a vector this index cannot store faithfully: wrong length, or a
+    /// NaN/inf component. A non-finite component makes the scale NaN, so the
+    /// row would score NaN — which the `total_cmp` heap ranks FIRST, forever.
+    fn check(&self, key: i64, vec: &[f32]) -> Result<()> {
+        if vec.len() != self.dim {
+            return Err(M3Error::VectorDimMismatch { expected: self.dim, got: vec.len(), index: None });
+        }
+        if let Some((i, x)) = vec.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+            return Err(M3Error::Config(format!(
+                "vector for key {key} has a non-finite component {x} at index {i} (dim {}); \
+                 the stored embedding is corrupt and must be re-embedded",
+                self.dim
+            )));
+        }
+        Ok(())
+    }
+
+    /// Insert or replace `keys[i]` with row `i` of `flat` (`keys.len() * dim`
+    /// floats). All-or-nothing: every row is checked before any is applied, so
+    /// a bad row leaves the index unchanged and the error names its key.
+    pub fn upsert_many(&mut self, keys: &[i64], flat: &[f32]) -> Result<()> {
+        if Some(flat.len()) != keys.len().checked_mul(self.dim) {
+            return Err(M3Error::Config(format!(
+                "{} floats for {} keys of dimension {}; expected {}",
+                flat.len(),
+                keys.len(),
+                self.dim,
+                keys.len().saturating_mul(self.dim)
+            )));
+        }
+        for (key, row) in keys.iter().zip(flat.chunks_exact(self.dim)) {
+            self.check(*key, row)?;
+        }
+        for (key, row) in keys.iter().zip(flat.chunks_exact(self.dim)) {
+            self.store(*key, row);
+        }
+        Ok(())
+    }
+
     /// Insert or replace `key`'s vector. A zero vector is stored as zeros and
     /// scores 0 against everything.
     pub fn upsert(&mut self, key: i64, vec: &[f32]) -> Result<()> {
-        if vec.len() != self.dim {
-            return Err(M3Error::VectorDimMismatch { expected: self.dim, got: vec.len() });
-        }
+        self.check(key, vec)?;
+        self.store(key, vec);
+        Ok(())
+    }
+
+    fn store(&mut self, key: i64, vec: &[f32]) {
         let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         let peak = vec.iter().fold(0f32, |m, x| m.max(x.abs()));
         let (scale, inv) = if norm > 0.0 && peak > 0.0 {
@@ -105,7 +147,6 @@ impl VectorIndex {
                 self.pos.insert(key, i);
             }
         }
-        Ok(())
     }
 
     /// Remove `key` if present (swap-remove: O(dim)). Returns whether it was there.
@@ -136,7 +177,13 @@ impl VectorIndex {
     /// `allowed`, only those keys are considered (unknown keys are ignored).
     pub fn search(&self, query: &[f32], k: usize, allowed: Option<&[i64]>) -> Result<Vec<(i64, f32)>> {
         if query.len() != self.dim {
-            return Err(M3Error::VectorDimMismatch { expected: self.dim, got: query.len() });
+            return Err(M3Error::VectorDimMismatch { expected: self.dim, got: query.len(), index: None });
+        }
+        if let Some((i, x)) = query.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+            return Err(M3Error::Config(format!(
+                "query has a non-finite component {x} at index {i} (dim {})",
+                self.dim
+            )));
         }
         if k == 0 || self.keys.is_empty() {
             return Ok(Vec::new());
@@ -274,6 +321,28 @@ mod tests {
         assert!(idx.upsert(1, &[0.0; 7]).is_err());
         assert!(idx.search(&[0.0; 9], 3, None).is_err());
         assert!(VectorIndex::new(0).is_err());
+    }
+
+    #[test]
+    fn non_finite_vectors_are_rejected_with_their_key_and_index() {
+        let mut idx = VectorIndex::new(4).unwrap();
+        let e = idx.upsert(42, &[0.1, f32::NAN, 0.2, 0.3]).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("key 42") && msg.contains("index 1"), "{msg}");
+        assert!(idx.upsert(43, &[0.1, f32::INFINITY, 0.2, 0.3]).is_err());
+        assert!(idx.is_empty(), "a rejected vector must not be stored");
+        assert!(idx.search(&[f32::NAN, 0.0, 0.0, 0.0], 1, None).is_err());
+    }
+
+    #[test]
+    fn upsert_many_is_all_or_nothing() {
+        let mut idx = VectorIndex::new(2).unwrap();
+        let e = idx.upsert_many(&[1, 2, 3], &[1.0, 0.0, 0.0, 1.0, f32::NAN, 1.0]).unwrap_err();
+        assert!(e.to_string().contains("key 3"), "{e}");
+        assert!(idx.is_empty(), "rows before the bad one must not be applied");
+        assert!(idx.upsert_many(&[1, 2], &[1.0, 0.0]).unwrap_err().to_string().contains("expected 4"));
+        idx.upsert_many(&[1, 2], &[1.0, 0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(idx.len(), 2);
     }
 
     #[test]

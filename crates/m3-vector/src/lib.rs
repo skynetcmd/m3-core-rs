@@ -27,7 +27,7 @@ pub fn f32_as_blob(vec: &[f32]) -> &[u8] {
 /// Cosine similarity between two equal-length vectors (scalar fallback).
 pub fn cosine(a: &[f32], b: &[f32]) -> Result<f32> {
     if a.len() != b.len() {
-        return Err(M3Error::VectorDimMismatch { expected: a.len(), got: b.len() });
+        return Err(M3Error::VectorDimMismatch { expected: a.len(), got: b.len(), index: None });
     }
     Ok(cosine_unchecked(a, b))
 }
@@ -71,28 +71,62 @@ fn cosine_unchecked(a: &[f32], b: &[f32]) -> f32 {
 pub fn cosine_batch(query: &[f32], corpus: &[&[f32]]) -> Result<Vec<f32>> {
     for (i, v) in corpus.iter().enumerate() {
         if v.len() != query.len() {
-            return Err(M3Error::VectorDimMismatch { expected: query.len(), got: v.len() });
+            return Err(M3Error::VectorDimMismatch { expected: query.len(), got: v.len(), index: Some(i) });
         }
-        let _ = i;
     }
     Ok(corpus.par_iter().map(|v| cosine_unchecked(query, v)).collect())
+}
+
+/// Decode one packed row of little-endian f32s: borrowed when the bytes are
+/// 4-byte aligned (the usual case), copied otherwise. Alignment is a property
+/// of the caller's allocator, not of the data, so it must never change a score
+/// or fail a call. `b.len()` must be a multiple of 4 (callers check the length
+/// first); a trailing partial float is ignored.
+pub fn decode_packed_row(b: &[u8]) -> std::borrow::Cow<'_, [f32]> {
+    match bytemuck::try_cast_slice::<u8, f32>(b) {
+        Ok(v) => std::borrow::Cow::Borrowed(v),
+        Err(_) => std::borrow::Cow::Owned(
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        ),
+    }
+}
+
+/// Warn once per call about rows that are not `dim * 4` bytes (they score 0.0).
+/// The count and the first offender are what an operator needs to find the
+/// truncated or wrong-model blob; silently zero-scoring hid them.
+fn warn_wrong_length_rows(op: &str, blobs: &[&[u8]], dim: usize) {
+    let expected = dim * 4;
+    let mut bad = blobs.iter().enumerate().filter(|(_, b)| b.len() != expected);
+    if let Some((first, b)) = bad.next() {
+        log::warn!(
+            "{op}: {} of {} candidate rows are not {expected} bytes (dim {dim} x 4) and scored 0.0; \
+             first is row {first} with {} bytes — a truncated blob or one written by a model of \
+             another dimension",
+            1 + bad.count(),
+            blobs.len(),
+            b.len(),
+        );
+    }
 }
 
 /// Score `query` against every packed-blob embedding in `blobs`, in parallel.
 ///
 /// Each blob must be exactly `dim * 4` bytes (a sequence of little-endian f32s
 /// — the on-disk layout produced by `f32_as_blob`). A blob of any other length
-/// scores 0.0 for that row rather than erroring; this matches the Python
-/// fallback's behavior on ragged inputs and keeps a single corrupt row from
-/// killing an entire batch retrieval.
+/// scores 0.0 for that row rather than erroring — parity with the Python
+/// fallback on ragged inputs, so a single corrupt row cannot kill a whole
+/// retrieval — and is reported with `log::warn!`.
 ///
 /// This is the load-bearing primitive for the retrieval hot path: the caller
 /// passes raw SQLite BLOB bytes straight in, avoiding a per-row `struct.unpack`
 /// + Python `list` allocation and a `Vec<Vec<f32>>` FFI marshalling step.
 pub fn cosine_batch_packed(query: &[f32], blobs: &[&[u8]], dim: usize) -> Result<Vec<f32>> {
     if query.len() != dim {
-        return Err(M3Error::VectorDimMismatch { expected: dim, got: query.len() });
+        return Err(M3Error::VectorDimMismatch { expected: dim, got: query.len(), index: None });
     }
+    warn_wrong_length_rows("cosine_batch_packed", blobs, dim);
     let expected_bytes = dim * 4;
     Ok(blobs
         .par_iter()
@@ -100,10 +134,7 @@ pub fn cosine_batch_packed(query: &[f32], blobs: &[&[u8]], dim: usize) -> Result
             if b.len() != expected_bytes {
                 return 0.0;
             }
-            match bytemuck::try_cast_slice::<u8, f32>(b) {
-                Ok(v) => cosine_unchecked(query, v),
-                Err(_) => 0.0,
-            }
+            cosine_unchecked(query, &decode_packed_row(b))
         })
         .collect())
 }
@@ -120,7 +151,7 @@ pub fn cosine_batch_packed(query: &[f32], blobs: &[&[u8]], dim: usize) -> Result
 ///
 /// `anchors` is a slice of M anchor vectors, each length `dim`. `blobs` are the
 /// candidate embeddings as raw little-endian f32 bytes (`dim * 4` each). A blob of
-/// the wrong byte length scores 0.0 (matches `cosine_batch_packed`'s ragged branch).
+/// the wrong byte length scores 0.0 and is warned about (as in `cosine_batch_packed`).
 /// An empty anchor list yields all -1.0 (no signal — caller treats as "unscored",
 /// mirroring the pure-Python `max(... for a in anchors)` over an empty set being
 /// guarded upstream). Errors if any anchor's length != dim.
@@ -129,11 +160,12 @@ pub fn cosine_batch_maxpool_packed(
     blobs: &[&[u8]],
     dim: usize,
 ) -> Result<Vec<f32>> {
-    for a in anchors {
+    for (j, a) in anchors.iter().enumerate() {
         if a.len() != dim {
-            return Err(M3Error::VectorDimMismatch { expected: dim, got: a.len() });
+            return Err(M3Error::VectorDimMismatch { expected: dim, got: a.len(), index: Some(j) });
         }
     }
+    warn_wrong_length_rows("cosine_batch_maxpool_packed", blobs, dim);
     let expected_bytes = dim * 4;
     Ok(blobs
         .par_iter()
@@ -141,15 +173,12 @@ pub fn cosine_batch_maxpool_packed(
             if b.len() != expected_bytes {
                 return 0.0;
             }
-            let v = match bytemuck::try_cast_slice::<u8, f32>(b) {
-                Ok(v) => v,
-                Err(_) => return 0.0,
-            };
+            let v = decode_packed_row(b);
             // max cosine over all anchors; -1.0 when there are no anchors (cosine is
             // in [-1, 1], so -1.0 is the correct identity for an empty max).
             anchors
                 .iter()
-                .map(|a| cosine_unchecked(a, v))
+                .map(|a| cosine_unchecked(a, &v))
                 .fold(-1.0_f32, f32::max)
         })
         .collect())
@@ -191,7 +220,7 @@ pub fn hybrid_score_batch(
         || importances.len() != n
         || title_overlaps.len() != n
     {
-        return Err(M3Error::Other(format!(
+        return Err(M3Error::Config(format!(
             "hybrid_score_batch length mismatch: vec={}, bm25={}, lens={}, imp={}, titles={}",
             n,
             bm25_scores.len(),
@@ -248,8 +277,11 @@ pub fn hybrid_score_batch(
 
 /// Rank-based linear recency bonus aligned to `valid_froms`.
 ///
-/// Items with `Some(non-empty)` `valid_from` are sorted lexicographically (ISO-8601
-/// sorts correctly as strings). The oldest dated item gets bonus 0, the newest gets
+/// Items with `Some(non-empty)` `valid_from` are ordered by their numeric
+/// `YYYY MM DD HH MM SS` fields (see `iso_to_u64`), which matches a string sort
+/// of well-formed ISO-8601. ⚠ A timezone offset is NOT applied: `10:00+05:00`
+/// and `10:00Z` compare equal, so mixed-offset inputs can be mis-ordered by up
+/// to the offset difference. The oldest dated item gets bonus 0, the newest gets
 /// `bias`, with linear interpolation between. Items with `None` or empty strings
 /// get bonus 0. When fewer than two dated items exist, returns all zeros.
 ///
@@ -265,7 +297,9 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
     // cheaper than lexicographic string compare. Accepts "YYYY-MM-DD" and
     // "YYYY-MM-DDTHH:MM:SS..." forms; missing parts default to 0. Unparseable
     // strings collapse to 0 (treated as oldest), matching the prior string
-    // sort's behavior on non-ISO inputs.
+    // sort's behavior on non-ISO inputs. Arithmetic saturates: an over-long
+    // digit run (or a year past ~1.8e9) sorts as newest instead of wrapping or
+    // panicking on caller data.
     fn iso_to_u64(s: &str) -> u64 {
         let mut parts = [0u64; 6]; // year, month, day, hour, min, sec
         let mut idx = 0usize;
@@ -273,7 +307,7 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
         let mut digits = 0u32;
         for ch in s.bytes() {
             if ch.is_ascii_digit() {
-                current = current * 10 + (ch - b'0') as u64;
+                current = current.saturating_mul(10).saturating_add((ch - b'0') as u64);
                 digits += 1;
             } else if digits > 0 {
                 if idx < 6 {
@@ -290,12 +324,10 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
         if digits > 0 && idx < 6 {
             parts[idx] = current;
         }
-        parts[0] * 10_000_000_000
-            + parts[1] * 100_000_000
-            + parts[2] * 1_000_000
-            + parts[3] * 10_000
-            + parts[4] * 100
-            + parts[5]
+        [10_000_000_000u64, 100_000_000, 1_000_000, 10_000, 100, 1]
+            .iter()
+            .zip(parts)
+            .fold(0u64, |acc, (scale, p)| acc.saturating_add(p.saturating_mul(*scale)))
     }
 
     let mut dated: Vec<(usize, u64)> = valid_froms
@@ -317,6 +349,50 @@ pub fn recency_bonus_ranks(valid_froms: &[Option<String>], bias: f32) -> Vec<f32
     out
 }
 
+/// Candidate count at which an MMR step scores candidates with rayon.
+const MMR_PAR_THRESHOLD: usize = 128;
+
+/// The better of two `(position, score)` pairs, one total order shared by the
+/// sequential and the rayon branch of each MMR step so they cannot disagree:
+/// the higher score wins, a tie goes to the lower position, and a NaN score
+/// ranks as -inf (it never beats a number). The rayon branch used
+/// `partial_cmp().unwrap()`, which panicked on NaN — only above 128 candidates,
+/// while the sequential branch quietly kept position 0.
+fn mmr_better(a: (usize, f32), b: (usize, f32)) -> (usize, f32) {
+    let key = |s: f32| if s.is_nan() { f32::NEG_INFINITY } else { s };
+    let (ka, kb) = (key(a.1), key(b.1));
+    if kb > ka || (kb == ka && b.0 < a.0) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Position in `remaining` of the best-scoring candidate; `None` when empty.
+fn mmr_pick(remaining: &[usize], score: impl Fn(usize) -> f32 + Sync) -> Option<usize> {
+    let scored = |(pos, &cand): (usize, &usize)| (pos, score(cand));
+    let best = if remaining.len() < MMR_PAR_THRESHOLD {
+        remaining.iter().enumerate().map(scored).reduce(mmr_better)
+    } else {
+        remaining.par_iter().enumerate().map(scored).reduce_with(mmr_better)
+    };
+    best.map(|(pos, _)| pos)
+}
+
+/// Warn when an MMR input carries NaN/inf: those candidates are ranked last
+/// rather than failing the search, but the cause must be visible.
+fn warn_non_finite(op: &str, what: &str, values: &[f32]) {
+    let mut bad = values.iter().enumerate().filter(|(_, v)| !v.is_finite());
+    if let Some((first, v)) = bad.next() {
+        log::warn!(
+            "{op}: {} of {} {what} values are not finite (first: index {first} = {v}); those \
+             candidates rank last — check the embedding blobs / scores that produced them",
+            1 + bad.count(),
+            values.len(),
+        );
+    }
+}
+
 /// Maximal Marginal Relevance rerank over candidate vectors.
 ///
 /// Selects `min(k, candidates.len())` indices balancing relevance to `query`
@@ -334,37 +410,16 @@ pub fn mmr_rerank(
     let mut selected: Vec<usize> = Vec::with_capacity(take);
     let mut remaining: Vec<usize> = (0..n).collect();
 
+    warn_non_finite("mmr_rerank", "query cosine", &query_sim);
     while selected.len() < take {
-        let best_pos = if remaining.len() < 128 {
-            let mut best_idx = 0usize;
-            let mut best_score = f32::NEG_INFINITY;
-            for (pos, &cand) in remaining.iter().enumerate() {
-                let max_div = selected
-                    .iter()
-                    .map(|&s| cosine_unchecked(candidates[cand], candidates[s]))
-                    .fold(0.0f32, f32::max);
-                let score = lambda * query_sim[cand] - (1.0 - lambda) * max_div;
-                if score > best_score {
-                    best_score = score;
-                    best_idx = pos;
-                }
-            }
-            best_idx
-        } else {
-            remaining
-                .par_iter()
-                .enumerate()
-                .map(|(pos, &cand)| {
-                    let max_div = selected
-                        .iter()
-                        .map(|&s| cosine_unchecked(candidates[cand], candidates[s]))
-                        .fold(0.0f32, f32::max);
-                    let score = lambda * query_sim[cand] - (1.0 - lambda) * max_div;
-                    (pos, score)
-                })
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .map(|(pos, _)| pos)
-                .unwrap()
+        let Some(best_pos) = mmr_pick(&remaining, |cand| {
+            let max_div = selected
+                .iter()
+                .map(|&s| cosine_unchecked(candidates[cand], candidates[s]))
+                .fold(0.0f32, f32::max);
+            lambda * query_sim[cand] - (1.0 - lambda) * max_div
+        }) else {
+            break;
         };
         selected.push(remaining.swap_remove(best_pos));
     }
@@ -394,8 +449,8 @@ pub fn mmr_rerank_scored(
 ) -> Result<Vec<usize>> {
     let n = relevance.len();
     if candidate_vectors.len() != n {
-        return Err(M3Error::Other(format!(
-            "relevance/vector length mismatch: {} vs {}",
+        return Err(M3Error::Config(format!(
+            "mmr_rerank_scored length mismatch: {} relevance scores vs {} candidate vectors",
             n,
             candidate_vectors.len()
         )));
@@ -407,41 +462,20 @@ pub fn mmr_rerank_scored(
         return Ok(selected);
     }
 
+    warn_non_finite("mmr_rerank_scored", "relevance", relevance);
     if force_seed_first {
         selected.push(remaining.remove(0));
     }
 
     while selected.len() < take {
-        let best_pos = if remaining.len() < 128 {
-            let mut best_pos = 0usize;
-            let mut best_score = f32::NEG_INFINITY;
-            for (pos, &cand) in remaining.iter().enumerate() {
-                let max_sim = selected
-                    .iter()
-                    .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
-                    .fold(0.0f32, f32::max);
-                let score = lambda * relevance[cand] - (1.0 - lambda) * max_sim;
-                if score > best_score {
-                    best_score = score;
-                    best_pos = pos;
-                }
-            }
-            best_pos
-        } else {
-            remaining
-                .par_iter()
-                .enumerate()
-                .map(|(pos, &cand)| {
-                    let max_sim = selected
-                        .iter()
-                        .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
-                        .fold(0.0f32, f32::max);
-                    let score = lambda * relevance[cand] - (1.0 - lambda) * max_sim;
-                    (pos, score)
-                })
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .map(|(pos, _)| pos)
-                .unwrap()
+        let Some(best_pos) = mmr_pick(&remaining, |cand| {
+            let max_sim = selected
+                .iter()
+                .map(|&s| cosine_unchecked(candidate_vectors[cand], candidate_vectors[s]))
+                .fold(0.0f32, f32::max);
+            lambda * relevance[cand] - (1.0 - lambda) * max_sim
+        }) else {
+            break;
         };
         selected.push(remaining.remove(best_pos));
     }
@@ -501,7 +535,7 @@ pub fn rank_hybrid(
 ) -> Result<Vec<usize>> {
     let n = relevance.len();
     if contents.len() != n || embeddings.len() != n {
-        return Err(M3Error::Other(format!(
+        return Err(M3Error::Config(format!(
             "rank_hybrid length mismatch: relevance={}, contents={}, embeddings={}",
             n, contents.len(), embeddings.len()
         )));
@@ -527,7 +561,7 @@ pub fn rank_hybrid(
             seen_content.insert(c);
         }
         pre_ranked_idx.push(idx);
-        if pre_ranked_idx.len() >= k * 3 {
+        if pre_ranked_idx.len() >= k.saturating_mul(3) {
             break;
         }
     }
@@ -786,6 +820,66 @@ mod tests {
         // zero bias -> all zero regardless
         let v = vec![Some("a".to_string()), Some("b".to_string())];
         assert_eq!(recency_bonus_ranks(&v, 0.0), vec![0.0, 0.0]);
+    }
+
+    fn unit_vectors(n: usize) -> Vec<Vec<f32>> {
+        (0..n).map(|i| vec![(i as f32).cos(), (i as f32).sin(), 0.5]).collect()
+    }
+
+    #[test]
+    fn mmr_nan_relevance_ranks_last_on_both_branches() {
+        // 200 candidates take the rayon branch, 50 the sequential one; NaN
+        // panicked the former and silently won position 0 in the latter.
+        for n in [50usize, 200] {
+            let vs = unit_vectors(n);
+            let refs: Vec<&[f32]> = vs.iter().map(|v| v.as_slice()).collect();
+            let mut rel: Vec<f32> = (0..n).map(|i| 1.0 - i as f32 / n as f32).collect();
+            rel[0] = f32::NAN;
+            let out = mmr_rerank_scored(&rel, &refs, 1.0, n, false).unwrap();
+            assert_eq!(out.len(), n);
+            assert_eq!(*out.last().unwrap(), 0, "n={n}: NaN candidate must rank last, got {out:?}");
+        }
+    }
+
+    #[test]
+    fn mmr_pick_sequential_and_parallel_agree_on_ties_and_nan() {
+        for n in [MMR_PAR_THRESHOLD - 1, MMR_PAR_THRESHOLD + 1] {
+            let remaining: Vec<usize> = (0..n).collect();
+            // Two equal maxima at 7 and 90 (when present); NaN everywhere else.
+            let best = mmr_pick(&remaining, |c| if c == 7 || c == 90 { 1.0 } else { f32::NAN });
+            assert_eq!(best, Some(7), "n={n}: a tie must go to the lower position");
+            let all_nan = mmr_pick(&remaining, |_| f32::NAN);
+            assert_eq!(all_nan, Some(0), "n={n}: all-NaN picks position 0 on both branches");
+        }
+        assert_eq!(mmr_pick(&[], |_| 0.0), None);
+    }
+
+    #[test]
+    fn misaligned_packed_rows_score_like_aligned_ones() {
+        let q: &[f32] = &[1.0, 2.0, 3.0, 4.0];
+        let row = f32_as_blob(q).to_vec();
+        let mut buf = vec![0u8; 1];
+        buf.extend_from_slice(&row); // offset by one byte: never 4-aligned
+        let blobs: Vec<&[u8]> = vec![&buf[1..]];
+        let got = cosine_batch_packed(q, &blobs, 4).unwrap();
+        assert!((got[0] - 1.0).abs() < 1e-6, "misaligned row scored {}", got[0]);
+    }
+
+    #[test]
+    fn dim_mismatch_names_the_row() {
+        let q: &[f32] = &[1.0, 0.0];
+        let good: &[f32] = &[1.0, 0.0];
+        let bad: &[f32] = &[1.0, 0.0, 0.0];
+        let e = cosine_batch(q, &[good, bad]).unwrap_err();
+        assert!(matches!(e, M3Error::VectorDimMismatch { expected: 2, got: 3, index: Some(1) }), "{e}");
+        assert!(e.to_string().contains("at row 1"), "{e}");
+    }
+
+    #[test]
+    fn recency_parse_saturates_instead_of_overflowing() {
+        let v = vec![Some("99999999999999999999999-01-01".to_string()), Some("2025-01-01".to_string())];
+        let b = recency_bonus_ranks(&v, 1.0);
+        assert_eq!(b, vec![1.0, 0.0], "an absurd year sorts newest, without a panic");
     }
 
     #[test]

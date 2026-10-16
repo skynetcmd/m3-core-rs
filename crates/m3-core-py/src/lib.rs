@@ -5,9 +5,10 @@
 //! the generic crates consume. Generic crates never call `std::env::var` and
 //! never depend on pyo3.
 
-use pyo3::exceptions::{PyOSError, PyValueError};
+use pyo3::exceptions::{PyException, PyOSError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple, PyString};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyDict, PyTuple, PyString, PyType};
 
 pub use m3_dispatcher;
 pub use m3_embed_llamacpp;
@@ -34,28 +35,166 @@ impl From<M3Error> for PyM3Error {
     }
 }
 
+/// The typed Python exceptions, one per `M3Error` variant, all under one
+/// `m3_core_rs.M3Error` base. ⚠ Each ALSO subclasses the builtin that variant
+/// raised before these existed (ValueError for caller errors, OSError for
+/// environment failures), so every existing `except ValueError` /
+/// `except OSError` around an m3_core_rs call keeps catching it. Changing a
+/// builtin base is a breaking change for m3-memory.
+///
+/// Built with `type()` because `create_exception!` takes a single base.
+struct ExcTypes {
+    base: Py<PyType>,
+    input_too_long: Py<PyType>,
+    vector_dim_mismatch: Py<PyType>,
+    config: Py<PyType>,
+    backend: Py<PyType>,
+    io: Py<PyType>,
+    database_locked: Py<PyType>,
+    parity: Py<PyType>,
+    value: Py<PyType>,
+}
+
+static EXC_TYPES: PyOnceLock<ExcTypes> = PyOnceLock::new();
+
+/// (Python name, builtin base is OSError, docstring) for each typed exception.
+const EXC_SPECS: [(&str, bool, &str); 8] = [
+    ("InputTooLong", false, "An input exceeds the model's context window (attributes: tokens, n_ctx, index)."),
+    ("VectorDimMismatch", false, "A vector has the wrong dimension (attributes: expected, got, index)."),
+    ("ConfigError", false, "An argument or configuration value is invalid."),
+    ("BackendError", true, "The model backend failed (a load, a worker, the circuit breaker)."),
+    ("IoError", true, "A filesystem or OS operation failed (errno set when the OS reported one)."),
+    ("DatabaseLockedError", true, "The database is locked."),
+    ("ParityError", false, "A Rust/Python parity check failed."),
+    ("M3ValueError", false, "Any other invalid value reported by the Rust core."),
+];
+
+fn exc_types(py: Python<'_>) -> PyResult<&ExcTypes> {
+    EXC_TYPES.get_or_try_init(py, || {
+        let type_ = py.import("builtins")?.getattr("type")?;
+        let make = |name: &str, bases: Bound<'_, PyTuple>, doc: &str| -> PyResult<Py<PyType>> {
+            let ns = PyDict::new(py);
+            ns.set_item("__module__", "m3_core_rs")?;
+            ns.set_item("__doc__", doc)?;
+            Ok(type_.call1((name, bases, ns))?.cast_into::<PyType>()?.unbind())
+        };
+        let base = make(
+            "M3Error",
+            PyTuple::new(py, [py.get_type::<PyException>()])?,
+            "Base of every exception the m3_core_rs Rust core raises.",
+        )?;
+        let mut sub = Vec::with_capacity(EXC_SPECS.len());
+        for (name, os, doc) in EXC_SPECS {
+            let builtin = if os { py.get_type::<PyOSError>() } else { py.get_type::<PyValueError>() };
+            sub.push(make(name, PyTuple::new(py, [base.bind(py).clone(), builtin])?, doc)?);
+        }
+        let mut it = sub.into_iter();
+        let mut next = || it.next().expect("one type per EXC_SPECS entry");
+        Ok(ExcTypes {
+            base,
+            input_too_long: next(),
+            vector_dim_mismatch: next(),
+            config: next(),
+            backend: next(),
+            io: next(),
+            database_locked: next(),
+            parity: next(),
+            value: next(),
+        })
+    })
+}
+
+/// Build the typed Python exception for `e`, with its structured fields as
+/// attributes so no caller has to parse the message.
+fn to_pyerr(py: Python<'_>, e: M3Error) -> PyErr {
+    let t = match exc_types(py) {
+        Ok(t) => t,
+        Err(err) => return err,
+    };
+    let msg = e.to_string();
+    let build = || -> PyResult<Bound<'_, PyAny>> {
+        Ok(match &e {
+            M3Error::InputTooLong { tokens, n_ctx, index } => {
+                let x = t.input_too_long.bind(py).call1((msg.as_str(),))?;
+                x.setattr("tokens", *tokens)?;
+                x.setattr("n_ctx", *n_ctx)?;
+                x.setattr("index", *index)?;
+                x
+            }
+            M3Error::VectorDimMismatch { expected, got, index } => {
+                let x = t.vector_dim_mismatch.bind(py).call1((msg.as_str(),))?;
+                x.setattr("expected", *expected)?;
+                x.setattr("got", *got)?;
+                x.setattr("index", *index)?;
+                x
+            }
+            M3Error::Io(io) => match io.raw_os_error() {
+                // (errno, strerror) populates OSError.errno / .strerror.
+                Some(code) => t.io.bind(py).call1((code, msg.as_str()))?,
+                None => t.io.bind(py).call1((msg.as_str(),))?,
+            },
+            M3Error::Config(_) => t.config.bind(py).call1((msg.as_str(),))?,
+            M3Error::Backend(_) => t.backend.bind(py).call1((msg.as_str(),))?,
+            M3Error::DatabaseLocked => t.database_locked.bind(py).call1((msg.as_str(),))?,
+            M3Error::Parity { .. } => t.parity.bind(py).call1((msg.as_str(),))?,
+            M3Error::Other(_) => t.value.bind(py).call1((msg.as_str(),))?,
+        })
+    };
+    match build() {
+        Ok(x) => PyErr::from_value(x),
+        Err(err) => err,
+    }
+}
+
 impl From<PyM3Error> for PyErr {
     fn from(e: PyM3Error) -> PyErr {
-        match e.0 {
-            M3Error::VectorDimMismatch { .. } | M3Error::Config(_) => {
-                PyValueError::new_err(e.0.to_string())
-            }
-            M3Error::DatabaseLocked | M3Error::Io(_) | M3Error::Backend(_) => {
-                PyOSError::new_err(e.0.to_string())
-            }
-            // Oversize input is a CALLER error, so ValueError — not OSError.
-            // It groups with VectorDimMismatch (the caller passed something the
-            // model cannot accept), not with Backend/Io (the environment
-            // failed). The same distinction the HTTP layer draws as 413-vs-500.
-            M3Error::InputTooLong { .. } => PyValueError::new_err(e.0.to_string()),
-            M3Error::Parity { .. } | M3Error::Other(_) => PyValueError::new_err(e.0.to_string()),
-        }
+        Python::attach(|py| to_pyerr(py, e.0))
     }
 }
 
 /// `m3_error::Result` -> `PyResult`, routed through the `PyM3Error` mapping.
 fn map_err<T>(r: m3_error::Result<T>) -> PyResult<T> {
     r.map_err(|e| PyM3Error::from(e).into())
+}
+
+/// `ConfigError` (a `ValueError`) for an invalid argument.
+fn config_err(msg: impl Into<String>) -> PyErr {
+    PyM3Error(M3Error::Config(msg.into())).into()
+}
+
+/// `BackendError` (an `OSError`) for a failure of the core itself.
+fn backend_err(msg: impl Into<String>) -> PyErr {
+    PyM3Error(M3Error::Backend(msg.into())).into()
+}
+
+/// Validate one flat little-endian buffer of `dim`-float rows and return the
+/// row size in bytes: the check every packed binding needs, in one place.
+/// `arg` names the Python argument in the error. Decode the rows with
+/// `m3_vector::decode_packed_row`, which copies only a misaligned buffer —
+/// alignment is the allocator's business, never the caller's error.
+fn packed_row_bytes(arg: &str, bytes: &[u8], dim: usize) -> PyResult<usize> {
+    let row_bytes = dim
+        .checked_mul(4)
+        .ok_or_else(|| config_err(format!("dim {dim} is too large (dim * 4 overflows)")))?;
+    if row_bytes == 0 {
+        return Err(config_err("dim must be > 0"));
+    }
+    if !bytes.len().is_multiple_of(row_bytes) {
+        return Err(config_err(format!(
+            "{arg} length {} is not a multiple of dim*4 = {row_bytes} (dim {dim}); a row is truncated \
+             or the buffer was packed for another dimension",
+            bytes.len(),
+        )));
+    }
+    Ok(row_bytes)
+}
+
+/// Seconds from Python as a `Duration`; negative, NaN or infinite input is a
+/// `ConfigError` naming the argument (`from_secs_f64` panics on them).
+fn duration_arg(arg: &str, secs: f64) -> PyResult<std::time::Duration> {
+    std::time::Duration::try_from_secs_f64(secs).map_err(|e| {
+        config_err(format!("{arg} must be a finite, non-negative number of seconds; got {secs} ({e})"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +243,8 @@ fn cosine_batch(query: Vec<f32>, corpus: Vec<Vec<f32>>) -> PyResult<Vec<f32>> {
 /// Cosine of `query` against a list of packed-blob embeddings. `dim` is the
 /// embedding dimension. Each `bytes`-typed blob must be exactly `dim * 4`
 /// bytes (sequence of little-endian f32s); any other length scores 0.0 for
-/// that row. Releases the GIL while rayon scores in parallel.
+/// that row and is reported with a warning (count + first row). Releases the
+/// GIL while rayon scores in parallel.
 #[pyfunction]
 fn cosine_batch_packed(
     py: Python<'_>,
@@ -137,19 +277,7 @@ fn cosine_batch_packed_flat(
     blobs: &[u8],
     dim: usize,
 ) -> PyResult<Vec<f32>> {
-    let row_bytes = dim
-        .checked_mul(4)
-        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
-    if row_bytes == 0 {
-        return Err(PyValueError::new_err("dim must be > 0"));
-    }
-    if !blobs.len().is_multiple_of(row_bytes) {
-        return Err(PyValueError::new_err(format!(
-            "blobs length {} is not a multiple of dim*4 = {}",
-            blobs.len(),
-            row_bytes,
-        )));
-    }
+    let row_bytes = packed_row_bytes("blobs", blobs, dim)?;
     py.detach(|| {
         let refs: Vec<&[u8]> = blobs.chunks_exact(row_bytes).collect();
         map_err(m3_vector::cosine_batch_packed(&query, &refs, dim))
@@ -164,8 +292,8 @@ fn cosine_batch_packed_flat(
 /// Both buffers are flat little-endian f32 bytes (same contract as
 /// `cosine_batch_packed_flat`): `anchors` = `m * dim * 4` bytes (M anchor rows),
 /// `blobs` = `n * dim * 4` bytes (N candidate rows). **Pass `bytes`** (zero-copy
-/// borrow). Errors with `ValueError` if either length isn't a multiple of `dim*4`.
-/// A candidate of the wrong length scores 0.0; with zero anchors every score is -1.0.
+/// borrow). Errors with `ConfigError` (a `ValueError`) if either length isn't a
+/// multiple of `dim*4`. With zero anchors every score is -1.0.
 #[pyfunction]
 fn cosine_batch_maxpool_packed(
     py: Python<'_>,
@@ -173,36 +301,11 @@ fn cosine_batch_maxpool_packed(
     blobs: &[u8],
     dim: usize,
 ) -> PyResult<Vec<f32>> {
-    let row_bytes = dim
-        .checked_mul(4)
-        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
-    if row_bytes == 0 {
-        return Err(PyValueError::new_err("dim must be > 0"));
-    }
-    if !anchors.len().is_multiple_of(row_bytes) {
-        return Err(PyValueError::new_err(format!(
-            "anchors length {} is not a multiple of dim*4 = {}",
-            anchors.len(),
-            row_bytes,
-        )));
-    }
-    if !blobs.len().is_multiple_of(row_bytes) {
-        return Err(PyValueError::new_err(format!(
-            "blobs length {} is not a multiple of dim*4 = {}",
-            blobs.len(),
-            row_bytes,
-        )));
-    }
+    packed_row_bytes("anchors", anchors, dim)?;
+    let row_bytes = packed_row_bytes("blobs", blobs, dim)?;
     py.detach(|| {
-        // Cast each anchor's bytes to &[f32]; a bad cast (alignment) -> error, surfaced.
-        let anchor_vecs: std::result::Result<Vec<&[f32]>, _> = anchors
-            .chunks_exact(row_bytes)
-            .map(bytemuck::try_cast_slice::<u8, f32>)
-            .collect();
-        let anchor_vecs = match anchor_vecs {
-            Ok(v) => v,
-            Err(e) => return Err(PyValueError::new_err(format!("anchor cast failed: {e}"))),
-        };
+        let anchor_floats = m3_vector::decode_packed_row(anchors);
+        let anchor_vecs: Vec<&[f32]> = anchor_floats.chunks_exact(dim).collect();
         let cand_refs: Vec<&[u8]> = blobs.chunks_exact(row_bytes).collect();
         map_err(m3_vector::cosine_batch_maxpool_packed(&anchor_vecs, &cand_refs, dim))
     })
@@ -298,9 +401,9 @@ fn mmr_rerank_scored(
 ///
 /// `candidates` is one contiguous `bytes` buffer of `n_rows * dim * 4` bytes
 /// (little-endian f32s). Number of rows is `candidates.len() / (dim * 4)` —
-/// errors with `ValueError` if the length is not evenly divisible or the byte
-/// slice fails to cast to `&[f32]` (alignment). Pass a `bytes` object so PyO3
-/// can borrow `&[u8]` zero-copy. Releases the GIL while MMR runs.
+/// errors with `ConfigError` (a `ValueError`) if the length is not evenly
+/// divisible. Pass a `bytes` object so PyO3 can borrow `&[u8]` zero-copy (a
+/// misaligned buffer is copied, never refused). Releases the GIL while MMR runs.
 #[pyfunction]
 fn mmr_rerank_packed(
     py: Python<'_>,
@@ -310,21 +413,8 @@ fn mmr_rerank_packed(
     lambda: f32,
     k: usize,
 ) -> PyResult<Vec<usize>> {
-    let row_bytes = dim
-        .checked_mul(4)
-        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
-    if row_bytes == 0 {
-        return Err(PyValueError::new_err("dim must be > 0"));
-    }
-    if !candidates.len().is_multiple_of(row_bytes) {
-        return Err(PyValueError::new_err(format!(
-            "candidates length {} is not a multiple of dim*4 = {}",
-            candidates.len(),
-            row_bytes,
-        )));
-    }
-    let floats: &[f32] = bytemuck::try_cast_slice::<u8, f32>(candidates)
-        .map_err(|e| PyValueError::new_err(format!("candidates byte->f32 cast failed: {e}")))?;
+    packed_row_bytes("candidates", candidates, dim)?;
+    let floats = m3_vector::decode_packed_row(candidates);
     py.detach(|| {
         let refs: Vec<&[f32]> = floats.chunks_exact(dim).collect();
         map_err(m3_vector::mmr_rerank(&query, &refs, lambda, k))
@@ -344,24 +434,11 @@ fn mmr_rerank_scored_packed(
     k: usize,
     force_seed_first: bool,
 ) -> PyResult<Vec<usize>> {
-    let row_bytes = dim
-        .checked_mul(4)
-        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
-    if row_bytes == 0 {
-        return Err(PyValueError::new_err("dim must be > 0"));
-    }
-    if !candidate_vectors.len().is_multiple_of(row_bytes) {
-        return Err(PyValueError::new_err(format!(
-            "candidate_vectors length {} is not a multiple of dim*4 = {}",
-            candidate_vectors.len(),
-            row_bytes,
-        )));
-    }
-    let floats: &[f32] = bytemuck::try_cast_slice::<u8, f32>(candidate_vectors)
-        .map_err(|e| PyValueError::new_err(format!("candidate_vectors byte->f32 cast failed: {e}")))?;
+    packed_row_bytes("candidate_vectors", candidate_vectors, dim)?;
+    let floats = m3_vector::decode_packed_row(candidate_vectors);
     let n_rows = floats.len() / dim;
     if relevance.len() != n_rows {
-        return Err(PyValueError::new_err(format!(
+        return Err(config_err(format!(
             "relevance length {} != n_rows {} (derived from candidate_vectors / dim*4)",
             relevance.len(),
             n_rows,
@@ -396,9 +473,13 @@ fn enforce_displacement_guard(
     m3_vector::displacement_permutation(&rows, protected_ranks, margin)
 }
 
+/// Little-endian f32s from a blob; its length must be a multiple of 4.
 #[pyfunction]
 fn blob_as_f32(blob: Vec<u8>) -> PyResult<Vec<f32>> {
-    map_err(m3_vector::blob_as_f32(&blob)).map(|s| s.to_vec())
+    if !blob.len().is_multiple_of(4) {
+        return Err(config_err(format!("blob length {} is not a multiple of 4 (f32 size)", blob.len())));
+    }
+    Ok(m3_vector::decode_packed_row(&blob).into_owned())
 }
 
 #[pyfunction]
@@ -443,21 +524,8 @@ fn rank_hybrid_packed(
     lambda: f32,
     k: usize,
 ) -> PyResult<Vec<usize>> {
-    let row_bytes = dim
-        .checked_mul(4)
-        .ok_or_else(|| PyValueError::new_err("dim * 4 overflow"))?;
-    if row_bytes == 0 {
-        return Err(PyValueError::new_err("dim must be > 0"));
-    }
-    if !embeddings.len().is_multiple_of(row_bytes) {
-        return Err(PyValueError::new_err(format!(
-            "embeddings length {} is not a multiple of dim*4 = {}",
-            embeddings.len(),
-            row_bytes,
-        )));
-    }
-    let floats: &[f32] = bytemuck::try_cast_slice::<u8, f32>(embeddings)
-        .map_err(|e| PyValueError::new_err(format!("embeddings byte->f32 cast failed: {e}")))?;
+    packed_row_bytes("embeddings", embeddings, dim)?;
+    let floats = m3_vector::decode_packed_row(embeddings);
     py.detach(|| {
         let refs: Vec<&[f32]> = floats.chunks_exact(dim).collect();
         let c_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
@@ -590,15 +658,18 @@ fn source_to_str(s: m3_rank::RankSource) -> String {
     }
 }
 
-fn source_from_str(s: &str) -> m3_rank::RankSource {
+/// `"fts"` or `"vector"` (any case). Anything else is a `ConfigError`: it was
+/// silently treated as FTS, misattributing every row with a typo'd source.
+fn source_from_str(s: &str) -> PyResult<m3_rank::RankSource> {
     match s.to_ascii_lowercase().as_str() {
-        "vector" => m3_rank::RankSource::Vector,
-        _ => m3_rank::RankSource::Fts,
+        "vector" => Ok(m3_rank::RankSource::Vector),
+        "fts" => Ok(m3_rank::RankSource::Fts),
+        _ => Err(config_err(format!("RankRow.source must be \"fts\" or \"vector\"; got {s:?}"))),
     }
 }
 
-fn rankrow_in(r: &PyRankRow) -> m3_rank::RankRow {
-    m3_rank::RankRow { id: r.id.clone(), score: r.score, source: source_from_str(&r.source) }
+fn rankrow_in(r: &PyRankRow) -> PyResult<m3_rank::RankRow> {
+    Ok(m3_rank::RankRow { id: r.id.clone(), score: r.score, source: source_from_str(&r.source)? })
 }
 
 fn rankrow_out(r: m3_rank::RankRow) -> PyRankRow {
@@ -613,11 +684,11 @@ fn fuse(
     vector: Vec<PyRankRow>,
     fts_weight: f32,
     vector_weight: f32,
-) -> Vec<PyRankRow> {
-    let fts_in: Vec<m3_rank::RankRow> = fts.iter().map(rankrow_in).collect();
-    let vec_in: Vec<m3_rank::RankRow> = vector.iter().map(rankrow_in).collect();
+) -> PyResult<Vec<PyRankRow>> {
+    let fts_in = fts.iter().map(rankrow_in).collect::<PyResult<Vec<_>>>()?;
+    let vec_in = vector.iter().map(rankrow_in).collect::<PyResult<Vec<_>>>()?;
     let weights = m3_rank::FusionWeights { fts: fts_weight, vector: vector_weight };
-    m3_rank::fuse(fts_in, vec_in, weights).into_iter().map(rankrow_out).collect()
+    Ok(m3_rank::fuse(fts_in, vec_in, weights).into_iter().map(rankrow_out).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -713,10 +784,10 @@ struct PyVectorIndex {
 
 impl PyVectorIndex {
     fn read(&self) -> PyResult<std::sync::RwLockReadGuard<'_, m3_vector::VectorIndex>> {
-        self.inner.read().map_err(|_| PyOSError::new_err("vector index lock poisoned"))
+        self.inner.read().map_err(|_| backend_err("vector index lock poisoned (an earlier call panicked)"))
     }
     fn write(&self) -> PyResult<std::sync::RwLockWriteGuard<'_, m3_vector::VectorIndex>> {
-        self.inner.write().map_err(|_| PyOSError::new_err("vector index lock poisoned"))
+        self.inner.write().map_err(|_| backend_err("vector index lock poisoned (an earlier call panicked)"))
     }
 }
 
@@ -730,30 +801,30 @@ impl PyVectorIndex {
     /// Insert or replace one vector per key from one contiguous `bytes` buffer
     /// of little-endian f32s, `len(keys) * dim * 4` bytes long (a SQLite
     /// embedding blob is exactly one row of it).
+    ///
+    /// All-or-nothing: a wrong length or a NaN/inf component raises
+    /// `ConfigError` (a `ValueError`) naming the key, and no row is applied.
     fn upsert_packed(&self, py: Python<'_>, keys: Vec<i64>, blobs: &[u8]) -> PyResult<()> {
+        let dim = self.read()?.dim();
+        let row_bytes = packed_row_bytes("blobs", blobs, dim)?;
+        if blobs.len() / row_bytes != keys.len() {
+            return Err(config_err(format!(
+                "{} bytes for {} keys of dimension {}; expected {}",
+                blobs.len(),
+                keys.len(),
+                dim,
+                keys.len().saturating_mul(row_bytes)
+            )));
+        }
         // The lock is taken inside the GIL-free closure: a guard cannot cross threads.
-        py.detach(|| {
-            let mut idx = self.inner.write().map_err(|_| "vector index lock poisoned".to_string())?;
-            let row = idx.dim() * 4;
-            if blobs.len() != keys.len() * row {
-                return Err(format!(
-                    "{} bytes for {} keys of dimension {}; expected {}",
-                    blobs.len(),
-                    keys.len(),
-                    idx.dim(),
-                    keys.len() * row
-                ));
+        let out = py.detach(|| {
+            let flat = m3_vector::decode_packed_row(blobs);
+            match self.inner.write() {
+                Ok(mut idx) => idx.upsert_many(&keys, &flat),
+                Err(_) => Err(M3Error::Backend("vector index lock poisoned (an earlier call panicked)".into())),
             }
-            let mut v = vec![0f32; idx.dim()];
-            for (key, chunk) in keys.iter().zip(blobs.chunks_exact(row)) {
-                for (x, b) in v.iter_mut().zip(chunk.chunks_exact(4)) {
-                    *x = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                }
-                idx.upsert(*key, &v).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })
-        .map_err(PyValueError::new_err)
+        });
+        map_err(out)
     }
 
     /// Remove keys; returns how many were present.
@@ -768,7 +839,7 @@ impl PyVectorIndex {
     fn search(&self, py: Python<'_>, query: Vec<f32>, k: usize, allowed: Option<Vec<i64>>) -> PyResult<Vec<(i64, f32)>> {
         let out = py.detach(|| match self.inner.read() {
             Ok(idx) => idx.search(&query, k, allowed.as_deref()),
-            Err(_) => Err(m3_error::M3Error::Other("vector index lock poisoned".into())),
+            Err(_) => Err(M3Error::Backend("vector index lock poisoned (an earlier call panicked)".into())),
         });
         map_err(out)
     }
@@ -848,13 +919,10 @@ struct PyCircuitBreaker {
 #[pymethods]
 impl PyCircuitBreaker {
     #[new]
-    fn new(threshold: u32, reset_after_secs: f64) -> Self {
-        PyCircuitBreaker {
-            inner: m3_graph::CircuitBreaker::new(
-                threshold,
-                std::time::Duration::from_secs_f64(reset_after_secs),
-            ),
-        }
+    fn new(threshold: u32, reset_after_secs: f64) -> PyResult<Self> {
+        Ok(PyCircuitBreaker {
+            inner: m3_graph::CircuitBreaker::new(threshold, duration_arg("reset_after_secs", reset_after_secs)?),
+        })
     }
 
     /// One of `"closed"`, `"open"`, `"half_open"`.
@@ -888,14 +956,14 @@ struct PyRetryPolicy {
 #[pymethods]
 impl PyRetryPolicy {
     #[new]
-    fn new(max_attempts: u32, base_delay_secs: f64, max_delay_secs: f64) -> Self {
-        PyRetryPolicy {
+    fn new(max_attempts: u32, base_delay_secs: f64, max_delay_secs: f64) -> PyResult<Self> {
+        Ok(PyRetryPolicy {
             inner: m3_graph::RetryPolicy::new(
                 max_attempts,
-                std::time::Duration::from_secs_f64(base_delay_secs),
-                std::time::Duration::from_secs_f64(max_delay_secs),
+                duration_arg("base_delay_secs", base_delay_secs)?,
+                duration_arg("max_delay_secs", max_delay_secs)?,
             ),
-        }
+        })
     }
 
     #[getter]
@@ -952,12 +1020,38 @@ impl PyGovernor {
 // m3-ingest
 // ---------------------------------------------------------------------------
 
+/// Run the sweep and marshal its entries; shared by both walk bindings.
+fn walk_py(
+    py: Python<'_>,
+    root: &str,
+    dir_ignores: &[String],
+    max_depth: i64,
+    follow_symlinks: bool,
+) -> PyResult<(Py<pyo3::types::PyList>, Vec<m3_ingest::WalkError>)> {
+    let md = usize::try_from(max_depth).ok(); // negative = unbounded
+    let walk = map_err(py.detach(|| m3_ingest::walk(root, dir_ignores, md, follow_symlinks)))?;
+    let list = pyo3::types::PyList::empty(py);
+    for e in walk.entries {
+        let d = PyDict::new(py);
+        d.set_item("path", e.path)?;
+        d.set_item("size", e.size)?;
+        d.set_item("mtime", e.mtime)?;
+        d.set_item("is_dir", e.is_dir)?;
+        list.append(d)?;
+    }
+    Ok((list.into(), walk.errors))
+}
+
 /// Recursively sweep `root`, returning one dict per entry with keys
 /// `path`, `size`, `mtime`, `is_dir`. Directories whose basename is in
 /// `dir_ignores` are pruned (their subtrees are skipped). `max_depth` is
 /// measured from `root` (`0` = direct children only); pass a negative value
 /// for unbounded. Symlinked directories are descended only when
-/// `follow_symlinks` is true. Individual unreadable entries are skipped.
+/// `follow_symlinks` is true, each real directory once.
+///
+/// A missing or unreadable `root` raises `IoError` (an `OSError`). Entries
+/// below it that cannot be read are skipped and summarised in one warning;
+/// use `fs_walk_with_errors` to get them.
 ///
 /// This is the mechanical, syscall-bound half of the Python walker; the
 /// caller still applies its gitignore/glob/binary-sniff/size filters to the
@@ -971,22 +1065,39 @@ fn fs_walk(
     max_depth: i64,
     follow_symlinks: bool,
 ) -> PyResult<Py<pyo3::types::PyList>> {
-    let md = if max_depth < 0 {
-        None
-    } else {
-        Some(max_depth as usize)
-    };
-    let entries = m3_ingest::walk_entries(root, &dir_ignores, md, follow_symlinks);
-    let list = pyo3::types::PyList::empty(py);
-    for e in entries {
+    let (list, errors) = walk_py(py, root, &dir_ignores, max_depth, follow_symlinks)?;
+    if let Some(first) = errors.first() {
+        log::warn!(
+            "fs_walk '{root}': skipped {} unreadable entr{}; first: {}: {} (fs_walk_with_errors lists them all)",
+            errors.len(),
+            if errors.len() == 1 { "y" } else { "ies" },
+            first.path,
+            first.error
+        );
+    }
+    Ok(list)
+}
+
+/// `fs_walk`, plus every entry it skipped: returns `(entries, errors)` where
+/// each error is a dict with keys `path` and `error`.
+#[pyfunction]
+#[pyo3(signature = (root, dir_ignores, max_depth=-1, follow_symlinks=false))]
+fn fs_walk_with_errors(
+    py: Python<'_>,
+    root: &str,
+    dir_ignores: Vec<String>,
+    max_depth: i64,
+    follow_symlinks: bool,
+) -> PyResult<(Py<pyo3::types::PyList>, Py<pyo3::types::PyList>)> {
+    let (list, errors) = walk_py(py, root, &dir_ignores, max_depth, follow_symlinks)?;
+    let errs = pyo3::types::PyList::empty(py);
+    for e in errors {
         let d = PyDict::new(py);
         d.set_item("path", e.path)?;
-        d.set_item("size", e.size)?;
-        d.set_item("mtime", e.mtime)?;
-        d.set_item("is_dir", e.is_dir)?;
-        list.append(d)?;
+        d.set_item("error", e.error)?;
+        errs.append(d)?;
     }
-    Ok(list.into())
+    Ok((list, errs.into()))
 }
 
 /// Batch-hash file contents in parallel. Returns one dict per input path (in
@@ -1089,7 +1200,9 @@ impl PyOrtNer {
         threshold: f32,
     ) -> PyResult<Self> {
         let p = platform_from_str(platform)?;
-        let inner = m3_ner_ort::OrtNer::new(
+        // Typed: a missing model/tokenizer file is IoError (an OSError) naming
+        // the path; an ONNX Runtime failure is BackendError.
+        let inner = map_err(m3_ner_ort::OrtNer::new(
             model_path,
             tokenizer_path,
             None,
@@ -1097,14 +1210,13 @@ impl PyOrtNer {
             threshold,
             m3_ner_ort::Quant::Fp32,
             p,
-        )
-        .map_err(|e| PyValueError::new_err(format!("failed to load NER model: {e}")))?;
+        ))?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .map_err(|e| PyOSError::new_err(format!("failed to build tokio runtime: {e}")))?;
+            .map_err(|e| backend_err(format!("failed to build the NER tokio runtime: {e}")))?;
 
         Ok(PyOrtNer {
             inner: std::sync::Arc::new(inner),
@@ -1129,20 +1241,24 @@ impl PyOrtNer {
 }
 
 /// Decode a flattened GLiNER span-score tensor. `shape` is
-/// `(max_spans, span_width, num_labels)`.
+/// `(max_spans, span_width, num_labels)`; `len(scores)` must equal its
+/// product (`ConfigError`, a `ValueError`, otherwise).
 #[pyfunction]
-fn decode_spans(scores: Vec<f32>, shape: (usize, usize, usize), threshold: f32) -> Vec<PySpan> {
-    m3_ner_ort::decode_spans(&scores, shape, threshold)
+fn decode_spans(scores: Vec<f32>, shape: (usize, usize, usize), threshold: f32) -> PyResult<Vec<PySpan>> {
+    Ok(map_err(m3_ner_ort::decode_spans(&scores, shape, threshold))?
         .into_iter()
         .map(|s| PySpan { start: s.start, end: s.end, label: s.label, score: s.score })
-        .collect()
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
 // m3-dispatcher + M3_* env config
 // ---------------------------------------------------------------------------
 
-/// Rough token-length estimate (~4 chars/token, minimum 1).
+/// Conservative BGE-M3 token count that never under-counts:
+/// `max(len(text.encode()) // 3, len(text)) + 2` (the 2 is the BOS/EOS frame,
+/// so `""` is 2). Over-counts English prose ~3x; use
+/// `EmbeddedEmbedder.count_tokens` for exact counts.
 #[pyfunction]
 fn estimate_tokens(text: &str) -> usize {
     m3_dispatcher::estimate_tokens(text)
@@ -1230,22 +1346,13 @@ impl PyDispatcherConfig {
     }
 }
 
-/// Wave 9.0 — label of the active embedded compute backend. Returns
-/// `"cpu"` for the default `embedded` build, `"cuda"` / `"vulkan"` /
-/// `"metal"` when the matching feature is enabled, and `"none"` when the
-/// wheel was built without `embedded` at all. Wave 9.4 will surface this in
-/// backend stats; for now it lets Python tests assert which backend the
-/// wheel is linked against.
+/// The backend this wheel was COMPILED for: `"cpu"`, `"cuda"`, `"vulkan"`,
+/// `"metal"`, or `"none"` without `embedded`. ⚠ Not what serves requests — a
+/// GPU wheel on a host without a usable device runs on the CPU. For the
+/// observed backend call `EmbeddedEmbedder.runtime_backend()`.
 #[pyfunction]
 fn embed_backend_label() -> &'static str {
-    #[cfg(feature = "embedded")]
-    {
-        m3_embed_llamacpp::active_backend()
-    }
-    #[cfg(not(feature = "embedded"))]
-    {
-        "none"
-    }
+    m3_embed_llamacpp::COMPILED_BACKEND
 }
 
 /// Resolved `M3_*` config snapshot — what the env layer produced before any
@@ -1260,6 +1367,9 @@ fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("M3_EMBED_SEQ_MAX", config::embed_seq_max())?;
     d.set_item("M3_EMBED_N_BATCH", config::embed_n_batch())?;
     d.set_item("M3_EMBED_N_UBATCH", config::embed_n_ubatch())?;
+    // The provider is fixed at build time; report what is ACTIVE, under the
+    // key callers already read. config::hash_provider() warns if the env
+    // var asks for something else.
     d.set_item("M3_HASH_PROVIDER", config::hash_provider())?;
     Ok(d.into())
 }
@@ -1345,7 +1455,7 @@ struct PyEmbeddedEmbedder {
 impl PyEmbeddedEmbedder {
     /// `model_path` is an absolute path to a GGUF embedding model.
     ///
-    /// `warmup` (Fix #2, default `True`): when true, the constructor forces
+    /// `warmup` (default `True`): when true, the constructor forces
     /// the GGUF load + worker-pool spin-up + per-context warmup decode
     /// synchronously inside `new()`. The very first real `embed()` call then
     /// only pays the per-batch cost. Pass `warmup=False` to keep the legacy
@@ -1363,9 +1473,7 @@ impl PyEmbeddedEmbedder {
             .worker_threads(2)
             .enable_all()
             .build()
-            .map_err(|e| {
-                PyOSError::new_err(format!("failed to build tokio runtime: {e}"))
-            })?;
+            .map_err(|e| backend_err(format!("failed to build the embedder tokio runtime: {e}")))?;
 
         let cfg = config::dispatcher_config_from_env();
         let streams = cfg.streams;
@@ -1382,12 +1490,11 @@ impl PyEmbeddedEmbedder {
         // up to n_ctx tokens), so n_ctx is the only encoder-safe default; the
         // embed crate floors any smaller value up to n_ctx.
         //
-        // Fix #12 (shape b): `Dispatcher::new` already wraps its backend in
-        // `Arc<B>` internally, so we build ONE `EmbeddedBackend`, hand it to the
-        // dispatcher, and pull the exact same `Arc<EmbeddedBackend>` back out
-        // via `dispatcher.backend()` for `embedding_dim` / `streams`. This
-        // guarantees a single underlying `Arc<ContextPool>` (and therefore a
-        // single GGUF load + worker-thread pool) per `PyEmbeddedEmbedder`.
+        // `Dispatcher::new` wraps its backend in `Arc<B>`, so we build ONE
+        // `EmbeddedBackend`, hand it to the dispatcher, and pull the same
+        // `Arc` back out via `dispatcher.backend()` for `embedding_dim` /
+        // `streams`: one backend, and (its load being serialised) one GGUF
+        // load and worker pool per `PyEmbeddedEmbedder`.
         let single_backend = m3_embed_llamacpp::EmbeddedBackend::with_streams_ctx_seqmax_batch(
             model_path, streams, n_ctx, seq_max, n_batch, n_ubatch,
         );
@@ -1403,7 +1510,7 @@ impl PyEmbeddedEmbedder {
             backend,
             runtime,
         };
-        // Fix #2: synchronous warmup. `embedding_dim()` triggers the
+        // Synchronous warmup. `embedding_dim()` triggers the
         // ContextPool::load path, which now performs a per-worker decode +
         // embedding read before reporting ready — so by the time this returns,
         // the next embed() call lands on a fully-warm context.
@@ -1430,8 +1537,7 @@ impl PyEmbeddedEmbedder {
 
     /// Exact BGE-M3 token counts for `texts`, one per input, in input order.
     ///
-    /// Uses the SAME tokenizer call the embed path makes
-    /// (`str_to_token(text, AddBos::Always)`), so a count returned here is
+    /// Uses the SAME tokenizer call the embed path makes, so a count returned here is
     /// exactly what the embedder will measure against `n_ctx`. A caller that
     /// chunks to a budget below `n_ctx` therefore cannot be surprised by an
     /// overflow — a guarantee no character/byte estimate can make, because
@@ -1480,6 +1586,14 @@ impl PyEmbeddedEmbedder {
         map_err(self.backend.embedding_dim())
     }
 
+    /// The compute backend that actually holds the model, observed after
+    /// load: `"cuda"`, `"vulkan"`, `"metal"` or `"cpu"`. Differs from
+    /// `embed_backend_label()` (the compiled backend) exactly when a GPU wheel
+    /// fell back to the CPU. Forces the GGUF load.
+    fn runtime_backend(&self) -> PyResult<String> {
+        map_err(self.backend.runtime_backend())
+    }
+
     /// Configured concurrent stream count (`M3_EMBED_STREAMS`). Equal to both
     /// the dispatcher's slot count and the backend's context-pool size.
     fn streams(&self) -> usize {
@@ -1491,23 +1605,6 @@ impl PyEmbeddedEmbedder {
 // module
 // ---------------------------------------------------------------------------
 
-/// Which llama.cpp backend this wheel was compiled with, resolved at compile
-/// time from the cargo features `build_wheel.py` passes. Exposed to Python as
-/// `m3_core_rs.__build_backend__` so a support question ("which core is
-/// actually loaded?") is answerable without guessing among 7 platform dist
-/// names. The GPU features each imply `embedded`, so test them first.
-const BUILD_BACKEND: &str = if cfg!(feature = "embedded-cuda") {
-    "cuda"
-} else if cfg!(feature = "embedded-vulkan") {
-    "vulkan"
-} else if cfg!(feature = "embedded-metal") {
-    "metal"
-} else if cfg!(feature = "embedded") {
-    "cpu"
-} else {
-    "none"
-};
-
 #[pymodule]
 fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Bridge env_logger to stderr. `RUST_LOG` controls verbosity as usual, but
@@ -1517,36 +1614,40 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // a chunking or token-count discrepancy saw one half of the seam and had no
     // indication the other half existed. `RUST_LOG` keeps precedence for anyone
     // who wants finer-grained control.
-    if std::env::var_os("RUST_LOG").is_none()
-        && std::env::var("M3_DEBUG").map(|v| {
-            let v = v.to_ascii_lowercase();
-            !v.is_empty() && v != "0" && v != "false" && v != "no"
-        }) == Ok(true)
-    {
-        let _ = env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Debug)
-            .try_init();
+    //
+    // With neither set the filter is WARN: env_logger's own default is ERROR,
+    // which silently dropped every warning the core emits (an ignored env
+    // value, a skipped corrupt blob, a GPU build running on the CPU).
+    let debug = std::env::var("M3_DEBUG").is_ok_and(|v| {
+        let v = v.to_ascii_lowercase();
+        !v.is_empty() && v != "0" && v != "false" && v != "no"
+    });
+    let mut builder = if std::env::var_os("RUST_LOG").is_some() {
+        env_logger::Builder::from_default_env()
     } else {
-        let _ = env_logger::try_init();
+        let mut b = env_logger::Builder::new();
+        b.filter_level(if debug { log::LevelFilter::Debug } else { log::LevelFilter::Warn });
+        b
+    };
+    if let Err(e) = builder.try_init() {
+        // Another logger owns `log` (a re-import in a sub-interpreter). Only
+        // worth saying when someone asked for debug output and won't get it.
+        if debug {
+            eprintln!("m3_core_rs: M3_DEBUG is set but Rust logging could not be enabled: {e}");
+        }
     }
     log::info!("m3_core_rs initialized (hash provider: {})", m3_hash::active_provider());
+    // Set llama.cpp's process env now, before any embedder thread exists (a
+    // no-op except on CUDA builds; see m3_embed_llamacpp::prepare_process_env).
+    #[cfg(feature = "embedded")]
+    m3_embed_llamacpp::prepare_process_env();
 
-    // Version of the LOADED extension, from CARGO_PKG_VERSION so it can never
-    // drift from the wheel it was built into.
-    //
-    // Its absence was not cosmetic. m3-memory's installer chain is:
-    //     installed_rust_core_version() -> getattr(m3_core_rs, "__version__", None)
-    //     is_rust_core_current()        -> unreadable version => False
-    // and False is deliberately conservative ("never skip an upgrade on a
-    // guess"). With nothing to read, the skip-if-current optimisation NEVER
-    // fired, so every `m3 setup` re-downloaded the core even when the correct
-    // version was already installed — 244 MB on windows-cuda, ~949 MB on
-    // linux-cuda, silently, on every run. The guard was right; the producer was
-    // missing. Also lets `m3 doctor` name the core it actually loaded and makes
-    // stale dist-info dirs detectable.
+    // ⚠ m3-memory's installer skips a re-download only when it can read this;
+    // CARGO_PKG_VERSION means it cannot drift from the wheel it ships in.
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    // Build provenance: which backend/features this wheel was compiled with.
-    m.add("__build_backend__", BUILD_BACKEND)?;
+    // Build provenance answers "which core is actually loaded?" without
+    // guessing among 7 platform dist names (owner: m3_embed_llamacpp).
+    m.add("__build_backend__", m3_embed_llamacpp::COMPILED_BACKEND)?;
 
     m.add_function(wrap_pyfunction!(sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(sha256_hex_bytes, m)?)?;
@@ -1583,7 +1684,26 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(env_config_summary, m)?)?;
     m.add_function(wrap_pyfunction!(embed_backend_label, m)?)?;
     m.add_function(wrap_pyfunction!(fs_walk, m)?)?;
+    m.add_function(wrap_pyfunction!(fs_walk_with_errors, m)?)?;
     m.add_function(wrap_pyfunction!(hash_files, m)?)?;
+
+    let exc = exc_types(m.py())?;
+    m.add("M3Error", exc.base.clone_ref(m.py()))?;
+    for (ty, (name, _, _)) in [
+        &exc.input_too_long,
+        &exc.vector_dim_mismatch,
+        &exc.config,
+        &exc.backend,
+        &exc.io,
+        &exc.database_locked,
+        &exc.parity,
+        &exc.value,
+    ]
+    .into_iter()
+    .zip(EXC_SPECS)
+    {
+        m.add(name, ty.clone_ref(m.py()))?;
+    }
 
     m.add_class::<PyRankRow>()?;
     m.add_class::<PyRouteSignals>()?;
@@ -1602,19 +1722,6 @@ fn m3_core_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // so `m3_core_rs.EmbeddedEmbedder` raises AttributeError in Python.
     #[cfg(feature = "embedded")]
     m.add_class::<PyEmbeddedEmbedder>()?;
-
-    // Module version, taken from CARGO_PKG_VERSION at COMPILE time so it can
-    // never drift from the wheel it was built into.
-    //
-    // Its absence was not cosmetic. m3-memory's rust_core_install reads
-    // `getattr(m3_core_rs, "__version__", None)`; with nothing to read,
-    // is_rust_core_current() takes its deliberately conservative branch and
-    // reports "not current" for a wheel that IS current. The skip-if-current
-    // check therefore never fired and every `m3 setup` re-downloaded the core
-    // — 244 MB on windows-cuda, ~949 MB on linux-cuda, silently, on every run.
-    // The guard was right to distrust a missing version; the fix belongs here,
-    // at the producer.
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     Ok(())
 }

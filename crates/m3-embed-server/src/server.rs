@@ -29,20 +29,10 @@ use crate::security;
 ///
 /// Reported at startup because a backend mismatch is otherwise invisible: a
 /// wheel labelled `-cuda` whose server fell back to CPU presents only as
-/// "embedding got slow". The feature flags are mutually exclusive and enforced
-/// at compile time in `m3-embed-llamacpp`, so at most one arm is ever live.
+/// "embedding got slow". The model load logs the backend actually used (a WARN
+/// when a GPU build lands on the CPU). Owner: `m3_embed_llamacpp`.
 const fn compiled_backend() -> &'static str {
-    if cfg!(feature = "embedded-cuda") {
-        "cuda"
-    } else if cfg!(feature = "embedded-vulkan") {
-        "vulkan"
-    } else if cfg!(feature = "embedded-metal") {
-        "metal"
-    } else if cfg!(feature = "embedded") {
-        "cpu"
-    } else {
-        "none (no embed backend compiled in)"
-    }
+    m3_embed_llamacpp::COMPILED_BACKEND
 }
 
 #[derive(Debug, Deserialize)]
@@ -485,7 +475,7 @@ async fn embed_handler(
     // variant, never on message text.
     let rows = match state.dispatcher.embed_batch(texts).await {
         Ok(rows) => rows,
-        Err(m3_error::M3Error::InputTooLong { tokens, n_ctx }) => {
+        Err(m3_error::M3Error::InputTooLong { tokens, n_ctx, .. }) => {
             return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 // Message preserved verbatim so an older client parsing the
@@ -563,11 +553,8 @@ async fn tokenize_windows_handler(
     State(state): State<Arc<AppState>>,
     ApiJson(req): ApiJson<WindowsRequest>,
 ) -> Result<Json<WindowsResponse>, (StatusCode, String)> {
-    // A budget no window can meet (BOS + EOS alone are 2 tokens) would cut the
-    // text into one window per character.
-    if req.budget < 3 {
-        return Err((StatusCode::BAD_REQUEST, format!("budget must be at least 3 tokens; got {}", req.budget)));
-    }
+    // The budget is validated by the tokenizer itself (inside the BOS/EOS
+    // frame, or above n_ctx, is a Config error), answered 400 below.
     let tok = state.tokenizer.clone();
     let windows = tokio::task::spawn_blocking(move || tok.token_windows(&req.input, req.budget, req.overlap)).await;
     let windows = tokenize_outcome(&state, "/tokenize/windows", 1, windows)?;
@@ -584,6 +571,8 @@ fn tokenize_outcome<T>(
 ) -> Result<T, (StatusCode, String)> {
     let msg = match r {
         Ok(Ok(v)) => return Ok(v),
+        // A caller error (e.g. a budget the model cannot honour), not a fault.
+        Ok(Err(e @ m3_error::M3Error::Config(_))) => return Err((StatusCode::BAD_REQUEST, format!("{route}: {e}"))),
         Ok(Err(e)) => format!("{route} failed: {e}"),
         Err(e) if e.is_panic() => format!("{route} failed: the tokenizer task panicked ({e})"),
         Err(e) => format!("{route} failed: the tokenizer task was cancelled ({e})"),

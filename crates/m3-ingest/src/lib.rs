@@ -15,7 +15,8 @@
 //! non-ignored entry with `(path, size, mtime, is_dir)`; Python applies the
 //! rest of its filter pipeline to that list.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
@@ -27,82 +28,108 @@ pub struct Entry {
     pub path: String,
     pub size: u64,
     /// Modification time as seconds since the Unix epoch (f64 to match Python's
-    /// `st_mtime`). NaN only if the platform clock predates the epoch, which we
-    /// never expect.
+    /// `st_mtime`). 0.0 when the platform reports no mtime or one before the
+    /// epoch.
     pub mtime: f64,
     pub is_dir: bool,
 }
 
+/// An entry the sweep could not read (or would not descend), with the reason.
+/// Accumulated, never fatal — parity with the Python walker.
+#[derive(Debug, Clone)]
+pub struct WalkError {
+    pub path: String,
+    pub error: String,
+}
+
+/// Everything a sweep found, plus every entry it had to skip and why.
+#[derive(Debug, Clone, Default)]
+pub struct Walk {
+    pub entries: Vec<Entry>,
+    pub errors: Vec<WalkError>,
+}
+
+/// Recursion ceiling. With `follow_symlinks` a link back up the tree would
+/// otherwise recurse until the stack overflowed — which aborts the whole
+/// Python process. Directory trees this deep are not real source trees.
+pub const MAX_WALK_DEPTH: usize = 256;
+
 /// Recursively sweep `root`, skipping any directory whose basename is in
 /// `dir_ignores` (the cheap first-stage filter the Python walker applies before
 /// the per-directory gitignore matcher). Symlinked directories are descended
-/// only when `follow_symlinks` is true. `max_depth` is measured from `root`
-/// (`Some(0)` = root's direct children only); `None` = unbounded.
+/// only when `follow_symlinks` is true, each real directory at most once (a
+/// link cycle is reported, not followed). `max_depth` is measured from `root`
+/// (`Some(0)` = root's direct children only); `None` = unbounded up to
+/// [`MAX_WALK_DEPTH`].
 ///
-/// Errors on individual entries (permission denied, races) are skipped, never
-/// fatal — parity with the Python walker, which accumulates errors and
-/// continues. Directories are included in the output (so Python can still see
-/// them) but the recursion itself honors the ignore set.
-pub fn walk_entries(
+/// An unreadable or missing ROOT is an error: an empty result would read as
+/// "an empty directory". Errors below the root (permission denied, races,
+/// cycles, the depth ceiling) are collected in `Walk::errors` and the sweep
+/// continues — parity with the Python walker, which accumulates errors.
+/// Directories are included in the output (so Python can still see them) but
+/// the recursion itself honors the ignore set.
+pub fn walk(
     root: &str,
     dir_ignores: &[String],
     max_depth: Option<usize>,
     follow_symlinks: bool,
-) -> Vec<Entry> {
-    let mut out = Vec::new();
-    let ignore: std::collections::HashSet<&str> = dir_ignores.iter().map(|s| s.as_str()).collect();
-    recurse(
-        Path::new(root),
-        0,
-        max_depth,
-        follow_symlinks,
-        &ignore,
-        &mut out,
-    );
-    out
+) -> m3_error::Result<Walk> {
+    let root_path = Path::new(root);
+    let rd = std::fs::read_dir(root_path).map_err(|e| {
+        m3_error::M3Error::Io(std::io::Error::new(e.kind(), format!("cannot read walk root '{root}': {e}")))
+    })?;
+    let mut w = Walk::default();
+    let ignore: HashSet<&str> = dir_ignores.iter().map(|s| s.as_str()).collect();
+    let mut visited = HashSet::new();
+    if let Ok(c) = std::fs::canonicalize(root_path) {
+        visited.insert(c);
+    }
+    let ctx = Ctx { max_depth, follow_symlinks, ignore: &ignore };
+    recurse(rd, 0, &ctx, &mut visited, &mut w);
+    Ok(w)
 }
 
-fn recurse(
-    dir: &Path,
-    depth: usize,
+struct Ctx<'a> {
     max_depth: Option<usize>,
     follow_symlinks: bool,
-    ignore: &std::collections::HashSet<&str>,
-    out: &mut Vec<Entry>,
-) {
-    if let Some(md) = max_depth {
-        if depth > md {
-            return;
-        }
-    }
-    let rd = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(e) => {
-            log::debug!("read_dir failed at {}: {e}", dir.display());
-            return;
-        }
-    };
+    ignore: &'a HashSet<&'a str>,
+}
+
+fn record(w: &mut Walk, path: &Path, error: impl std::fmt::Display) {
+    w.errors.push(WalkError { path: path.to_string_lossy().into_owned(), error: error.to_string() });
+}
+
+fn recurse(rd: std::fs::ReadDir, depth: usize, ctx: &Ctx<'_>, visited: &mut HashSet<PathBuf>, w: &mut Walk) {
     for entry in rd {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                record(w, Path::new("(directory listing)"), e);
+                continue;
+            }
         };
         let path = entry.path();
         // Use symlink_metadata first so we can apply the symlink policy without
         // following; only follow into the target when allowed.
         let lmeta = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                record(w, &path, e);
+                continue;
+            }
         };
         let is_symlink = lmeta.file_type().is_symlink();
-        if is_symlink && !follow_symlinks {
+        if is_symlink && !ctx.follow_symlinks {
             continue;
         }
         // Resolve the effective metadata (follow when permitted).
-        let meta = if is_symlink && follow_symlinks {
+        let meta = if is_symlink {
             match std::fs::metadata(&path) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(e) => {
+                    record(w, &path, format!("broken symlink: {e}"));
+                    continue;
+                }
             }
         } else {
             lmeta
@@ -117,29 +144,45 @@ fn recurse(
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        if is_dir {
-            let basename = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            // Cheap dir-ignore stage (parity with `bn in dir_ignores`).
-            if ignore.contains(basename.as_str()) {
-                continue;
+        if !is_dir {
+            w.entries.push(Entry { path: path_str, size: meta.len(), mtime, is_dir: false });
+            continue;
+        }
+        let basename = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        // Cheap dir-ignore stage (parity with `bn in dir_ignores`).
+        if ctx.ignore.contains(basename.as_str()) {
+            continue;
+        }
+        w.entries.push(Entry { path: path_str, size: 0, mtime, is_dir: true });
+        let child_depth = depth + 1;
+        if ctx.max_depth.is_some_and(|md| child_depth > md) {
+            continue;
+        }
+        if child_depth > MAX_WALK_DEPTH {
+            record(w, &path, format!("not descended: deeper than the {MAX_WALK_DEPTH}-level walk ceiling"));
+            continue;
+        }
+        if ctx.follow_symlinks {
+            match std::fs::canonicalize(&path) {
+                Ok(real) => {
+                    if !visited.insert(real.clone()) {
+                        record(
+                            w,
+                            &path,
+                            format!("not descended: {} was already walked (symlink cycle or alias)", real.display()),
+                        );
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    record(w, &path, format!("cannot resolve: {e}"));
+                    continue;
+                }
             }
-            out.push(Entry {
-                path: path_str,
-                size: 0,
-                mtime,
-                is_dir: true,
-            });
-            recurse(&path, depth + 1, max_depth, follow_symlinks, ignore, out);
-        } else {
-            out.push(Entry {
-                path: path_str,
-                size: meta.len(),
-                mtime,
-                is_dir: false,
-            });
+        }
+        match std::fs::read_dir(&path) {
+            Ok(rd) => recurse(rd, child_depth, ctx, visited, w),
+            Err(e) => record(w, &path, e),
         }
     }
 }
@@ -200,12 +243,14 @@ mod tests {
         std::fs::write(dir.join("keep/a.txt"), b"a").unwrap();
         std::fs::write(dir.join("node_modules/b.txt"), b"b").unwrap();
 
-        let entries = walk_entries(
+        let entries = walk(
             &dir.to_string_lossy(),
             &["node_modules".to_string()],
             None,
             false,
-        );
+        )
+        .unwrap()
+        .entries;
         let files: Vec<&str> = entries
             .iter()
             .filter(|e| !e.is_dir)
@@ -225,7 +270,7 @@ mod tests {
         std::fs::write(dir.join("top.txt"), b"t").unwrap();
         std::fs::write(dir.join("sub/deep.txt"), b"d").unwrap();
 
-        let entries = walk_entries(&dir.to_string_lossy(), &[], Some(0), false);
+        let entries = walk(&dir.to_string_lossy(), &[], Some(0), false).unwrap().entries;
         let files: Vec<&str> = entries
             .iter()
             .filter(|e| !e.is_dir)
@@ -233,6 +278,26 @@ mod tests {
             .collect();
         assert!(files.iter().any(|p| p.ends_with("top.txt")));
         assert!(!files.iter().any(|p| p.ends_with("deep.txt")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_missing_root_is_an_error_not_an_empty_tree() {
+        let e = walk("/nonexistent/m3/ingest/root", &[], None, false).unwrap_err();
+        assert!(e.to_string().contains("cannot read walk root"), "{e}");
+        assert!(matches!(e, m3_error::M3Error::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound), "{e}");
+    }
+
+    /// A link back up the tree is walked once and reported, not followed
+    /// until the stack overflows (which aborted Python).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_is_reported_not_followed() {
+        let dir = std::env::temp_dir().join("m3_ingest_cycle_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("a/loop")).unwrap();
+        let w = walk(&dir.to_string_lossy(), &[], None, true).unwrap();
+        assert!(w.errors.iter().any(|e| e.error.contains("already walked")), "{:?}", w.errors);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

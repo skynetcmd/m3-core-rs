@@ -91,3 +91,10 @@ fn expand_respects_limit() {
     let got = g.expand(&["a"], 3, 2);
     assert_eq!(got.len(), 2);
 }
+
+#[test]
+fn expand_with_limit_zero_returns_nothing() {
+    let mut g = m3_graph::GraphIndex::new();
+    g.add_edge("x", "y", "rel", 1.0);
+    assert!(g.expand(&["x"], 2, 0).is_empty());
+}

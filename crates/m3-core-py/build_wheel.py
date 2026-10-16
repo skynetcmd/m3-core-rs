@@ -91,6 +91,11 @@ def package_name(os_tok: str, backend: str) -> str:
     return f"m3-core-rs-{os_tok}-{backend}"
 
 
+def exe_name(os_tok: str) -> str:
+    """The embed-server binary's file name for the TARGET OS (not the host)."""
+    return _EMBED_SERVER_BIN + (".exe" if os_tok == "windows" else "")
+
+
 def host_os() -> str:
     """Map the host platform to our OS token (windows/linux/macos)."""
     if sys.platform.startswith("win"):
@@ -132,7 +137,7 @@ def _patched_name(name: str):
         _PYPROJECT.write_text(original, encoding="utf-8")
 
 
-def _set_exec_bit(wheel: pathlib.Path) -> bool:
+def _set_exec_bit(wheel: pathlib.Path, os_tok: str) -> bool:
     """Give the staged server binary an executable mode INSIDE the wheel.
 
     All 35 shipped 3.9.20 wheels store this binary non-executable, so the mode
@@ -156,10 +161,11 @@ def _set_exec_bit(wheel: pathlib.Path) -> bool:
     ZIP entry's mode does NOT invalidate RECORD (which carries content hashes
     and sizes only — verified: 0 mismatches before and after).
 
-    Skipped on Windows: there is no exec bit there, `os.chmod` ignores 0o111,
-    and `os.access(X_OK)` is true for every file.
+    Skipped for Windows wheels (decided by the TARGET os token, not the build
+    host): there is no exec bit there, `os.chmod` ignores 0o111, and
+    `os.access(X_OK)` is true for every file.
     """
-    if sys.platform.startswith("win"):
+    if os_tok == "windows":
         return False
     names = {_EMBED_SERVER_BIN, _EMBED_SERVER_BIN + ".exe"}
     with zipfile.ZipFile(wheel) as zin:
@@ -197,7 +203,7 @@ def _set_exec_bit(wheel: pathlib.Path) -> bool:
 
 @contextlib.contextmanager
 
-def _staged_embed_server(features: list[str], release: bool):
+def _staged_embed_server(features: list[str], release: bool, os_tok: str):
     """Build the m3-embed-server binary with the SAME backend as this wheel and
     stage it under python/m3_core_rs/ so maturin bundles it into the wheel.
 
@@ -212,7 +218,7 @@ def _staged_embed_server(features: list[str], release: bool):
 
     Cleans up the staged copy afterward so the source tree is never left dirty.
     """
-    exe = _EMBED_SERVER_BIN + (".exe" if sys.platform.startswith("win") else "")
+    exe = exe_name(os_tok)
     cmd = ["cargo", "build", "-p", "m3-embed-server"]
     if release:
         cmd.append("--release")
@@ -308,7 +314,7 @@ def _staged_embed_server(features: list[str], release: bool):
     # So try the hyphen form, then the underscore form. Do not "simplify" this
     # to one name: the two conventions are set by different tools.
     staged_pdb = None
-    if sys.platform.startswith("win"):
+    if os_tok == "windows":
         pdb_src = built.with_suffix(".pdb")
         if not pdb_src.exists():
             pdb_src = built.with_name(built.stem.replace("-", "_") + ".pdb")
@@ -342,8 +348,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="target OS token (default: inferred from host)")
     parser.add_argument("--out", default=None,
                         help="maturin --out directory (default: dist/<package>)")
-    parser.add_argument("--release", action="store_true", default=True,
-                        help="build in release profile (default: on)")
+    # BooleanOptionalAction: `store_true` with default=True could never be
+    # turned off. `--no-release` builds the dev profile.
+    parser.add_argument("--release", action=argparse.BooleanOptionalAction, default=True,
+                        help="build in release profile (default: on; --no-release for dev)")
     parser.add_argument("maturin_args", nargs="*",
                         help="extra args passed through to `maturin build` "
                              "(put after a literal -- )")
@@ -384,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
     # build), then build the wheel with the binary present in python-source so
     # maturin bundles it. Both happen under the patched package name.
     started = time.time()
-    with _patched_name(name), _staged_embed_server(features, args.release):
+    with _patched_name(name), _staged_embed_server(features, args.release, os_tok):
         proc = subprocess.run(cmd, cwd=_HERE, env=os.environ.copy())
     if proc.returncode != 0:
         return proc.returncode
@@ -412,8 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     for wheel in wheels:
         with zipfile.ZipFile(wheel) as z:
             members = set(z.namelist())
-        exe_member = f"m3_core_rs/{_EMBED_SERVER_BIN}" + (
-            ".exe" if sys.platform.startswith("win") else "")
+        exe_member = f"m3_core_rs/{exe_name(os_tok)}"
         if exe_member not in members:
             print(f"[build_wheel] error: {wheel.name} does not contain "
                   f"{exe_member}", file=sys.stderr)
@@ -426,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
         # stores faithfully (verified on pip 25.1.1/25.2/26.0/26.2), so getting
         # this right here is what makes a downstream workaround unnecessary.
         # verify_wheels.py asserts the result, so a regression fails the build.
-        if _set_exec_bit(wheel):
+        if _set_exec_bit(wheel, os_tok):
             print(f"[build_wheel] set the exec bit on {exe_member} "
                   f"(maturin stored it non-executable)")
         # Scrub the builder's absolute paths out of maturin's SBOM. Done here so
@@ -437,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         if scrubbed:
             print(f"[build_wheel] scrubbed {scrubbed} local path ref(s) from "
                   f"the SBOM in {wheel.name}")
-        if sys.platform.startswith("win"):
+        if os_tok == "windows":
             pdbs = [m for m in members if m.endswith(".pdb")]
             if pdbs:
                 print(f"[build_wheel] verified: wheel contains {pdbs[0]}")

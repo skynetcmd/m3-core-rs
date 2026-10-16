@@ -391,11 +391,12 @@ jobs:
           done
           ls -la "$GITHUB_WORKSPACE"/dist/*.whl
 
-      # Import-smoke each CPU wheel on its own interpreter (runners have no GPU,
-      # so only CPU wheels are runtime-tested; GPU wheels are import-verified
-      # off-CI on a device — see WHEEL_BUILD_GUIDE.md). The CPU wheel is the
-      # plain vector-ops build (no llama.cpp / no EmbeddedEmbedder by design),
-      # so the smoke test must NOT assert EmbeddedEmbedder.
+      # Smoke-test each CPU wheel on its own interpreter (runners have no GPU,
+      # so only CPU wheels can be imported here; GPU wheels are import-verified
+      # off-CI on a device — see WHEEL_BUILD_GUIDE.md). Every wheel, CPU
+      # included, is built with `embedded` (build_wheel.py's _MATRIX), so the
+      # smoke run ASSERTS __build_backend__ == this job's backend and that
+      # EmbeddedEmbedder exists, then runs the full tests/smoke.py.
       # Run each per-version wheel on its matching interpreter. setup-python
       # exposes the non-default versions differently per OS: on Linux/macOS as
       # `pythonX.Y` on PATH, but on Windows there is no `python3.12.exe` — the
@@ -428,7 +429,10 @@ jobs:
               exit 1
             fi
             $py -m pip install --force-reinstall "$whl"
-            $py -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
+            # Run from outside the checkout so `import m3_core_rs` resolves the
+            # INSTALLED wheel, not crates/m3-core-py/python/.
+            (cd "$RUNNER_TEMP" && M3_SMOKE_EXPECT_BACKEND="${{ matrix.backend }}" \
+              $py "$GITHUB_WORKSPACE/crates/m3-core-py/tests/smoke.py")
           done
 
       # GATE: nothing in CI verified wheel CONTENTS until now, which is how

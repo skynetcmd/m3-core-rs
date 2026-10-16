@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify m3-core-rs wheels ship the m3-embed-server shared-embedder binary.
 
-Every published wheel must bundle BOTH native artifacts (see docs/BUILD_WHEELS.md):
+Every published wheel must bundle BOTH native artifacts (see WHEEL_BUILD_GUIDE.md):
   1. the Python extension  m3_core_rs/m3_core_rs.*.{pyd,so}
   2. the shared server bin m3_core_rs/m3-embed-server[.exe]
 
@@ -42,6 +42,19 @@ from pathlib import Path
 _MIN_BIN_MB = {"cpu": 2, "vulkan": 30, "cuda": 60, "metal": 2}
 
 
+# Symbols only a GPU llama.cpp build contains. A CPU wheel carrying any of them
+# shipped the wrong backend's binary (the size floor cannot catch that: it
+# only bounds GPU wheels from below).
+_GPU_SYMBOLS = {b"ggml_backend_cuda": "CUDA", b"ggml_backend_vk": "Vulkan", b"ggml_backend_metal": "Metal"}
+
+
+def _is_windows_wheel(wheel_name: str) -> bool:
+    """From the wheel's PLATFORM TAG (the last dash field), e.g. win_amd64.
+    A `"win" in name` substring test also matches `darwin` and any package
+    name containing "win"."""
+    return wheel_name.removesuffix(".whl").rsplit("-", 1)[-1].startswith("win")
+
+
 def _backend_of(wheel_name: str) -> str | None:
     for tok in ("cpu", "cuda", "vulkan", "metal"):
         if f"_{tok}-" in wheel_name or f"-{tok}-" in wheel_name:
@@ -69,7 +82,8 @@ def _record_entry(z: zipfile.ZipFile, target: str) -> tuple[str, int] | None:
 def verify_wheel(path: Path) -> list[str]:
     """Return a list of problem strings (empty = wheel OK)."""
     problems: list[str] = []
-    exe = "m3-embed-server.exe" if "win" in path.name else "m3-embed-server"
+    is_win = _is_windows_wheel(path.name)
+    exe = "m3-embed-server.exe" if is_win else "m3-embed-server"
     target = f"m3_core_rs/{exe}"
     with zipfile.ZipFile(path) as z:
         names = z.namelist()
@@ -98,6 +112,19 @@ def verify_wheel(path: Path) -> list[str]:
                 f"{backend} server only {mb:.1f} MB (< {floor} MB floor) "
                 "— wrong backend bundled?"
             )
+
+        # 3b. A CPU wheel must contain no GPU backend, in the server binary or
+        # the extension module.
+        if backend == "cpu":
+            ext = [n for n in names if n.endswith((".pyd", ".so")) and "m3_core_rs" in n]
+            for member in [target, *ext]:
+                blob = raw if member == target else z.read(member)
+                found = [label for needle, label in _GPU_SYMBOLS.items() if needle in blob]
+                if found:
+                    problems.append(
+                        f"cpu wheel's {member} contains {'/'.join(found)} backend symbols "
+                        "— a GPU build was bundled"
+                    )
 
         # 4. RECORD lists it with a correct sha256 + size (else pip rejects it).
         claimed = _record_entry(z, target)
@@ -145,7 +172,7 @@ def verify_wheel(path: Path) -> list[str]:
         # Windows has no exec bit (`os.chmod` ignores 0o111 and `os.access`
         # X_OK is true for every file), so asserting one there would be
         # vacuously green at best and a false failure at worst.
-        if "win" not in path.name:
+        if not is_win:
             full = info.external_attr >> 16
             mode = full & 0o7777
             if full == 0:
@@ -205,6 +232,7 @@ def _synthetic_wheel(
     win: bool = False,
     sbom_root: str | None = None,
     type_bits: bool = True,
+    binary_marker: bytes = b"",
 ) -> Path:
     """A minimal but VALID cpu wheel, so the only variable is the one under test.
 
@@ -226,7 +254,7 @@ def _synthetic_wheel(
     exe = "m3-embed-server.exe" if win else "m3-embed-server"
     name = f"m3_core_rs_{'windows' if win else 'linux'}_cpu-9.9.9-cp313-cp313-{plat}.whl"
     whl = dirpath / name
-    binary = b"\0" * (3 * 1024 * 1024)          # clear the 2 MB cpu floor
+    binary = binary_marker + b"\0" * (3 * 1024 * 1024)  # clear the 2 MB cpu floor
     so = b"\0" * 1024
     members = {
         f"m3_core_rs/{exe}": binary,
@@ -313,6 +341,18 @@ def selftest() -> int:
         expect("Windows wheels are exempt (no exec bit there)",
                not [p for p in probs if "not executable" in p], f"problems={probs}")
 
+        # Check 3b: a CPU wheel carrying a GPU backend is caught.
+        (d / "gpu").mkdir(parents=True)
+        g = _synthetic_wheel(d / "gpu", mode=0o755, binary_marker=b"ggml_backend_cuda_init")
+        probs = verify_wheel(g)
+        expect("a cpu wheel with CUDA symbols is rejected",
+               any("CUDA backend symbols" in p for p in probs), f"problems={probs}")
+
+        # The platform tag, not a substring, decides "Windows".
+        expect("platform tag decides windows",
+               _is_windows_wheel("m3_core_rs_windows_cpu-1-cp313-cp313-win_amd64.whl")
+               and not _is_windows_wheel("m3_core_rs_winx_cpu-1-cp313-cp313-macosx_11_0_arm64.whl"))
+
         # Check 6: the SBOM leak guard must fire on a builder path and stay
         # quiet on CI's generic one, or it is decoration.
         (d / "leak").mkdir(parents=True)
@@ -366,7 +406,7 @@ def main(argv: list[str]) -> int:
     ok = bad = 0
     for w in wheels:
         problems = verify_wheel(w)
-        exe = "m3-embed-server.exe" if "win" in w.name else "m3-embed-server"
+        exe = "m3-embed-server.exe" if _is_windows_wheel(w.name) else "m3-embed-server"
         try:
             with zipfile.ZipFile(w) as z:
                 sz = z.getinfo(f"m3_core_rs/{exe}").file_size / (1024 * 1024)

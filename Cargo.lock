@@ -1310,6 +1310,7 @@ dependencies = [
 name = "m3-ner-ort"
 version = "3.10.14"
 dependencies = [
+ "log",
  "m3-dispatcher",
  "m3-error",
  "ndarray 0.16.1",
@@ -1333,6 +1334,7 @@ name = "m3-redact"
 version = "3.10.14"
 dependencies = [
  "criterion",
+ "log",
  "m3-error",
  "regex",
 ]
@@ -1352,6 +1354,7 @@ version = "3.10.14"
 dependencies = [
  "bytemuck",
  "criterion",
+ "log",
  "m3-error",
  "proptest",
  "rand 0.8.6",

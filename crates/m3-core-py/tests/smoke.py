@@ -8,8 +8,9 @@ How to run:
     maturin develop          # builds + installs m3_core_rs into the active venv
     python tests/smoke.py
 
-Status: written but unverified-by-execution in this environment (maturin not
-available here). Build correctness is covered by `cargo build -p m3-core-py`.
+release.yml runs it against every CPU wheel it builds. Set
+M3_SMOKE_EXPECT_BACKEND (e.g. "cpu") to also assert __build_backend__ and the
+presence of EmbeddedEmbedder.
 """
 
 import os
@@ -131,8 +132,10 @@ def test_ner() -> None:
 
 
 def test_dispatcher_and_env() -> None:
-    assert m.estimate_tokens("a" * 40) == 10
-    assert m.estimate_tokens("") == 1
+    # max(bytes // 3, chars) + 2 (the BOS/EOS frame), never under-counting.
+    assert m.estimate_tokens("a" * 40) == 42
+    assert m.estimate_tokens("") == 2
+    assert m.estimate_tokens("\u6570" * 10) == 12  # 30 bytes // 3 = 10 = chars
 
     # defaults (assuming no M3_* env vars set)
     cfg = m.DispatcherConfig()
@@ -245,9 +248,82 @@ def test_version() -> None:
     assert seen, "no m3-core-rs* distribution found"
 
 
+def test_exceptions() -> None:
+    """Typed exceptions, each still the builtin it used to be."""
+    assert issubclass(m.InputTooLong, m.M3Error) and issubclass(m.InputTooLong, ValueError)
+    assert issubclass(m.BackendError, OSError) and issubclass(m.IoError, OSError)
+    try:
+        m.cosine_batch([1.0, 0.0], [[1.0, 0.0], [1.0, 0.0, 0.0]])
+    except ValueError as e:  # the pre-hierarchy contract
+        assert isinstance(e, m.VectorDimMismatch), type(e)
+        assert (e.expected, e.got, e.index) == (2, 3, 1), (e.expected, e.got, e.index)
+    else:
+        raise AssertionError("dimension mismatch not raised")
+    for bad in (-1.0, float("nan"), float("inf")):
+        try:
+            m.CircuitBreaker(2, bad)
+        except ValueError as e:
+            assert isinstance(e, m.ConfigError) and "reset_after_secs" in str(e), e
+        else:
+            raise AssertionError(f"CircuitBreaker accepted {bad}")
+    try:
+        m.fuse([m.RankRow("a", 1.0, "ftss")], [])
+    except m.ConfigError as e:
+        assert "ftss" in str(e), e
+    else:
+        raise AssertionError("unknown RankRow.source accepted")
+    try:
+        m.decode_spans([0.9, 0.1, 0.2], (2, 1, 2), 0.5)
+    except m.ConfigError:
+        pass
+    else:
+        raise AssertionError("decode_spans accepted a shape that does not fit")
+
+
+def test_vector_index() -> None:
+    idx = m.VectorIndex(2)
+    idx.upsert_packed([1, 2], struct.pack("<4f", 1.0, 0.0, 0.0, 1.0))
+    assert len(idx) == 2 and idx.search([1.0, 0.0], 1)[0][0] == 1
+    try:
+        idx.upsert_packed([3], struct.pack("<2f", float("nan"), 1.0))
+    except m.ConfigError as e:
+        assert "key 3" in str(e), e
+    else:
+        raise AssertionError("NaN vector accepted")
+    assert len(idx) == 2
+
+
+def test_fs_walk() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "a.txt"), "w").close()
+        entries, errors = m.fs_walk_with_errors(d, [])
+        assert [os.path.basename(e["path"]) for e in entries] == ["a.txt"] and errors == []
+        assert len(m.fs_walk(d, [])) == 1
+    try:
+        m.fs_walk(os.path.join(d, "gone"), [])
+    except OSError as e:
+        assert isinstance(e, m.IoError), type(e)
+    else:
+        raise AssertionError("a missing root returned instead of raising")
+
+
+def test_build_backend() -> None:
+    expected = os.environ.get("M3_SMOKE_EXPECT_BACKEND")
+    assert m.__build_backend__ == m.embed_backend_label(), (m.__build_backend__, m.embed_backend_label())
+    if expected:
+        assert m.__build_backend__ == expected, (m.__build_backend__, expected)
+        assert hasattr(m, "EmbeddedEmbedder"), "every built wheel ships EmbeddedEmbedder"
+
+
 def main() -> None:
     tests = [
         test_version,
+        test_build_backend,
+        test_exceptions,
+        test_vector_index,
+        test_fs_walk,
         test_hash,
         test_vector,
         test_redact,

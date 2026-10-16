@@ -82,6 +82,14 @@ jobs:
     - name: cargo check (m3-embed-server, embedded feature)
       run: cargo check -p m3-embed-server --features embedded --all-targets
 
+    # m3-core-py's `embedded` and `onnx` features gate the EmbeddedEmbedder /
+    # OrtNer bindings — the code every released wheel ships — and the default
+    # check above compiles neither. `embedded` reuses the llama.cpp cmake
+    # build the embed-server step already does; `onnx` uses ort's
+    # load-dynamic, so no native ONNX Runtime is needed to build.
+    - name: cargo check (m3-core-py, embedded + onnx features)
+      run: cargo check -p m3-core-py --features embedded,onnx --all-targets
+
     - name: cargo test (workspace)
       run: cargo test --workspace
 
@@ -100,3 +108,11 @@ jobs:
     # default-feature run says nothing about it.
     - name: cargo clippy (m3-embed-server, embedded feature)
       run: cargo clippy -p m3-embed-server --features embedded --all-targets -- -D warnings
+
+    - name: cargo clippy (m3-core-py, embedded + onnx features)
+      run: cargo clippy -p m3-core-py --features embedded,onnx --all-targets -- -D warnings
+
+    # The selftest proves verify_wheels.py's checks can fail (exec bit, SBOM
+    # leak, GPU symbols in a CPU wheel). Pure stdlib; no wheel needed.
+    - name: verify_wheels.py selftest
+      run: python crates/m3-core-py/verify_wheels.py --selftest

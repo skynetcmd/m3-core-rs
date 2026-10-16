@@ -614,7 +614,10 @@ def build_one(
 
 
 def smoke_test(os_tok: str, version: str, backend: str) -> bool:
-    """Install one built wheel into a throwaway uv venv and check the backend label."""
+    """Install one built wheel into a throwaway uv venv and check it is the
+    backend it claims: `__build_backend__` and `embed_backend_label()` must
+    both equal `backend`, and `EmbeddedEmbedder` must exist. (Any non-empty
+    label used to pass, so a CPU wheel in a cuda directory went unnoticed.)"""
     out_dir = _REPO_ROOT / "ci-wheels" / f"local-{version}" / f"{os_tok}-{backend}"
     wheels = sorted(out_dir.glob("*.whl"))
     if not wheels:
@@ -631,18 +634,24 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
             subprocess.run([uv, "venv", str(venv)], capture_output=True)
         py = venv / ("Scripts" if os_tok == "windows" else "bin") / (
             "python.exe" if os_tok == "windows" else "python")
-        if subprocess.run([uv, "pip", "install", "--python", str(py), str(wheel)],
-                          capture_output=True).returncode != 0:
-            print(f"[smoke] {os_tok}/{backend}: install failed", file=sys.stderr)
+        inst = subprocess.run([uv, "pip", "install", "--python", str(py), str(wheel)],
+                              capture_output=True, text=True)
+        if inst.returncode != 0:
+            print(f"[smoke] {os_tok}/{backend}: install of {wheel.name} failed "
+                  f"(exit {inst.returncode}):\n{inst.stderr.strip()}", file=sys.stderr)
             return False
         r = subprocess.run(
             [str(py), "-c",
-             "import m3_core_rs; print(m3_core_rs.embed_backend_label())"],
+             "import m3_core_rs as m; print(m.__build_backend__, m.embed_backend_label(), "
+             "hasattr(m, 'EmbeddedEmbedder'))"],
             capture_output=True, text=True)
-        label = r.stdout.strip()
-        ok = r.returncode == 0 and label != ""
-        print(f"[smoke] {os_tok}/{backend}: import {'OK' if ok else 'FAILED'} "
-              f"-> backend={label or '(error)'}")
+        got = r.stdout.split()
+        ok = r.returncode == 0 and got == [backend, backend, "True"]
+        print(f"[smoke] {os_tok}/{backend}: {'OK' if ok else 'FAILED'} -> "
+              f"__build_backend__, embed_backend_label, EmbeddedEmbedder = "
+              f"{got or '(import error)'}; expected [{backend!r}, {backend!r}, 'True']")
+        if r.returncode != 0:
+            print(r.stderr.strip(), file=sys.stderr)
         return ok
 
 
@@ -697,8 +706,8 @@ def main(argv: list[str] | None = None) -> int:
         use_zig = (os_tok == "linux" and backend == "cpu")
         rc = build_one(backend, os_tok, version, interps, use_zig=use_zig)
         rc_total = rc_total or rc
-        if rc == 0 and args.smoke:
-            smoke_test(os_tok, version, backend)
+        if rc == 0 and args.smoke and not smoke_test(os_tok, version, backend):
+            rc_total = rc_total or 3
 
     return rc_total
 

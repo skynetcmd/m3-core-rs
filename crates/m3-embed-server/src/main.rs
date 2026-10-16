@@ -220,6 +220,9 @@ fn run_foreground() -> anyhow::Result<()> {
     let file_cfg = config::load_file_config(&config::default_config_path())?;
     let cfg = config::resolve(&file_cfg)?;
 
+    // Still single-threaded here: the one safe point for llama.cpp's env
+    // (GGML_CUDA_DISABLE_GRAPHS on CUDA builds; a no-op otherwise).
+    m3_embed_llamacpp::prepare_process_env();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

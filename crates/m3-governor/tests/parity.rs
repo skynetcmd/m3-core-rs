@@ -165,3 +165,12 @@ fn sanity_fix_skipped_when_limit_is_100() {
     assert_eq!(cfg.initial_limit, 99);
     assert_eq!(cfg.limit_threshold, 100);
 }
+
+#[test]
+fn nan_inputs_pace_most_restrictively_not_continuous() {
+    let cfg = GovernorConfig::new(70, 90);
+    assert_eq!(cfg.decide(10.0, f64::NAN).mode, PacingMode::Halted);
+    assert_eq!(cfg.decide(f64::NAN, 1000.0).mode, PacingMode::Halted);
+    let no_cap = GovernorConfig::new(70, 100);
+    assert_eq!(no_cap.decide(f64::NAN, 1000.0).mode, PacingMode::Throttled);
+}

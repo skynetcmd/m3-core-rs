@@ -10,8 +10,8 @@ description = "llama.cpp embedding backend for m3-dispatcher."
 [features]
 default = []
 # Real llama-cpp-rs FFI backend. Enabling this cmake-builds llama.cpp from
-# source (CPU-only here) via llama-cpp-sys-2. The default build ships the
-# HTTP backend only and pulls no llama.cpp dependency at all.
+# source via llama-cpp-sys-2 (CPU; the embedded-* features add a GPU backend).
+# The default build pulls no llama.cpp dependency at all.
 embedded = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:crossbeam-channel"]
 
 # Wave 9.0 — GPU backends. Mutually exclusive: pick exactly one per build.
@@ -36,7 +36,8 @@ m3-dispatcher = { workspace = true }
 # lines an operator needs when the footprint or the backend looks wrong.
 log = "0.4"
 tokio = { version = "1", features = ["rt", "macros"] }
-# Only compiled when the `embedded` feature is on. CPU-only: no cuda/metal/etc.
+# Only compiled when the `embedded` feature is on; GPU backends come from the
+# embedded-* features above.
 llama-cpp-2 = { version = "0.1.156", optional = true, default-features = false }
 # Wave-3 fix #1: needed for the `LLAMA_FLASH_ATTN_TYPE_ENABLED` enum constant
 # passed to `LlamaContextParams::with_flash_attention_policy`. The llama-cpp-2

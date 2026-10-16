@@ -76,11 +76,20 @@ pub struct DispatcherConfig {
     pub circuit_breaker: BreakerCfg,
 }
 
+/// Default concurrent streams. `m3-core-py`'s `M3_EMBED_STREAMS` layer and
+/// this `Default` both read it, so the two cannot drift.
+pub const DEFAULT_STREAMS: usize = 8;
+/// Default coalescing-window width in milliseconds (`M3_EMBED_COALESCE_MS`).
+pub const DEFAULT_COALESCE_WINDOW_MS: u64 = 3;
+
 impl Default for DispatcherConfig {
     fn default() -> Self {
         Self {
-            streams: 8,
-            coalesce_window_ms: 3,
+            streams: DEFAULT_STREAMS,
+            coalesce_window_ms: DEFAULT_COALESCE_WINDOW_MS,
+            // ⚠ Differs from the `M3_EMBED_MAX_BATCH_TOKENS` default, which is
+            // streams * n_ctx (m3-core-py config.rs). Rust callers that build
+            // a config from `Default` get this tighter ceiling.
             max_batch_tokens: 2048,
             length_buckets: vec![64, 256, 1024, 4096],
             circuit_breaker: BreakerCfg::default(),
@@ -97,7 +106,9 @@ impl Default for DispatcherConfig {
 /// and reads as observability while providing none.
 #[derive(Debug, Clone, Default)]
 pub struct DispatcherStats {
+    /// Backend calls running now.
     pub in_flight: usize,
+    /// Single-shot jobs accepted and not yet handed to the backend.
     pub queue_depth: usize,
     /// p50 over the recent window; `None` when no batch has completed yet.
     pub p50_ms: Option<f64>,
@@ -188,7 +199,7 @@ enum BreakerState {
     HalfOpen,
 }
 
-// Encoded breaker states for the lock-free fast path (Fix #28).
+// Encoded breaker states for the lock-free fast path.
 const BREAKER_CLOSED: u8 = 0;
 const BREAKER_OPEN: u8 = 1;
 const BREAKER_HALF_OPEN: u8 = 2;
@@ -212,28 +223,60 @@ fn is_client_error(e: &M3Error) -> bool {
     matches!(e, M3Error::InputTooLong { .. })
 }
 
-/// One error for each of several waiters (`M3Error` is not `Clone`). Keeps the
-/// typed `InputTooLong` so the HTTP layer can still answer 413, and keeps a
-/// `Backend` message as is rather than prefixing "backend error: " twice.
-fn share_err(e: &M3Error) -> M3Error {
-    match e {
-        M3Error::InputTooLong { tokens, n_ctx } => M3Error::InputTooLong { tokens: *tokens, n_ctx: *n_ctx },
-        M3Error::Backend(m) => M3Error::Backend(m.clone()),
-        other => M3Error::Backend(other.to_string()),
+/// Counts a batch as in flight for exactly as long as this guard lives, so a
+/// cancelled caller (dropped future) or a panicking backend still decrements.
+struct InFlight(Arc<AtomicUsize>);
+
+impl InFlight {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        InFlight(counter.clone())
     }
 }
 
-/// N consecutive failures open the breaker; after `open_secs` a single
-/// half-open probe is allowed, and a success closes it again.
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Removes `n` jobs from the dispatcher's queued count when dropped.
+struct Dequeue(Arc<AtomicUsize>, usize);
+
+impl Drop for Dequeue {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::SeqCst);
+    }
+}
+
+/// `rows` from a backend that was handed `sent` texts, or an error carrying
+/// both counts: a short reply must not be zipped against the callers.
+fn checked_rows(rows: Vec<Vec<f32>>, sent: usize) -> Result<Vec<Vec<f32>>> {
+    if rows.len() == sent {
+        Ok(rows)
+    } else {
+        Err(M3Error::Backend(format!(
+            "backend returned {} embedding rows for {sent} input texts",
+            rows.len()
+        )))
+    }
+}
+
+/// N consecutive failures open the breaker; after `open_secs` exactly one
+/// half-open probe is admitted, and its success closes the breaker again (its
+/// failure re-opens it). A probe that never reports — its caller was
+/// cancelled, or it failed with a client error that records nothing — is
+/// presumed lost after another `open_secs`, and the next caller probes.
 pub struct CircuitBreaker {
     cfg: BreakerCfg,
+    /// (state, consecutive failures, time of the last transition: opened at
+    /// when Open, probe admitted at when HalfOpen).
     state: Mutex<(BreakerState, usize, Option<Instant>)>,
     /// The latest failure's message, cleared on success. Locked after `state`.
     last_error: std::sync::Mutex<Option<String>>,
-    /// Fix #28 — lock-free state for the Closed-fast-path.
+    /// Lock-free copy of the state for the Closed fast path.
     state_fast: AtomicU8,
-    /// Fix #28 — debug-only counter incremented when `check()` returns via
-    /// the lock-free path. Compiled out in release.
+    /// Test-only count of `check()` calls answered by the lock-free path.
     #[cfg(test)]
     fast_path_hits: AtomicUsize,
 }
@@ -250,40 +293,61 @@ impl CircuitBreaker {
         }
     }
 
-    /// Returns Err fast when the breaker is open and the cooldown has not elapsed.
+    /// Admit a call, or refuse it while the breaker is open. Past the cooldown
+    /// the FIRST caller is admitted as the half-open probe and everyone else is
+    /// refused until it reports (or is presumed lost; see the type doc).
     ///
-    /// Fix #28 — Closed-state check is lock-free. When the breaker is Closed
-    /// (the overwhelmingly common case), this loads a single `AtomicU8` with
-    /// Acquire ordering and returns Ok without touching the mutex. Any other
-    /// state falls through to the original mutex-guarded transition logic.
+    /// The Closed state — the overwhelmingly common case — is answered from a
+    /// single `AtomicU8` load without touching the mutex.
     pub async fn check(&self) -> Result<()> {
+        self.gate(true).await
+    }
+
+    /// `check` without admitting: refuses exactly when `check` would, but never
+    /// claims the half-open probe. For an early fast-fail in front of a queue
+    /// whose consumer calls `check` itself — two admitting checks on one path
+    /// would refuse the very probe the first one admitted.
+    pub async fn peek(&self) -> Result<()> {
+        self.gate(false).await
+    }
+
+    async fn gate(&self, admit: bool) -> Result<()> {
         if self.state_fast.load(Ordering::Acquire) == BREAKER_CLOSED {
             #[cfg(test)]
             self.fast_path_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
         let mut g = self.state.lock().await;
+        let cooldown = Duration::from_secs(self.cfg.open_secs);
+        let elapsed = g.2.map(|t| t.elapsed()).unwrap_or(cooldown);
         match g.0 {
-            BreakerState::Closed | BreakerState::HalfOpen => Ok(()),
-            BreakerState::Open => {
-                let elapsed = g.2.map(|t| t.elapsed()).unwrap_or_default();
-                let cooldown = Duration::from_secs(self.cfg.open_secs);
-                if elapsed >= cooldown {
+            BreakerState::Closed => Ok(()),
+            BreakerState::Open | BreakerState::HalfOpen if elapsed >= cooldown => {
+                if admit {
                     g.0 = BreakerState::HalfOpen;
+                    g.2 = Some(Instant::now());
                     self.state_fast.store(BREAKER_HALF_OPEN, Ordering::Release);
-                    Ok(())
-                } else {
-                    // The refusal names why and for how long; "circuit breaker
-                    // open" alone hid the failure that opened it.
-                    let last = self.last_error();
-                    Err(M3Error::Backend(format!(
-                        "circuit breaker open after {} consecutive backend failures; refusing calls for \
-                         another {}s; last failure: {}",
-                        g.1,
-                        (cooldown - elapsed).as_secs() + 1,
-                        last.as_deref().unwrap_or("(not recorded)"),
-                    )))
                 }
+                Ok(())
+            }
+            BreakerState::HalfOpen => Err(M3Error::Backend(format!(
+                "circuit breaker half-open: a probe call is testing the backend after {} consecutive \
+                 failures; refusing other calls for up to {}s until it reports; last failure: {}",
+                g.1,
+                (cooldown - elapsed).as_secs() + 1,
+                self.last_error().as_deref().unwrap_or("(not recorded)"),
+            ))),
+            BreakerState::Open => {
+                // The refusal names why and for how long; "circuit breaker
+                // open" alone hid the failure that opened it.
+                let last = self.last_error();
+                Err(M3Error::Backend(format!(
+                    "circuit breaker open after {} consecutive backend failures; refusing calls for \
+                     another {}s; last failure: {}",
+                    g.1,
+                    (cooldown - elapsed).as_secs() + 1,
+                    last.as_deref().unwrap_or("(not recorded)"),
+                )))
             }
         }
     }
@@ -320,11 +384,14 @@ impl CircuitBreaker {
     }
 
     /// The breaker as a caller would meet it now. Open past its cooldown reads
-    /// as not open: the next call is let through as the half-open probe.
+    /// as not open: the next call is let through as the half-open probe. While
+    /// a probe is outstanding other calls are refused, so that reads as open.
     pub async fn status(&self) -> BreakerStatus {
         let g = self.state.lock().await;
         let left = match (g.0, g.2) {
-            (BreakerState::Open, Some(t)) => Duration::from_secs(self.cfg.open_secs).checked_sub(t.elapsed()),
+            (BreakerState::Open | BreakerState::HalfOpen, Some(t)) => {
+                Duration::from_secs(self.cfg.open_secs).checked_sub(t.elapsed())
+            }
             _ => None,
         }
         .filter(|d| !d.is_zero());
@@ -339,7 +406,7 @@ impl CircuitBreaker {
 
 /// One pending single-shot job: its text plus a channel to deliver the vector.
 ///
-/// `deadline` (Fix #27) lets callers tag a job with a wall-clock cutoff. The
+/// `deadline` lets callers tag a job with a wall-clock cutoff. The
 /// scheduler drops past-deadline jobs before dispatching them to the backend,
 /// surfacing `M3Error::Backend("job deadline exceeded")` to the caller. None
 /// = no deadline (existing `embed()` API path).
@@ -355,7 +422,7 @@ pub struct LengthBucketQueue {
     /// Sorted bucket ceilings; index i collects jobs up to `buckets[i]` tokens.
     buckets: Vec<usize>,
     pending: Vec<VecDeque<Job>>,
-    /// Fix #9: running total of pending tokens. Read by the scheduler without
+    /// running total of pending tokens. Read by the scheduler without
     /// taking the queue mutex (via `total_tokens_handle()`). Updated under the
     /// mutex on push/drain so the invariant `sum(bucket.token_len) == total`
     /// holds.
@@ -376,14 +443,14 @@ impl LengthBucketQueue {
         }
     }
 
-    /// Fix #9: clone the shared atomic so the scheduler can poll queue depth
+    /// clone the shared atomic so the scheduler can poll queue depth
     /// (in tokens) without taking the queue mutex.
     fn total_tokens_handle(&self) -> Arc<AtomicUsize> {
         self.total_tokens.clone()
     }
 
     fn bucket_index(&self, token_len: usize) -> usize {
-        // Fix #8: binary search for the first ceiling >= token_len. Falls back
+        // binary search for the first ceiling >= token_len. Falls back
         // to the last bucket when token_len exceeds every ceiling, matching
         // the original linear behavior.
         self.buckets
@@ -397,15 +464,11 @@ impl LengthBucketQueue {
         self.pending[idx].push_back(job);
     }
 
-    fn depth(&self) -> usize {
-        self.pending.iter().map(|b| b.len()).sum()
-    }
-
     /// Drains every bucket that has work, capping each flushed batch at
     /// `max_batch_tokens`. Returns one drained batch per call (round-robin
     /// over buckets) so the scheduler can flush incrementally.
     ///
-    /// Fix #7: uses `VecDeque` internally, so the drain is a single
+    /// uses `VecDeque` internally, so the drain is a single
     /// `drain(..take_count)` call — no O(n) shift per job.
     fn drain_one(&mut self, max_batch_tokens: usize) -> Option<Vec<Job>> {
         for bucket in &mut self.pending {
@@ -437,13 +500,19 @@ pub struct Dispatcher<B: ModelBackend> {
     cfg: DispatcherConfig,
     backend: Arc<B>,
     breaker: Arc<CircuitBreaker>,
-    queue: Arc<Mutex<LengthBucketQueue>>,
     slots: Arc<Semaphore>,
     in_flight: Arc<AtomicUsize>,
+    /// Single-shot jobs submitted and not yet handed to the backend (in the
+    /// channel or the bucket queue). An atomic, so `stats()` never has to
+    /// contend for the queue lock — a `try_lock` there reported 0 exactly when
+    /// the queue was busiest.
+    queued: Arc<AtomicUsize>,
     /// Recent batch latencies backing `stats().p50_ms` / `p99_ms`.
     latency: Arc<LatencyRing>,
     /// Bounded channel: backpressure point for `embed`. Cap = 4 x streams.
     tx: mpsc::Sender<Job>,
+    /// The channel's capacity, for the backpressure error.
+    queue_cap: usize,
 }
 
 impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
@@ -455,6 +524,7 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         let queue = Arc::new(Mutex::new(queue_inner));
         let slots = Arc::new(Semaphore::new(cfg.streams.max(1)));
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let queued = Arc::new(AtomicUsize::new(0));
         let latency = Arc::new(LatencyRing::new(LATENCY_WINDOW));
         let cap = (cfg.streams.max(1)) * 4;
         let (tx, rx) = mpsc::channel::<Job>(cap);
@@ -463,14 +533,15 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
             cfg: cfg.clone(),
             backend: backend.clone(),
             breaker: breaker.clone(),
-            queue: queue.clone(),
             slots: slots.clone(),
             in_flight: in_flight.clone(),
+            queued: queued.clone(),
             latency: latency.clone(),
             tx,
+            queue_cap: cap,
         };
         tokio::spawn(scheduler_loop(
-            cfg, backend, breaker, queue, total_tokens, slots, in_flight, latency, rx,
+            cfg, backend, breaker, queue, total_tokens, slots, in_flight, queued, latency, rx,
         ));
         d
     }
@@ -482,14 +553,13 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         self.embed_inner(text, None, None).await
     }
 
-    /// Fix #10 — Single-shot embed with a caller-supplied token count.
+    /// Single-shot embed with a caller-supplied token count.
     ///
-    /// `estimate_tokens` uses `len/4`, which is off by 3–5× for BGE-M3 on
-    /// CJK / multilingual text and produces wrong bucket placement. Callers
-    /// that have already tokenized (or maintain a better char→token ratio)
-    /// should pass the real count here. The dispatcher uses it solely for
-    /// bucket selection and the running-total cap; the backend still sees the
-    /// raw text.
+    /// [`estimate_tokens`] never under-counts but over-counts English prose
+    /// ~3x, so its bucket placement and running-total cap are conservative.
+    /// Callers that have already tokenized should pass the real count here.
+    /// The dispatcher uses it solely for bucket selection and the running-total
+    /// cap; the backend still sees the raw text.
     pub async fn embed_with_token_count(
         &self,
         text: String,
@@ -498,7 +568,7 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         self.embed_inner(text, None, Some(token_len)).await
     }
 
-    /// Like `embed()` but with a wall-clock deadline (Fix #27). If the
+    /// Like `embed()` but with a wall-clock deadline. If the
     /// dispatcher pulls this job off the queue past `deadline`, it replies
     /// with `M3Error::Backend("job deadline exceeded")` without invoking the
     /// backend. A deadline already in the past at submission time also
@@ -517,106 +587,101 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
         deadline: Option<Instant>,
         token_len_hint: Option<usize>,
     ) -> Result<Vec<f32>> {
-        self.breaker.check().await?;
+        // `peek`, not `check`: the scheduler admits (and so may claim the
+        // half-open probe for) the batch this job lands in.
+        self.breaker.peek().await?;
         let token_len = token_len_hint.unwrap_or_else(|| estimate_tokens(&text));
         let (reply, rx) = oneshot::channel();
         let job = Job { text, token_len, reply, deadline };
-        self.tx
-            .try_send(job)
-            .map_err(|_| M3Error::Backend("dispatcher queue full (backpressure)".into()))?;
-        rx.await
-            .map_err(|_| M3Error::Backend("dispatcher dropped job".into()))?
+        // Count before sending so the scheduler's decrement cannot run first.
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        if let Err(e) = self.tx.try_send(job) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(M3Error::Backend(match e {
+                mpsc::error::TrySendError::Full(_) => format!(
+                    "dispatcher queue full (backpressure): {} jobs waiting, capacity {}; retry, or \
+                     raise M3_EMBED_STREAMS (capacity is 4 x streams)",
+                    self.queued.load(Ordering::SeqCst),
+                    self.queue_cap
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    "dispatcher scheduler has stopped; no further jobs can run (restart the embedder)".into()
+                }
+            }));
+        }
+        rx.await.map_err(|_| {
+            M3Error::Backend(
+                "dispatcher dropped the job without a reply (the scheduler or a batch task exited)".into(),
+            )
+        })?
     }
 
     /// Bulk embed. Bypasses coalescing — runs the caller's batch directly,
     /// still subject to the slot semaphore and circuit breaker.
     ///
-    /// Fix #11 — exception: a single-text "batch" is routed through the
-    /// coalescer so concurrent `embed_batch([t1])` + `embed_batch([t2])`
-    /// calls from different threads can merge into one backend pass instead
-    /// of two. Multi-text batches still bypass to preserve the caller's
-    /// explicit batching intent.
-    pub async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
+    /// Exception: a single-text "batch" is routed through the coalescer so
+    /// concurrent `embed_batch([t1])` + `embed_batch([t2])` calls from
+    /// different threads can merge into one backend pass instead of two.
+    /// Multi-text batches still bypass to preserve the caller's explicit
+    /// batching intent.
+    pub async fn embed_batch(&self, mut texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        match texts.len() {
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![self.embed(texts.swap_remove(0)).await?]),
+            _ => {
+                let token_len = texts.iter().map(|t| estimate_tokens(t)).sum();
+                self.run_direct(texts, token_len).await
+            }
         }
-        if texts.len() == 1 {
-            let mut texts = texts;
-            let row = self.embed(texts.pop().unwrap()).await?;
-            return Ok(vec![row]);
+    }
+
+    /// Bulk embed with caller-supplied token counts per text.
+    ///
+    /// Same bypass semantics as `embed_batch`, but the dispatcher uses the
+    /// caller's per-text token counts for its internal `token_len_hint`
+    /// instead of the conservative `estimate_tokens`. Required:
+    /// `texts.len() == token_lens.len()`.
+    pub async fn embed_batch_with_token_counts(
+        &self,
+        mut texts: Vec<String>,
+        token_lens: Vec<usize>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if texts.len() != token_lens.len() {
+            return Err(M3Error::Config(format!(
+                "embed_batch_with_token_counts: {} texts but {} token counts",
+                texts.len(),
+                token_lens.len()
+            )));
         }
+        match texts.len() {
+            0 => Ok(Vec::new()),
+            1 => Ok(vec![self.embed_with_token_count(texts.swap_remove(0), token_lens[0]).await?]),
+            _ => self.run_direct(texts, token_lens.iter().sum()).await,
+        }
+    }
+
+    /// The bypass path shared by both bulk entry points: breaker admission, a
+    /// stream slot, one backend call, breaker bookkeeping.
+    async fn run_direct(&self, texts: Vec<String>, token_len: usize) -> Result<Vec<Vec<f32>>> {
         self.breaker.check().await?;
         let _permit = self
             .slots
             .acquire()
             .await
-            .map_err(|_| M3Error::Backend("dispatcher closed".into()))?;
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let token_len = texts.iter().map(|t| estimate_tokens(t)).sum();
+            .map_err(|_| M3Error::Backend("dispatcher closed: its stream semaphore was shut down".into()))?;
+        let sent = texts.len();
+        let in_flight = InFlight::enter(&self.in_flight);
         // Time the backend call only — the queue/semaphore wait before this
         // point is already visible as queue_depth, and folding it in here
         // would make a backlog look like a slow model.
         let t0 = Instant::now();
         let res = self.backend.run(Batch::new(texts, token_len)).await;
         self.latency.record(t0.elapsed());
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        match res {
-            Ok(out) => {
+        drop(in_flight);
+        match res.and_then(|out| checked_rows(out.rows, sent)) {
+            Ok(rows) => {
                 self.breaker.record_success().await;
-                Ok(out.rows)
-            }
-            Err(e) => {
-                if !is_client_error(&e) {
-                    self.breaker.record_failure_because(&e).await;
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Fix #10 — Bulk embed with caller-supplied token counts per text.
-    ///
-    /// Same bypass semantics as `embed_batch`, but the dispatcher uses the
-    /// caller's per-text token counts for its internal `token_len_hint`
-    /// instead of the cheap `estimate_tokens` heuristic. Required:
-    /// `texts.len() == token_lens.len()`.
-    pub async fn embed_batch_with_token_counts(
-        &self,
-        texts: Vec<String>,
-        token_lens: Vec<usize>,
-    ) -> Result<Vec<Vec<f32>>> {
-        if texts.len() != token_lens.len() {
-            return Err(M3Error::Backend(
-                "embed_batch_with_token_counts: texts.len() != token_lens.len()".into(),
-            ));
-        }
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        if texts.len() == 1 {
-            let mut texts = texts;
-            let row = self
-                .embed_with_token_count(texts.pop().unwrap(), token_lens[0])
-                .await?;
-            return Ok(vec![row]);
-        }
-        self.breaker.check().await?;
-        let _permit = self
-            .slots
-            .acquire()
-            .await
-            .map_err(|_| M3Error::Backend("dispatcher closed".into()))?;
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        let token_len: usize = token_lens.iter().sum();
-        // See the sibling site above: backend call only, not the queue wait.
-        let t0 = Instant::now();
-        let res = self.backend.run(Batch::new(texts, token_len)).await;
-        self.latency.record(t0.elapsed());
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        match res {
-            Ok(out) => {
-                self.breaker.record_success().await;
-                Ok(out.rows)
+                Ok(rows)
             }
             Err(e) => {
                 if !is_client_error(&e) {
@@ -642,7 +707,7 @@ impl<B: ModelBackend + Send + Sync + 'static> Dispatcher<B> {
     }
 
     pub fn stats(&self) -> DispatcherStats {
-        let queue_depth = self.queue.try_lock().map(|q| q.depth()).unwrap_or(0);
+        let queue_depth = self.queued.load(Ordering::SeqCst);
         let (p50, p99) = match self.latency.percentiles() {
             Some((a, b)) => (Some(a), Some(b)),
             None => (None, None),
@@ -721,6 +786,7 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
     total_tokens: Arc<AtomicUsize>,
     slots: Arc<Semaphore>,
     in_flight: Arc<AtomicUsize>,
+    queued: Arc<AtomicUsize>,
     latency: Arc<LatencyRing>,
     mut rx: mpsc::Receiver<Job>,
 ) {
@@ -747,7 +813,7 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
                                 let mut q = queue.lock().await;
                                 q.push(j);
                             }
-                            // Fix #9: lock-free depth read — atomic running
+                            // lock-free depth read — atomic running
                             // total maintained by push/drain.
                             if total_tokens.load(Ordering::Relaxed) >= cfg.max_batch_tokens {
                                 break;
@@ -769,8 +835,11 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
                 Some(j) if !j.is_empty() => j,
                 _ => break,
             };
+            // Still "queued" until this iteration ends: while it waits for the
+            // breaker or a stream slot it is neither in flight nor answered.
+            let _dequeue = Dequeue(queued.clone(), jobs.len());
 
-            // Fix #27: drop past-deadline jobs before dispatching.
+            // Drop past-deadline jobs before dispatching.
             let now = Instant::now();
             let (jobs, expired): (Vec<Job>, Vec<Job>) = jobs
                 .into_iter()
@@ -786,14 +855,21 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
 
             if let Err(e) = breaker.check().await {
                 for j in jobs {
-                    let _ = j.reply.send(Err(share_err(&e)));
+                    let _ = j.reply.send(Err(e.clone()));
                 }
                 continue;
             }
 
             let permit = match slots.clone().acquire_owned().await {
                 Ok(p) => p,
-                Err(_) => return,
+                Err(_) => {
+                    for j in jobs {
+                        let _ = j.reply.send(Err(M3Error::Backend(
+                            "dispatcher closed: its stream semaphore was shut down".into(),
+                        )));
+                    }
+                    return;
+                }
             };
             let backend = backend.clone();
             let breaker = breaker.clone();
@@ -801,38 +877,51 @@ async fn scheduler_loop<B: ModelBackend + Send + Sync + 'static>(
             let latency = latency.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                in_flight.fetch_add(1, Ordering::SeqCst);
-                let (texts, replies): (Vec<String>, Vec<_>) =
-                    jobs.into_iter().map(|j| (j.text, j.reply)).unzip();
-                let token_len = texts.iter().map(|t| estimate_tokens(t)).sum();
-                // This is the COALESCED path — the one that normally serves
-                // traffic. Missing it here would leave p50/p99 reflecting only
-                // the two direct-submit sites, i.e. almost nothing.
-                let t0 = Instant::now();
-                let res = backend.run(Batch::new(texts, token_len)).await;
-                latency.record(t0.elapsed());
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                match res {
-                    Ok(out) => {
-                        breaker.record_success().await;
-                        if out.rows.len() == replies.len() {
-                            for (reply, row) in replies.into_iter().zip(out.rows) {
+                let mut jobs: Vec<(String, oneshot::Sender<Result<Vec<f32>>>)> =
+                    jobs.into_iter().map(|j| (j.text, j.reply)).collect();
+                // Each job is a DIFFERENT caller's single text. An over-long
+                // text must fail only its own caller: the backend names it by
+                // index, it is answered and removed, and the rest re-run. (The
+                // texts are cloned only when there is a rest to re-run.)
+                while !jobs.is_empty() {
+                    let texts: Vec<String> = if jobs.len() == 1 {
+                        vec![std::mem::take(&mut jobs[0].0)]
+                    } else {
+                        jobs.iter().map(|j| j.0.clone()).collect()
+                    };
+                    let sent = texts.len();
+                    let token_len = texts.iter().map(|t| estimate_tokens(t)).sum();
+                    // This is the COALESCED path — the one that normally serves
+                    // traffic. Missing it here would leave p50/p99 reflecting
+                    // only the direct-submit path, i.e. almost nothing.
+                    let guard = InFlight::enter(&in_flight);
+                    let t0 = Instant::now();
+                    let res = backend.run(Batch::new(texts, token_len)).await;
+                    latency.record(t0.elapsed());
+                    drop(guard);
+                    match res.and_then(|out| checked_rows(out.rows, sent)) {
+                        Ok(rows) => {
+                            breaker.record_success().await;
+                            for ((_, reply), row) in jobs.into_iter().zip(rows) {
                                 let _ = reply.send(Ok(row));
                             }
-                        } else {
-                            for reply in replies {
-                                let _ = reply.send(Err(M3Error::Backend(
-                                    "backend returned wrong row count".into(),
-                                )));
+                            return;
+                        }
+                        Err(M3Error::InputTooLong { tokens, n_ctx, index: Some(i) })
+                            if jobs.len() > 1 && i < jobs.len() =>
+                        {
+                            let (_, reply) = jobs.remove(i);
+                            // Index 0: relative to that caller's one text.
+                            let _ = reply.send(Err(M3Error::InputTooLong { tokens, n_ctx, index: Some(0) }));
+                        }
+                        Err(e) => {
+                            if !is_client_error(&e) {
+                                breaker.record_failure_because(&e).await;
                             }
-                        }
-                    }
-                    Err(e) => {
-                        if !is_client_error(&e) {
-                            breaker.record_failure_because(&e).await;
-                        }
-                        for reply in replies {
-                            let _ = reply.send(Err(share_err(&e)));
+                            for (_, reply) in jobs {
+                                let _ = reply.send(Err(e.clone()));
+                            }
+                            return;
                         }
                     }
                 }
@@ -851,7 +940,7 @@ mod tests {
         Job { text: String::new(), token_len, reply, deadline: None }
     }
 
-    /// Fix #8 — bucket_index boundaries.
+    /// bucket_index boundaries.
     #[test]
     fn bucket_index_boundaries() {
         let q = LengthBucketQueue::new(vec![64, 256, 1024, 4096]);
@@ -870,7 +959,7 @@ mod tests {
         assert_eq!(q.bucket_index(1_000_000), 3);
     }
 
-    /// Fix #7 — FIFO drain respects token cap and uses VecDeque internally.
+    /// FIFO drain respects token cap and uses VecDeque internally.
     #[test]
     fn drain_one_fifo_and_token_cap() {
         // Single-bucket queue so all jobs share one VecDeque and we exercise
@@ -880,7 +969,7 @@ mod tests {
         for &l in &lens {
             q.push(mk_job(l));
         }
-        // Fix #9 — running total invariant.
+        // running total invariant.
         assert_eq!(q.total_tokens.load(Ordering::Relaxed), lens.iter().sum::<usize>());
 
         // Drain with cap = 300. Greedy FIFO: 50+100+80 = 230; next is 120 ->
@@ -899,7 +988,7 @@ mod tests {
         assert_eq!(drained2, vec![120, 60, 90]);
     }
 
-    /// Fix #28 — closed breaker `check()` takes the lock-free path; an open
+    /// closed breaker `check()` takes the lock-free path; an open
     /// breaker falls through to the mutex.
     #[tokio::test]
     async fn breaker_check_uses_lock_free_path_when_closed() {
@@ -928,7 +1017,40 @@ mod tests {
         assert_eq!(cb.fast_path_hits.load(Ordering::Relaxed), before + 1);
     }
 
-    /// Fix #9 — running total stays consistent across mixed push/drain.
+    /// Half-open admits ONE probe; `peek` never claims it; the probe's result
+    /// decides. Every caller used to be let through half-open.
+    #[tokio::test]
+    async fn half_open_admits_a_single_probe() {
+        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 1, open_secs: 1 });
+        cb.record_failure().await;
+        assert!(cb.check().await.is_err(), "open inside the cooldown");
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        assert!(cb.peek().await.is_ok(), "peek sees a probe would be admitted");
+        assert!(cb.peek().await.is_ok(), "and peeking did not claim it");
+        assert!(cb.check().await.is_ok(), "the first check is the probe");
+        let e = cb.check().await.unwrap_err().to_string();
+        assert!(e.contains("half-open"), "a second caller is refused: {e}");
+        assert!(cb.peek().await.is_err());
+        assert!(cb.status().await.open, "refusing others reads as open");
+        cb.record_success().await;
+        assert!(cb.check().await.is_ok() && cb.check().await.is_ok(), "closed again");
+    }
+
+    /// A failed probe re-opens the breaker for a fresh cooldown.
+    #[tokio::test]
+    async fn a_failed_probe_reopens() {
+        let cb = CircuitBreaker::new(BreakerCfg { failure_threshold: 3, open_secs: 1 });
+        for _ in 0..3 {
+            cb.record_failure().await;
+        }
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        assert!(cb.check().await.is_ok());
+        cb.record_failure().await;
+        let e = cb.check().await.unwrap_err().to_string();
+        assert!(e.contains("circuit breaker open"), "{e}");
+    }
+
+    /// Running total stays consistent across mixed push/drain.
     #[test]
     fn total_tokens_running_invariant() {
         let mut q = LengthBucketQueue::new(vec![64, 256, 1024]);

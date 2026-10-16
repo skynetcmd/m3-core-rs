@@ -103,11 +103,12 @@ pub fn fuse(
     fused
 }
 
-/// Convenience: fuse, then hand the fused candidate ordering to the m3-vector
-/// MMR reranker. `candidate_vectors[i]` must correspond to `fused[i]` after the
-/// fuse step — callers supply vectors already aligned to the fused order, so
-/// this helper fuses first and expects the caller to have ordered vectors to
-/// match. Returns the MMR-selected indices into the fused list.
+/// Convenience: fuse, then MMR-rerank the fused list. `candidate_vectors[i]`
+/// must be the vector of `fused[i]` — the caller must already know the fused
+/// order (e.g. from an earlier `fuse` of the same inputs, which is
+/// deterministic). Returns the fused rows and the MMR-selected indices into
+/// them; a vector count that differs from the fused row count is an error,
+/// since it proves the two are not aligned.
 pub fn fuse_then_mmr(
     fts: Vec<RankRow>,
     vector: Vec<RankRow>,
@@ -118,6 +119,14 @@ pub fn fuse_then_mmr(
     k: usize,
 ) -> Result<(Vec<RankRow>, Vec<usize>)> {
     let fused = fuse(fts, vector, weights);
+    if candidate_vectors.len() != fused.len() {
+        return Err(m3_error::M3Error::Config(format!(
+            "fuse_then_mmr: {} candidate vectors for {} fused rows; the vectors must be aligned \
+             to the fused order",
+            candidate_vectors.len(),
+            fused.len()
+        )));
+    }
     let selected = mmr_rerank(query_vec, candidate_vectors, lambda, k)?;
     Ok((fused, selected))
 }

@@ -39,9 +39,10 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
-  # Cargo.toml rust-version is a promise to anyone building from source; the
-  # wheels are built with a newer compiler, so nothing else would notice a
-  # change that needs a newer one. Check every feature set the wheels use.
+  # Cargo.toml rust-version is a promise to anyone building from source (m3's
+  # source fallback uses the user's own cargo). The other jobs use `stable`,
+  # which moves past it, so only this job notices a change that needs a newer
+  # compiler. Check every feature set the wheels use.
   msrv:
     name: Minimum Rust (rust-version)
     runs-on: ubuntu-latest

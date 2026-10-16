@@ -454,6 +454,10 @@ fn texts_from(input: serde_json::Value) -> Result<Vec<String>, (StatusCode, Stri
     Ok(texts)
 }
 
+// Response is axum's own error type for a handler: built once per refused
+// request and returned straight to the client, never carried up a call chain,
+// so its size costs nothing that boxing would save.
+#[allow(clippy::result_large_err)]
 async fn embed_handler(
     State(state): State<Arc<AppState>>,
     ApiJson(req): ApiJson<EmbedRequest>,

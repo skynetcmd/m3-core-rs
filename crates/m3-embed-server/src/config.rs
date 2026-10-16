@@ -494,6 +494,9 @@ pub fn merge_env_into_file(path: &Path) -> anyhow::Result<()> {
     })
 }
 
+// Its one caller is the Windows service installer (service.rs is cfg(windows)),
+// so on other platforms it is dead code and clippy -D warnings rejects it.
+#[cfg(windows)]
 pub fn write_config_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

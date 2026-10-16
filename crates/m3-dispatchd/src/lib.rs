@@ -8,5 +8,6 @@
 
 pub mod addressing;
 pub mod api;
+pub mod client;
 pub mod hub;
 pub mod ipc;

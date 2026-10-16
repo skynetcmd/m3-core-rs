@@ -31,6 +31,9 @@ use crate::addressing::sees;
 struct Ring {
     seq: u64,
     recipient: String,
+    /// The node that rang, when the writer says (a multi-node relay names the
+    /// remote node, so a waiter knows the message may need a sync to read).
+    origin: Option<String>,
     at: Instant,
 }
 
@@ -47,8 +50,14 @@ struct State {
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(tag = "wake", rename_all = "lowercase")]
 pub enum Wake {
-    /// New mail for these readers: how many rings, and for which recipients.
-    Mail { count: usize, recipients: Vec<String> },
+    /// New mail for these readers: how many rings, for which recipients, and
+    /// from which nodes (empty when no ring named one).
+    Mail {
+        count: usize,
+        recipients: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        origins: Vec<String>,
+    },
     /// The hub has no history for these readers: read the inbox once.
     Resync,
     /// Nothing arrived before the timeout.
@@ -67,7 +76,13 @@ impl Hub {
     /// `window`: the coalescing window. `keep`: how long rings stay in the log
     /// for a waiter that is not connected.
     pub fn new(window: Duration, keep: Duration) -> Self {
-        Self { state: Mutex::new(State::default()), notify: Notify::new(), window, keep, max_log: 100_000 }
+        Self {
+            state: Mutex::new(State::default()),
+            notify: Notify::new(),
+            window,
+            keep,
+            max_log: 100_000,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -75,8 +90,12 @@ impl Hub {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Record that messages for `recipients` were committed.
-    pub fn ring<I: IntoIterator<Item = String>>(&self, recipients: I) -> usize {
+    /// Record that messages for `recipients` were committed, on `origin` when given.
+    pub fn ring<I: IntoIterator<Item = String>>(
+        &self,
+        recipients: I,
+        origin: Option<&str>,
+    ) -> usize {
         let now = Instant::now();
         let mut n = 0;
         {
@@ -87,10 +106,20 @@ impl Hub {
                 }
                 st.seq += 1;
                 let seq = st.seq;
-                st.log.push_back(Ring { seq, recipient: r, at: now });
+                st.log.push_back(Ring {
+                    seq,
+                    recipient: r,
+                    origin: origin.map(str::to_owned),
+                    at: now,
+                });
                 n += 1;
             }
-            while st.log.len() > self.max_log || st.log.front().is_some_and(|r| now.duration_since(r.at) > self.keep) {
+            while st.log.len() > self.max_log
+                || st
+                    .log
+                    .front()
+                    .is_some_and(|r| now.duration_since(r.at) > self.keep)
+            {
                 st.log.pop_front();
             }
         }
@@ -101,7 +130,14 @@ impl Hub {
     }
 
     fn key(readers: &[String]) -> String {
-        readers.iter().filter(|r| !r.is_empty()).cloned().collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>().join("\n")
+        readers
+            .iter()
+            .filter(|r| !r.is_empty())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Wait up to `timeout` for mail any of `readers` would see.
@@ -131,7 +167,10 @@ impl Hub {
     fn first_match(&self, key: &str, readers: &[String]) -> Option<Instant> {
         let st = self.lock();
         let cursor = st.cursors.get(key).copied().unwrap_or(0);
-        st.log.iter().find(|r| r.seq > cursor && readers.iter().any(|rd| sees(rd, &r.recipient))).map(|r| r.at)
+        st.log
+            .iter()
+            .find(|r| r.seq > cursor && readers.iter().any(|rd| sees(rd, &r.recipient)))
+            .map(|r| r.at)
     }
 
     async fn wait_known(&self, key: &str, readers: &[String], deadline: Instant) -> Wake {
@@ -162,17 +201,27 @@ impl Hub {
         let mut count = 0;
         let mut last = cursor;
         let mut recipients = BTreeSet::new();
-        for r in st.log.iter().filter(|r| r.seq > cursor && readers.iter().any(|rd| sees(rd, &r.recipient))) {
+        let mut origins = BTreeSet::new();
+        for r in st
+            .log
+            .iter()
+            .filter(|r| r.seq > cursor && readers.iter().any(|rd| sees(rd, &r.recipient)))
+        {
             count += 1;
             last = r.seq;
             recipients.insert(r.recipient.clone());
+            origins.extend(r.origin.clone());
         }
         if count == 0 {
             return Wake::Timeout;
         }
         st.cursors.insert(key.to_string(), last);
         *st.wakes.entry(key.to_string()).or_default() += 1;
-        Wake::Mail { count, recipients: recipients.into_iter().collect() }
+        Wake::Mail {
+            count,
+            recipients: recipients.into_iter().collect(),
+            origins: origins.into_iter().collect(),
+        }
     }
 
     /// The cross-agent view: per reader set, rings waiting and since when,
@@ -183,7 +232,11 @@ impl Hub {
         let mut readers = serde_json::Map::new();
         for (key, cursor) in &st.cursors {
             let set: Vec<&str> = key.split('\n').collect();
-            let pending: Vec<&Ring> = st.log.iter().filter(|r| r.seq > *cursor && set.iter().any(|rd| sees(rd, &r.recipient))).collect();
+            let pending: Vec<&Ring> = st
+                .log
+                .iter()
+                .filter(|r| r.seq > *cursor && set.iter().any(|rd| sees(rd, &r.recipient)))
+                .collect();
             readers.insert(
                 key.replace('\n', ","),
                 serde_json::json!({
@@ -204,7 +257,10 @@ mod tests {
     use std::sync::Arc;
 
     fn hub() -> Arc<Hub> {
-        Arc::new(Hub::new(Duration::from_millis(250), Duration::from_secs(3600)))
+        Arc::new(Hub::new(
+            Duration::from_millis(250),
+            Duration::from_secs(3600),
+        ))
     }
 
     fn r(xs: &[&str]) -> Vec<String> {
@@ -214,8 +270,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_new_reader_set_resyncs_first() {
         let h = hub();
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(5)).await, Wake::Resync);
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(5)).await, Wake::Timeout);
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(5)).await,
+            Wake::Resync
+        );
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(5)).await,
+            Wake::Timeout
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -223,22 +285,41 @@ mod tests {
         let h = hub();
         h.wait(&r(&["a"]), Duration::ZERO).await; // register
         let h2 = h.clone();
-        let waiter = tokio::spawn(async move { h2.wait(&r(&["a"]), Duration::from_secs(60)).await });
+        let waiter =
+            tokio::spawn(async move { h2.wait(&r(&["a"]), Duration::from_secs(60)).await });
         tokio::task::yield_now().await;
         for _ in 0..50 {
-            h.ring(r(&["a@1"]));
+            h.ring(r(&["a@1"]), None);
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert_eq!(waiter.await.unwrap(), Wake::Mail { count: 50, recipients: r(&["a@1"]) });
+        assert_eq!(
+            waiter.await.unwrap(),
+            Wake::Mail {
+                count: 50,
+                recipients: r(&["a@1"]),
+                origins: vec![]
+            }
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn rings_while_away_are_delivered_at_the_next_wait() {
         let h = hub();
         h.wait(&r(&["a@1"]), Duration::ZERO).await;
-        h.ring(r(&["a@1", "b"]));
-        assert_eq!(h.wait(&r(&["a@1"]), Duration::from_secs(5)).await, Wake::Mail { count: 1, recipients: r(&["a@1"]) });
-        assert_eq!(h.wait(&r(&["a@1"]), Duration::from_secs(1)).await, Wake::Timeout, "one wake per batch");
+        h.ring(r(&["a@1", "b"]), None);
+        assert_eq!(
+            h.wait(&r(&["a@1"]), Duration::from_secs(5)).await,
+            Wake::Mail {
+                count: 1,
+                recipients: r(&["a@1"]),
+                origins: vec![]
+            }
+        );
+        assert_eq!(
+            h.wait(&r(&["a@1"]), Duration::from_secs(1)).await,
+            Wake::Timeout,
+            "one wake per batch"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -247,18 +328,33 @@ mod tests {
         for set in [&["a"][..], &["a@1"], &["a@2"], &["b"]] {
             h.wait(&r(set), Duration::ZERO).await;
         }
-        h.ring(r(&["a@1"]));
-        assert!(matches!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Mail { .. }), "bare type fans out");
-        assert!(matches!(h.wait(&r(&["a@1"]), Duration::from_secs(1)).await, Wake::Mail { .. }));
-        assert_eq!(h.wait(&r(&["a@2"]), Duration::from_secs(1)).await, Wake::Timeout);
-        assert_eq!(h.wait(&r(&["b"]), Duration::from_secs(1)).await, Wake::Timeout);
+        h.ring(r(&["a@1"]), None);
+        assert!(
+            matches!(
+                h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+                Wake::Mail { .. }
+            ),
+            "bare type fans out"
+        );
+        assert!(matches!(
+            h.wait(&r(&["a@1"]), Duration::from_secs(1)).await,
+            Wake::Mail { .. }
+        ));
+        assert_eq!(
+            h.wait(&r(&["a@2"]), Duration::from_secs(1)).await,
+            Wake::Timeout
+        );
+        assert_eq!(
+            h.wait(&r(&["b"]), Duration::from_secs(1)).await,
+            Wake::Timeout
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn status_shows_pending_and_waiters() {
         let h = hub();
         h.wait(&r(&["a"]), Duration::ZERO).await;
-        h.ring(r(&["a@9", "a@9"]));
+        h.ring(r(&["a@9", "a@9"]), None);
         let s = h.status();
         assert_eq!(s["readers"]["a"]["pending"], 2);
         assert_eq!(s["readers"]["a"]["waiting"], 0);
@@ -268,9 +364,29 @@ mod tests {
     async fn old_rings_age_out_of_the_log() {
         let h = Arc::new(Hub::new(Duration::from_millis(10), Duration::from_secs(60)));
         h.wait(&r(&["a"]), Duration::ZERO).await;
-        h.ring(r(&["a"]));
+        h.ring(r(&["a"]), None);
         tokio::time::advance(Duration::from_secs(120)).await;
-        h.ring(r(&["z"])); // a later ring trims the log
-        assert_eq!(h.wait(&r(&["a"]), Duration::from_secs(1)).await, Wake::Timeout);
+        h.ring(r(&["z"]), None); // a later ring trims the log
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+            Wake::Timeout
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_names_the_nodes_that_rang() {
+        let h = hub();
+        h.wait(&r(&["a"]), Duration::ZERO).await;
+        h.ring(r(&["a@1"]), Some("node-b"));
+        h.ring(r(&["a@2"]), None);
+        h.ring(r(&["a@1"]), Some("node-b"));
+        assert_eq!(
+            h.wait(&r(&["a"]), Duration::from_secs(1)).await,
+            Wake::Mail {
+                count: 3,
+                recipients: r(&["a@1", "a@2"]),
+                origins: r(&["node-b"])
+            }
+        );
     }
 }

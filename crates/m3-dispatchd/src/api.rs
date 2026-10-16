@@ -15,10 +15,15 @@ use crate::hub::{Hub, Wake};
 pub const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// Most recipients one ring may carry.
 pub const MAX_RECIPIENTS: usize = 1000;
+/// Longest node name a ring may carry as its origin.
+pub const MAX_ORIGIN: usize = 128;
 
 #[derive(Deserialize)]
 struct RingRequest {
     recipients: Vec<String>,
+    /// The node the message was committed on, when the writer names one.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -37,7 +42,12 @@ pub fn router(hub: Arc<Hub>) -> Router {
         .route("/ring", post(ring))
         .route("/wait", post(wait))
         .route("/status", get(status))
-        .route("/health", get(|| async { Json(serde_json::json!({ "status": "ok", "pid": std::process::id() })) }))
+        .route(
+            "/health",
+            get(|| async {
+                Json(serde_json::json!({ "status": "ok", "pid": std::process::id() }))
+            }),
+        )
         .with_state(hub)
 }
 
@@ -45,23 +55,48 @@ pub fn router(hub: Arc<Hub>) -> Router {
 type ApiError = (StatusCode, Json<serde_json::Value>);
 
 fn bad(msg: String) -> ApiError {
-    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": msg })),
+    )
 }
 
-async fn ring(State(hub): State<Arc<Hub>>, Json(req): Json<RingRequest>) -> Result<StatusCode, ApiError> {
+async fn ring(
+    State(hub): State<Arc<Hub>>,
+    Json(req): Json<RingRequest>,
+) -> Result<StatusCode, ApiError> {
     if req.recipients.is_empty() || req.recipients.len() > MAX_RECIPIENTS {
-        return Err(bad(format!("recipients: 1..={MAX_RECIPIENTS} required; got {}", req.recipients.len())));
+        return Err(bad(format!(
+            "recipients: 1..={MAX_RECIPIENTS} required; got {}",
+            req.recipients.len()
+        )));
     }
-    hub.ring(req.recipients);
+    if let Some(o) = &req.origin {
+        if o.is_empty() || o.len() > MAX_ORIGIN || o.chars().any(char::is_control) {
+            return Err(bad(format!(
+                "origin: 1..={MAX_ORIGIN} bytes, no control characters; got {} bytes",
+                o.len()
+            )));
+        }
+    }
+    hub.ring(req.recipients, req.origin.as_deref());
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn wait(State(hub): State<Arc<Hub>>, Json(req): Json<WaitRequest>) -> Result<Json<Wake>, ApiError> {
+async fn wait(
+    State(hub): State<Arc<Hub>>,
+    Json(req): Json<WaitRequest>,
+) -> Result<Json<Wake>, ApiError> {
     if req.readers.iter().all(|r| r.is_empty()) {
-        return Err(bad("readers: at least one non-empty agent id required".into()));
+        return Err(bad(
+            "readers: at least one non-empty agent id required".into()
+        ));
     }
     if !(req.timeout_s.is_finite() && req.timeout_s >= 0.0) {
-        return Err(bad(format!("timeout_s must be a non-negative number; got {}", req.timeout_s)));
+        return Err(bad(format!(
+            "timeout_s must be a non-negative number; got {}",
+            req.timeout_s
+        )));
     }
     let timeout = Duration::from_secs_f64(req.timeout_s).min(MAX_WAIT);
     Ok(Json(hub.wait(&req.readers, timeout).await))

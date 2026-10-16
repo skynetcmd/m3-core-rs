@@ -9,7 +9,8 @@ description = "Per-user doorbell for m3 agent mail: coalesced, paced wake-ups ov
 
 [dependencies]
 axum = "0.7"
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1", "service"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net", "io-util"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,3 +36,7 @@ tokio = { version = "1", features = ["test-util"] }
 [[bin]]
 name = "m3-dispatchd"
 path = "src/main.rs"
+
+[[bin]]
+name = "m3-wait"
+path = "src/bin/m3-wait.rs"

@@ -39,15 +39,27 @@ mod tests {
     #[test]
     fn the_rule() {
         assert!(sees("claude-code", "claude-code"));
-        assert!(sees("claude-code", "claude-code@abc"), "a bare read fans out");
+        assert!(
+            sees("claude-code", "claude-code@abc"),
+            "a bare read fans out"
+        );
         assert!(sees("claude-code@abc", "claude-code@abc"));
-        assert!(!sees("claude-code@abc", "claude-code"), "a direct read does not see the type inbox");
+        assert!(
+            !sees("claude-code@abc", "claude-code"),
+            "a direct read does not see the type inbox"
+        );
         assert!(!sees("claude-code@abc", "claude-code@xyz"));
-        assert!(!sees("claude", "claude-code@abc"), "a prefix that is not the whole type");
+        assert!(
+            !sees("claude", "claude-code@abc"),
+            "a prefix that is not the whole type"
+        );
         assert!(!sees("claude-code", "claude-codex@abc"));
         assert!(sees("a@", "a@@x"), "an empty instance counts as bare");
         assert!(!sees("a@", "a@x"));
-        assert!(sees("a@b@c", "a@b@c"), "the instance may itself contain the separator");
+        assert!(
+            sees("a@b@c", "a@b@c"),
+            "the instance may itself contain the separator"
+        );
         assert!(!sees("", "anything"));
     }
 }

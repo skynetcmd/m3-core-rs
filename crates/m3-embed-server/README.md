@@ -45,7 +45,8 @@ where every non-default value came from.
 The token digest is read only when `remote_listen` is set. A secrets file that
 others can read is refused (Unix mode/owner; Windows DACL), as m3 refuses it.
 Earlier versions' own `config.toml` is no longer read; if it is still present
-the server says so once at startup (m3 migrates and removes it).
+the server says so once at startup (m3 migrates it and keeps it, unread, as
+`config.toml.migrated` for a rollback).
 
 ## Foreground / dev mode
 

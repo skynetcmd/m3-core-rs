@@ -12,7 +12,8 @@
 //!
 //! The server's own `config.toml` from earlier versions is no longer read; if
 //! it is still there, one warning says so ([`warn_legacy_file`]). m3 migrates
-//! its values and removes it.
+//! its values and renames it to `config.toml.migrated` (unread; kept for a
+//! rollback to an older core).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -483,8 +484,8 @@ pub fn legacy_file_notice(legacy: &Path, m3_config: &Path) -> Option<String> {
          They belong in m3_config.toml ({}): [embed] gguf, ctx; [embed.server] host, port, streams, \
          seq_max, n_batch, n_ubatch, coalesce_ms, max_batch_tokens, remote_listen, tls_cert, tls_key; \
          [crypto] fips_mode, fips_strict; token_sha256 becomes {TOKEN_SECRET} in the secrets file. \
-         m3 migrates them and removes the old file (`m3 embedder` commands); until then compare the \
-         two by hand",
+         m3 migrates them and renames the old file to config.toml.migrated (`m3 embedder` \
+         commands); until then compare the two by hand",
         legacy.display(),
         m3_config.display()
     ))
@@ -913,9 +914,17 @@ mod tests {
             legacy_file_notice(&old, &m3).is_none(),
             "no file, no warning"
         );
+        // m3 keeps the migrated file as config.toml.migrated: that copy alone is not warned about.
+        std::fs::write(
+            d.path().join("config.toml.migrated"),
+            "[embed]\nport = 9000\n",
+        )
+        .unwrap();
+        assert!(legacy_file_notice(&old, &m3).is_none());
         std::fs::write(&old, "[embed]\nport = 9000\n").unwrap();
         let msg = legacy_file_notice(&old, &m3).unwrap();
         assert!(msg.contains(&old.display().to_string()) && msg.contains("no longer reads it"));
         assert!(msg.contains(&m3.display().to_string()) && msg.contains(TOKEN_SECRET));
+        assert!(msg.contains("config.toml.migrated"), "{msg}");
     }
 }

@@ -227,7 +227,7 @@ def _staged_embed_server(features: list[str], release: bool, os_tok: str):
         # embedded-cuda/-vulkan/-metal), so the SAME feature list applies.
         cmd += ["--features", ",".join(features)]
     print(f"[build_wheel] building embed server: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=_WORKSPACE, env=os.environ.copy())
+    proc = subprocess.run(cmd, cwd=_WORKSPACE, env=os.environ.copy(), check=False)
     if proc.returncode != 0:
         raise SystemExit(
             f"error: `cargo build -p m3-embed-server` failed (exit {proc.returncode}). "
@@ -393,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     # maturin bundles it. Both happen under the patched package name.
     started = time.time()
     with _patched_name(name), _staged_embed_server(features, args.release, os_tok):
-        proc = subprocess.run(cmd, cwd=_HERE, env=os.environ.copy())
+        proc = subprocess.run(cmd, cwd=_HERE, env=os.environ.copy(), check=False)
     if proc.returncode != 0:
         return proc.returncode
 

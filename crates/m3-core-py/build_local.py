@@ -143,7 +143,7 @@ def resolve_interpreter(version: str, *, install_missing: bool) -> str | None:
         if managed:
             cmd.append("--managed-python")
         cmd.append(version)
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if r.returncode != 0:
             return None
         out = r.stdout.strip()
@@ -247,7 +247,7 @@ def _vcvars_env() -> dict[str, str] | None:
                 [str(vswhere), "-latest", "-products", "*",
                  "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
                  "-property", "installationPath"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=60, check=False
             ).stdout.strip()
             if found:
                 candidates.append(Path(found) / "VC" / "Auxiliary" / "Build" / "vcvars64.bat")
@@ -288,7 +288,7 @@ def _vcvars_env() -> dict[str, str] | None:
         proc = subprocess.run(
             ["cmd", "/c", tmp],
             capture_output=True, text=True, timeout=300,
-            cwd=os.environ.get("SystemRoot", r"C:\Windows"),
+            cwd=os.environ.get("SystemRoot", r"C:\Windows"), check=False
         )
     except Exception:  # noqa: BLE001 — never let discovery break the build
         return None
@@ -594,7 +594,7 @@ def build_one(
         log.flush()
         print(f"[build_local] {os_tok}/{backend}: building ({len(interps)} interpreters, "
               f"zig={use_zig}) -> {out_dir}")
-        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+        proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, check=False)
         log.write(f"end: {_utcnow()}\n")
         log.write(f"maturin exit: {proc.returncode}\n")
         wheels = sorted(out_dir.glob("*.whl"))
@@ -636,7 +636,7 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         venv = Path(tmp) / "venv"
-        made = subprocess.run([uv, "venv", "--python", pyver, str(venv)], capture_output=True, text=True)
+        made = subprocess.run([uv, "venv", "--python", pyver, str(venv)], capture_output=True, text=True, check=False)
         if made.returncode != 0:
             print(f"[smoke] {os_tok}/{backend}: cannot create a Python {pyver} venv for {wheel.name} "
                   f"(uv exit {made.returncode}): {made.stderr.strip()}", file=sys.stderr)
@@ -644,7 +644,7 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
         py = venv / ("Scripts" if os_tok == "windows" else "bin") / (
             "python.exe" if os_tok == "windows" else "python")
         inst = subprocess.run([uv, "pip", "install", "--python", str(py), str(wheel)],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
         if inst.returncode != 0:
             print(f"[smoke] {os_tok}/{backend}: install of {wheel.name} failed "
                   f"(exit {inst.returncode}):\n{inst.stderr.strip()}", file=sys.stderr)
@@ -653,7 +653,7 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
             [str(py), "-c",
              "import m3_core_rs as m; print(m.__build_backend__, m.embed_backend_label(), "
              "hasattr(m, 'EmbeddedEmbedder'))"],
-            capture_output=True, text=True)
+            capture_output=True, text=True, check=False)
         got = r.stdout.split()
         ok = r.returncode == 0 and got == [backend, backend, "True"]
         print(f"[smoke] {os_tok}/{backend}: {'OK' if ok else 'FAILED'} -> "
@@ -696,7 +696,7 @@ def preflight(os_tok: str, backends: list[str], pythons: list[str], *, install_m
     if mat:
         check("maturin", True, mat)
     else:
-        r = subprocess.run([sys.executable, "-m", "maturin", "--version"], capture_output=True, text=True)
+        r = subprocess.run([sys.executable, "-m", "maturin", "--version"], capture_output=True, text=True, check=False)
         check("maturin", r.returncode == 0,
               f"{sys.executable} -m maturin ({r.stdout.strip()})" if r.returncode == 0 else
               f"neither `maturin` on PATH nor importable by {sys.executable}; "
@@ -705,9 +705,13 @@ def preflight(os_tok: str, backends: list[str], pythons: list[str], *, install_m
     need = _rust_version_required()
     rustc = shutil.which("rustc") or (str(Path.home() / ".cargo" / "bin" / "rustc") if (Path.home() / ".cargo" / "bin").is_dir() else None)
     if rustc:
-        got = subprocess.run([rustc, "--version"], capture_output=True, text=True).stdout.strip()
-        ok = _version_tuple(got) >= _version_tuple(need)
-        check("rustc", ok, f"{got} (needs >= {need})" + ("" if ok else "; run `rustup update stable`"))
+        r = subprocess.run([rustc, "--version"], capture_output=True, text=True, check=False)
+        got = r.stdout.strip()
+        if r.returncode != 0 or not got:
+            check("rustc", False, f"`{rustc} --version` failed (exit {r.returncode}): {r.stderr.strip() or 'no output'}")
+        else:
+            ok = _version_tuple(got) >= _version_tuple(need)
+            check("rustc", ok, f"{got} (needs >= {need})" + ("" if ok else "; run `rustup update stable`"))
     else:
         check("rustc", False, "not found; install rustup (https://rustup.rs)")
     check("cargo", bool(shutil.which("cargo") or (Path.home() / ".cargo" / "bin").is_dir()),
@@ -721,7 +725,7 @@ def preflight(os_tok: str, backends: list[str], pythons: list[str], *, install_m
         check("MSVC (vcvars64)", vc_env is not None,
               "found" if vc_env else "not found; install Visual Studio Build Tools with the C++ workload")
     elif os_tok == "macos":
-        r = subprocess.run(["xcrun", "--find", "clang"], capture_output=True, text=True)
+        r = subprocess.run(["xcrun", "--find", "clang"], capture_output=True, text=True, check=False)
         check("Xcode clang", r.returncode == 0, r.stdout.strip() or "run `xcode-select --install`")
     else:
         cc = shutil.which("cc") or shutil.which("gcc")
@@ -749,14 +753,20 @@ def preflight(os_tok: str, backends: list[str], pythons: list[str], *, install_m
                 cand = Path(os.environ["CUDA_PATH"], "bin", "nvcc.exe" if os_tok == "windows" else "nvcc")
                 nvcc = str(cand) if cand.is_file() else None
             if nvcc:
-                ver = subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1:]
-                check("cuda: nvcc", True, f"{nvcc} ({ver[0] if ver else '?'})")
+                r = subprocess.run([nvcc, "--version"], capture_output=True, text=True, check=False)
+                ver = r.stdout.strip().splitlines()[-1:]
+                check(
+                    "cuda: nvcc",
+                    r.returncode == 0 and bool(ver),
+                    f"{nvcc} ({ver[0]})" if r.returncode == 0 and ver
+                    else f"`{nvcc} --version` failed (exit {r.returncode}): {r.stderr.strip() or 'no output'}",
+                )
             else:
                 check("cuda: nvcc", False, "not found on PATH or under CUDA_PATH; install the CUDA toolkit")
         if os_tok == "linux" and backend == "cpu":
             zig = shutil.which("zig")
             if not zig:
-                r = subprocess.run([sys.executable, "-m", "ziglang", "version"], capture_output=True, text=True)
+                r = subprocess.run([sys.executable, "-m", "ziglang", "version"], capture_output=True, text=True, check=False)
                 zig = f"{sys.executable} -m ziglang {r.stdout.strip()}" if r.returncode == 0 else None
             check("cpu: zig (maturin --zig)", bool(zig), zig or f"`{sys.executable} -m pip install ziglang` or install zig")
 

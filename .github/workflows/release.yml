@@ -132,14 +132,10 @@ jobs:
         with:
           toolchain: "1.99"
 
-      - name: Cache cargo + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ matrix.os_tok }}-${{ matrix.backend }}-cargo-${{ hashFiles('Cargo.lock') }}
+      # No caches in this workflow: a release build restores nothing another
+      # run could have written (zizmor cache-poisoning), so cargo, the CUDA
+      # toolkit and the Vulkan SDK are fetched fresh. Slower; this is the
+      # fallback path (wheels are built locally, RUST_CORE_WHEEL_RELEASE_RUNBOOK).
 
       - name: Install maturin
         run: pip install "maturin>=1.7,<2.0"
@@ -154,6 +150,7 @@ jobs:
           cuda: "13.2.0"
           # build-only: we need nvcc + cublas headers/libs, not a driver.
           method: network
+          use-github-cache: false  # the action's default is true; see "No caches"
 
       # Linux: the prebuilt-SDK action works and linux-vulkan is green — keep it.
       - name: Install Vulkan SDK (Linux vulkan backend)
@@ -161,7 +158,7 @@ jobs:
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.341.0
-          cache: true
+          cache: false
 
       # Windows needs BOTH SDK sources — neither alone is complete:
       #   - setup-vulkan-sdk builds Vulkan-Headers + Vulkan-Loader (gives the
@@ -188,14 +185,14 @@ jobs:
         with:
           vulkan-query-version: 1.4.341.0
           vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Headers
-          vulkan-use-cache: true
+          vulkan-use-cache: false
 
       - name: Install prebuilt Vulkan SDK for glslc (Windows vulkan backend)
         if: matrix.backend == 'vulkan' && runner.os == 'Windows'
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff # v1.2
         with:
           version: 1.4.341.0
-          cache: true
+          cache: false
 
       # Assemble a single VULKAN_SDK with the layout FindVulkan expects:
       #   <root>/Include/vulkan/vulkan.h, <root>/Lib/vulkan-1.lib, <root>/Bin/glslc.exe

@@ -663,6 +663,111 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
         return ok
 
 
+def _rust_version_required() -> str:
+    """Cargo.toml [workspace.package] rust-version (the minimum compiler)."""
+    m = re.search(r'^rust-version\s*=\s*"([^"]+)"', (_REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"), re.M)
+    return m.group(1) if m else "0"
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    return tuple(int(g) for g in m.groups() if g is not None) if m else ()
+
+
+def preflight(os_tok: str, backends: list[str], pythons: list[str], *, install_missing: bool) -> int:
+    """Check every prerequisite of the requested builds WITHOUT building, and
+    report all of them at once. A missing tool used to surface mid-build (the
+    macOS lane: no maturin for the launching Python, found after cargo had run).
+    Exit 0 when every check passes, 2 otherwise."""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: str) -> None:
+        results.append((name, ok, detail))
+
+    uv = shutil.which("uv")
+    check("uv", bool(uv), uv or "not on PATH; install https://docs.astral.sh/uv/ or use a login shell")
+    if uv:
+        for v in pythons:
+            p = resolve_interpreter(v, install_missing=install_missing)
+            check(f"python {v}", bool(p), p or f"not found; rerun with --install-missing (uv python install {v})")
+
+    mat = shutil.which("maturin")
+    if mat:
+        check("maturin", True, mat)
+    else:
+        r = subprocess.run([sys.executable, "-m", "maturin", "--version"], capture_output=True, text=True)
+        check("maturin", r.returncode == 0,
+              f"{sys.executable} -m maturin ({r.stdout.strip()})" if r.returncode == 0 else
+              f"neither `maturin` on PATH nor importable by {sys.executable}; "
+              f"`pipx install maturin` (and put ~/.local/bin on PATH) or `{sys.executable} -m pip install maturin`")
+
+    need = _rust_version_required()
+    rustc = shutil.which("rustc") or (str(Path.home() / ".cargo" / "bin" / "rustc") if (Path.home() / ".cargo" / "bin").is_dir() else None)
+    if rustc:
+        got = subprocess.run([rustc, "--version"], capture_output=True, text=True).stdout.strip()
+        ok = _version_tuple(got) >= _version_tuple(need)
+        check("rustc", ok, f"{got} (needs >= {need})" + ("" if ok else "; run `rustup update stable`"))
+    else:
+        check("rustc", False, "not found; install rustup (https://rustup.rs)")
+    check("cargo", bool(shutil.which("cargo") or (Path.home() / ".cargo" / "bin").is_dir()),
+          shutil.which("cargo") or "~/.cargo/bin (not on PATH)")
+
+    check("cmake", bool(shutil.which("cmake")), shutil.which("cmake") or "not on PATH (llama.cpp builds with cmake on every backend)")
+
+    vc_env = None
+    if os_tok == "windows":
+        vc_env = _vcvars_env()
+        check("MSVC (vcvars64)", vc_env is not None,
+              "found" if vc_env else "not found; install Visual Studio Build Tools with the C++ workload")
+    elif os_tok == "macos":
+        r = subprocess.run(["xcrun", "--find", "clang"], capture_output=True, text=True)
+        check("Xcode clang", r.returncode == 0, r.stdout.strip() or "run `xcode-select --install`")
+    else:
+        cc = shutil.which("cc") or shutil.which("gcc")
+        check("C compiler", bool(cc), cc or "install build-essential (gcc, g++)")
+
+    for backend in backends:
+        if (os_tok, backend) not in _MATRIX:
+            continue
+        if os_tok == "windows" and backend in ("vulkan", "cuda"):
+            path_value = (vc_env or {}).get("PATH", os.environ.get("PATH", ""))
+            ninja = _find_on_path(path_value, "ninja.exe") or shutil.which("ninja")
+            check(f"{backend}: ninja", bool(ninja), ninja or "not found (VS ships it under CMake; or `winget install Ninja-build.Ninja`)")
+        if backend == "vulkan":
+            if os_tok == "windows":
+                sdk = _find_vulkan_sdk()
+                check("vulkan: SDK (glslc)", bool(sdk), sdk or "install the LunarG Vulkan SDK")
+            else:
+                glslc = shutil.which("glslc")
+                check("vulkan: glslc", bool(glslc), glslc or "install glslc (shaderc) / the Vulkan SDK")
+                hdr = any(Path(d, "vulkan", "vulkan.h").is_file() for d in ("/usr/include", "/usr/local/include"))
+                check("vulkan: headers", hdr, "vulkan/vulkan.h" if hdr else "install libvulkan-dev")
+        if backend == "cuda":
+            nvcc = shutil.which("nvcc")
+            if not nvcc and os.environ.get("CUDA_PATH"):
+                cand = Path(os.environ["CUDA_PATH"], "bin", "nvcc.exe" if os_tok == "windows" else "nvcc")
+                nvcc = str(cand) if cand.is_file() else None
+            if nvcc:
+                ver = subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1:]
+                check("cuda: nvcc", True, f"{nvcc} ({ver[0] if ver else '?'})")
+            else:
+                check("cuda: nvcc", False, "not found on PATH or under CUDA_PATH; install the CUDA toolkit")
+        if os_tok == "linux" and backend == "cpu":
+            zig = shutil.which("zig")
+            if not zig:
+                r = subprocess.run([sys.executable, "-m", "ziglang", "version"], capture_output=True, text=True)
+                zig = f"{sys.executable} -m ziglang {r.stdout.strip()}" if r.returncode == 0 else None
+            check("cpu: zig (maturin --zig)", bool(zig), zig or f"`{sys.executable} -m pip install ziglang` or install zig")
+
+    width = max(len(n) for n, _, _ in results)
+    for name, ok, detail in results:
+        print(f"[preflight] {'ok  ' if ok else 'MISS'} {name:<{width}}  {detail}")
+    missing = [n for n, ok, _ in results if not ok]
+    print(f"[preflight] {os_tok}: {len(results) - len(missing)}/{len(results)} ready"
+          + (f"; missing: {', '.join(missing)}" if missing else ""))
+    return 2 if missing else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     valid_backends = sorted({b for _, b in _MATRIX})
     parser = argparse.ArgumentParser(
@@ -673,6 +778,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"CPython versions (default: {' '.join(_PYTHONS)})")
     parser.add_argument("--install-missing", action="store_true",
                         help="`uv python install` any interpreter not already present")
+    parser.add_argument("--preflight", action="store_true",
+                        help="check every prerequisite of the requested builds and exit (builds nothing)")
     parser.add_argument("--no-smoke-test", dest="smoke", action="store_false",
                         help="skip the post-build import/backend-label check")
     args = parser.parse_args(argv)
@@ -690,6 +797,9 @@ def main(argv: list[str] | None = None) -> int:
                          f"valid: {', '.join(valid_backends)}")
 
     # Resolve interpreters once (shared across backends).
+    if args.preflight:
+        return preflight(os_tok, requested, args.pythons, install_missing=args.install_missing)
+
     print(f"[build_local] host OS: {os_tok}; resolving interpreters via uv...")
     interps: list[str] = []
     for v in args.pythons:

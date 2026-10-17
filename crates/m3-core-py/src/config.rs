@@ -2,86 +2,59 @@
 //!
 //! m3 reads every setting from its registry (m3_config.toml and its sources)
 //! and passes the values here (m3 memory `9655f30a`: settings reach the core as
-//! parameters, not environment). Per setting: the parameter > its legacy
-//! `M3_*` environment name > the default. The environment name is honoured for
-//! one release when the caller passes nothing, with one warning naming the
-//! parameter and the m3_config.toml key that replace it (owner of that read
-//! and warning: `m3_config::deprecated_env`).
+//! parameters, not environment). Per setting: the parameter > the default. The
+//! legacy `M3_EMBED_*` environment names were read for one release (3.10.17)
+//! and are not read any more.
 
 use m3_dispatcher::{BreakerCfg, DispatcherConfig};
 
-/// One setting's parameter name, legacy environment name and m3 registry key.
+/// One setting's parameter name and m3 registry key.
 struct Setting {
     param: &'static str,
-    env: &'static str,
     key: &'static str,
 }
 
 const STREAMS: Setting = Setting {
     param: "streams",
-    env: "M3_EMBED_STREAMS",
     key: "embed.streams",
 };
 const COALESCE_MS: Setting = Setting {
     param: "coalesce_ms",
-    env: "M3_EMBED_COALESCE_MS",
     key: "embed.coalesce_ms",
 };
 const MAX_BATCH_TOKENS: Setting = Setting {
     param: "max_batch_tokens",
-    env: "M3_EMBED_MAX_BATCH_TOKENS",
     key: "embed.max_batch_tokens",
 };
 const CTX: Setting = Setting {
     param: "ctx",
-    env: "M3_EMBED_CTX",
     key: "embed.ctx",
 };
 const SEQ_MAX: Setting = Setting {
     param: "seq_max",
-    env: "M3_EMBED_SEQ_MAX",
     key: "embed.seq_max",
 };
 const N_BATCH: Setting = Setting {
     param: "n_batch",
-    env: "M3_EMBED_N_BATCH",
     key: "embed.n_batch",
 };
 const N_UBATCH: Setting = Setting {
     param: "n_ubatch",
-    env: "M3_EMBED_N_UBATCH",
     key: "embed.n_ubatch",
 };
 
-/// `given`, else the legacy environment value, else `default`; a value below
-/// `min` is raised to it. An unparseable environment value is reported with the
-/// name, the raw value and what was used instead: it must not read as the value
-/// the operator set.
+/// `given`, else `default`; a value below `min` is raised to it, and says so.
 fn value<T>(s: &Setting, given: Option<T>, default: T, min: T) -> T
 where
-    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
-    T::Err: std::fmt::Display,
+    T: PartialOrd + std::fmt::Display + Copy,
 {
-    let (v, from) = match given {
-        Some(v) => (v, format!("{}=", s.param)),
-        None => match m3_config::deprecated_env(s.env, s.param, s.key) {
-            None => return default,
-            Some(raw) => match raw.trim().parse::<T>() {
-                Ok(v) => (v, s.env.to_string()),
-                Err(e) => {
-                    log::warn!(
-                        "ignoring {}={raw:?}: not a valid {} ({e}); using the default {default}",
-                        s.env,
-                        std::any::type_name::<T>()
-                    );
-                    return default;
-                }
-            },
-        },
+    let Some(v) = given else {
+        return default;
     };
     if v < min {
         log::warn!(
-            "{from}{v} is below the minimum {min} for {}; using {min}",
+            "{}={v} is below the minimum {min} for {}; using {min}",
+            s.param,
             s.key
         );
         return min;
@@ -169,25 +142,24 @@ pub fn dispatcher_config(s: &EmbedSettings) -> DispatcherConfig {
 
 /// The ACTIVE content-hash provider. It is chosen at build time (the
 /// `non-fips-perf` feature), so it is not a setting and has no m3_config.toml
-/// key; `M3_HASH_PROVIDER` is read only to say that a request for another
-/// provider is ignored (deprecated: no longer read after this release).
+/// key. `M3_HASH_PROVIDER` was read until 3.10.17 only to warn that it was
+/// ignored; it is not read any more.
 pub fn hash_provider() -> String {
-    let active = m3_hash::active_provider();
-    if let Ok(wanted) = std::env::var("M3_HASH_PROVIDER") {
-        if !wanted.is_empty() && !active.starts_with(wanted.trim()) {
-            log::warn!(
-                "M3_HASH_PROVIDER={wanted:?} is ignored: the hash provider is fixed when the wheel \
-                 is built, and this one uses {active:?}. The variable is deprecated and stops being \
-                 read in the next release; unset it"
-            );
-        }
-    }
-    active.to_string()
+    m3_hash::active_provider().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A leftover legacy name changes nothing: 3.10.17 read it for one release.
+    #[test]
+    fn a_leftover_legacy_env_name_is_not_read() {
+        std::env::set_var("M3_EMBED_STREAMS", "7");
+        let s = resolve(EmbedParams::default());
+        std::env::remove_var("M3_EMBED_STREAMS");
+        assert_eq!(s.streams, m3_dispatcher::DEFAULT_STREAMS);
+    }
 
     /// Parameters decide without consulting the environment, and the derived
     /// defaults follow the parameters (n_batch/n_ubatch = ctx, max = streams*ctx).

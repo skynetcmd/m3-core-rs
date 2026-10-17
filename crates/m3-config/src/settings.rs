@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::env::{Env, ProcessEnv};
+use crate::env::Env;
 use crate::roots::{expand_user, Location};
 
 /// The flag that carries settings to a child, spelled as m3 spells it.
@@ -632,23 +632,6 @@ fn kind_mismatch(key: &Key, got: &Value) -> ConfigError {
         "internal: {} is declared {:?} but resolved to {got:?}",
         key.name, key.kind
     ))
-}
-
-/// For callers that take a setting as a PARAMETER and still honour its old
-/// environment name for one release (m3-core-py): the value of `name` when set,
-/// with one warning naming the parameter and the m3_config.toml key that
-/// replace it.
-pub fn deprecated_env(name: &str, param: &str, key: &str) -> Option<String> {
-    let raw = ProcessEnv.var(name)?;
-    if once(&format!("deprecated:{name}")) {
-        log::warn!(
-            "{name}={raw:?} is used because the caller did not pass {param}=; the environment name is \
-             deprecated and stops being read in the next release. The setting is {key} in \
-             m3_config.toml, which m3 passes as {param}=: set it there (`m3 config set {key} <value>`) \
-             and unset {name}"
-        );
-    }
-    Some(raw)
 }
 
 #[cfg(test)]

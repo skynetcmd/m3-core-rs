@@ -37,5 +37,5 @@ mod winacl;
 pub use env::{Env, MapEnv, ProcessEnv};
 pub use roots::{locate, Location, Tier, CONFIG_FILE_NAME, CONFIG_ROOT_ENV, MEMORY_ROOT_ENV};
 pub use settings::{
-    deprecated_env, parse_bool, parse_set, Config, ConfigError, Key, Kind, Overrides, Source, Value,
+    parse_bool, parse_set, Config, ConfigError, Key, Kind, Overrides, Source, Value,
 };

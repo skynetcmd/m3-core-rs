@@ -492,15 +492,17 @@ pub fn install() -> Result<(), Box<dyn std::error::Error>> {
 /// `key= value` pair, and the args must be passed as separate tokens (not a
 /// single command-line string).
 fn configure_recovery_actions() -> Result<(), String> {
-    let output = std::process::Command::new("sc.exe")
-        .args([
-            "failure",
-            SERVICE_NAME,
-            "reset=",
-            "60",
-            "actions=",
-            "restart/5000/restart/5000/restart/5000",
-        ])
+    let mut cmd = std::process::Command::new("sc.exe");
+    cmd.args([
+        "failure",
+        SERVICE_NAME,
+        "reset=",
+        "60",
+        "actions=",
+        "restart/5000/restart/5000/restart/5000",
+    ]);
+    // `install` also runs from an elevated helper with no visible console.
+    let output = m3_config::os::no_console_window(&mut cmd)
         .output()
         .map_err(|e| format!("failed to spawn sc.exe: {e}"))?;
     if !output.status.success() {

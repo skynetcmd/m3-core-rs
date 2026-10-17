@@ -72,8 +72,11 @@ fn disable_cuda_graphs_on_blackwell() {
 /// or the unparseable line).
 #[cfg(feature = "embedded-cuda")]
 pub(crate) fn detect_cuda_compute_caps() -> Result<Vec<(usize, f32)>, String> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=index,compute_cap", "--format=csv,noheader"])
+    // No console window: this runs at `import m3_core_rs`, so from a process
+    // without a console (pythonw, a hook) it flashed a window each time.
+    let mut cmd = std::process::Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=index,compute_cap", "--format=csv,noheader"]);
+    let out = m3_config::os::no_console_window(&mut cmd)
         .output()
         .map_err(|e| format!("could not run nvidia-smi: {e}"))?;
     if !out.status.success() {

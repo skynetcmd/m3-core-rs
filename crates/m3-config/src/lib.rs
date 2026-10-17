@@ -21,6 +21,7 @@
 //! setting that decided it.
 
 pub mod env;
+pub mod os;
 pub mod roots;
 pub mod secrets;
 pub mod security;

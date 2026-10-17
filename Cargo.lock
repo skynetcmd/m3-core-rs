@@ -1241,6 +1241,7 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "log",
+ "m3-config",
  "m3-dispatcher",
  "m3-error",
  "tokio",

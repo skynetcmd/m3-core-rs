@@ -29,6 +29,8 @@ embedded-metal  = ["embedded", "llama-cpp-2/metal"]
 
 [dependencies]
 m3-error = { workspace = true }
+# no_console_window: the nvidia-smi probe must not open a window.
+m3-config = { workspace = true }
 m3-dispatcher = { workspace = true }
 # Diagnostics here must reach the SERVICE log, not just a console. Under the
 # Windows SCM there is no usable stderr, so `eprintln!` discards the CUDA

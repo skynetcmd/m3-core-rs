@@ -9,6 +9,7 @@ description = "Generic model-backend coalescer: length bucketing, batching, back
 
 [dependencies]
 m3-error = { workspace = true }
+m3-resilience = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 log = "0.4"
 

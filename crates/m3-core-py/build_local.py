@@ -70,9 +70,12 @@ _REPO_ROOT = _HERE.parent.parent
 # host that only has stable interpreters will report it MISSING — that is
 # expected, not a broken environment. Use --pythons to build a subset locally;
 # CI is the place the full matrix has to be complete.
-# ⚠ 3.11 is a ONE-RELEASE COURTESY set (see pyproject requires-python,
-# temporarily >=3.11). Drop it, and restore the >=3.12 floor, next release.
-_PYTHONS = ("3.11", "3.12", "3.13", "3.14", "3.15")
+# 3.11 was dropped 2026-10-01: its one-release courtesy set shipped in
+# v2026.9.20 and pyproject's floor is back to >=3.12. Building a cp311 wheel now
+# would produce an asset no supported m3 install can use — m3-memory requires
+# >=3.12, and pip reads Requires-Python from the wheel's own METADATA and
+# refuses, even on the direct --no-deps path.
+_PYTHONS = ("3.12", "3.13", "3.14", "3.15")
 
 # A path is a virtualenv interpreter (never use one to build a wheel) if it sits
 # under a venv layout. uv may return the active project venv from a plain
@@ -611,36 +614,158 @@ def build_one(
 
 
 def smoke_test(os_tok: str, version: str, backend: str) -> bool:
-    """Install one built wheel into a throwaway uv venv and check the backend label."""
+    """Install one built wheel into a throwaway uv venv and check it is the
+    backend it claims: `__build_backend__` and `embed_backend_label()` must
+    both equal `backend`, and `EmbeddedEmbedder` must exist. (Any non-empty
+    label used to pass, so a CPU wheel in a cuda directory went unnoticed.)"""
     out_dir = _REPO_ROOT / "ci-wheels" / f"local-{version}" / f"{os_tok}-{backend}"
     wheels = sorted(out_dir.glob("*.whl"))
     if not wheels:
         print(f"[smoke] {os_tok}/{backend}: no wheel to test", file=sys.stderr)
         return False
-    # Prefer a 3.13 wheel; otherwise the first available.
-    wheel = next((w for w in wheels if "cp313" in w.name), wheels[0])
+    # Test with the interpreter the wheel was built for, read from its tag
+    # (cp314 -> 3.14). A fixed 3.13 failed every `--pythons` build without 3.13.
+    wheel = wheels[0]
+    tag = re.search(r"-cp3(\d+)-", wheel.name)
+    if not tag:
+        print(f"[smoke] {os_tok}/{backend}: cannot read the Python tag from {wheel.name}", file=sys.stderr)
+        return False
+    pyver = f"3.{tag.group(1)}"
     uv = _uv()
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         venv = Path(tmp) / "venv"
-        if subprocess.run([uv, "venv", "--python", "3.13", str(venv)],
-                          capture_output=True).returncode != 0:
-            subprocess.run([uv, "venv", str(venv)], capture_output=True)
+        made = subprocess.run([uv, "venv", "--python", pyver, str(venv)], capture_output=True, text=True)
+        if made.returncode != 0:
+            print(f"[smoke] {os_tok}/{backend}: cannot create a Python {pyver} venv for {wheel.name} "
+                  f"(uv exit {made.returncode}): {made.stderr.strip()}", file=sys.stderr)
+            return False
         py = venv / ("Scripts" if os_tok == "windows" else "bin") / (
             "python.exe" if os_tok == "windows" else "python")
-        if subprocess.run([uv, "pip", "install", "--python", str(py), str(wheel)],
-                          capture_output=True).returncode != 0:
-            print(f"[smoke] {os_tok}/{backend}: install failed", file=sys.stderr)
+        inst = subprocess.run([uv, "pip", "install", "--python", str(py), str(wheel)],
+                              capture_output=True, text=True)
+        if inst.returncode != 0:
+            print(f"[smoke] {os_tok}/{backend}: install of {wheel.name} failed "
+                  f"(exit {inst.returncode}):\n{inst.stderr.strip()}", file=sys.stderr)
             return False
         r = subprocess.run(
             [str(py), "-c",
-             "import m3_core_rs; print(m3_core_rs.embed_backend_label())"],
+             "import m3_core_rs as m; print(m.__build_backend__, m.embed_backend_label(), "
+             "hasattr(m, 'EmbeddedEmbedder'))"],
             capture_output=True, text=True)
-        label = r.stdout.strip()
-        ok = r.returncode == 0 and label != ""
-        print(f"[smoke] {os_tok}/{backend}: import {'OK' if ok else 'FAILED'} "
-              f"-> backend={label or '(error)'}")
+        got = r.stdout.split()
+        ok = r.returncode == 0 and got == [backend, backend, "True"]
+        print(f"[smoke] {os_tok}/{backend}: {'OK' if ok else 'FAILED'} -> "
+              f"__build_backend__, embed_backend_label, EmbeddedEmbedder = "
+              f"{got or '(import error)'}; expected [{backend!r}, {backend!r}, 'True']")
+        if r.returncode != 0:
+            print(r.stderr.strip(), file=sys.stderr)
         return ok
+
+
+def _rust_version_required() -> str:
+    """Cargo.toml [workspace.package] rust-version (the minimum compiler)."""
+    m = re.search(r'^rust-version\s*=\s*"([^"]+)"', (_REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8"), re.M)
+    return m.group(1) if m else "0"
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", text)
+    return tuple(int(g) for g in m.groups() if g is not None) if m else ()
+
+
+def preflight(os_tok: str, backends: list[str], pythons: list[str], *, install_missing: bool) -> int:
+    """Check every prerequisite of the requested builds WITHOUT building, and
+    report all of them at once. A missing tool used to surface mid-build (the
+    macOS lane: no maturin for the launching Python, found after cargo had run).
+    Exit 0 when every check passes, 2 otherwise."""
+    results: list[tuple[str, bool, str]] = []
+
+    def check(name: str, ok: bool, detail: str) -> None:
+        results.append((name, ok, detail))
+
+    uv = shutil.which("uv")
+    check("uv", bool(uv), uv or "not on PATH; install https://docs.astral.sh/uv/ or use a login shell")
+    if uv:
+        for v in pythons:
+            p = resolve_interpreter(v, install_missing=install_missing)
+            check(f"python {v}", bool(p), p or f"not found; rerun with --install-missing (uv python install {v})")
+
+    mat = shutil.which("maturin")
+    if mat:
+        check("maturin", True, mat)
+    else:
+        r = subprocess.run([sys.executable, "-m", "maturin", "--version"], capture_output=True, text=True)
+        check("maturin", r.returncode == 0,
+              f"{sys.executable} -m maturin ({r.stdout.strip()})" if r.returncode == 0 else
+              f"neither `maturin` on PATH nor importable by {sys.executable}; "
+              f"`pipx install maturin` (and put ~/.local/bin on PATH) or `{sys.executable} -m pip install maturin`")
+
+    need = _rust_version_required()
+    rustc = shutil.which("rustc") or (str(Path.home() / ".cargo" / "bin" / "rustc") if (Path.home() / ".cargo" / "bin").is_dir() else None)
+    if rustc:
+        got = subprocess.run([rustc, "--version"], capture_output=True, text=True).stdout.strip()
+        ok = _version_tuple(got) >= _version_tuple(need)
+        check("rustc", ok, f"{got} (needs >= {need})" + ("" if ok else "; run `rustup update stable`"))
+    else:
+        check("rustc", False, "not found; install rustup (https://rustup.rs)")
+    check("cargo", bool(shutil.which("cargo") or (Path.home() / ".cargo" / "bin").is_dir()),
+          shutil.which("cargo") or "~/.cargo/bin (not on PATH)")
+
+    check("cmake", bool(shutil.which("cmake")), shutil.which("cmake") or "not on PATH (llama.cpp builds with cmake on every backend)")
+
+    vc_env = None
+    if os_tok == "windows":
+        vc_env = _vcvars_env()
+        check("MSVC (vcvars64)", vc_env is not None,
+              "found" if vc_env else "not found; install Visual Studio Build Tools with the C++ workload")
+    elif os_tok == "macos":
+        r = subprocess.run(["xcrun", "--find", "clang"], capture_output=True, text=True)
+        check("Xcode clang", r.returncode == 0, r.stdout.strip() or "run `xcode-select --install`")
+    else:
+        cc = shutil.which("cc") or shutil.which("gcc")
+        check("C compiler", bool(cc), cc or "install build-essential (gcc, g++)")
+
+    for backend in backends:
+        if (os_tok, backend) not in _MATRIX:
+            continue
+        if os_tok == "windows" and backend in ("vulkan", "cuda"):
+            path_value = (vc_env or {}).get("PATH", os.environ.get("PATH", ""))
+            ninja = _find_on_path(path_value, "ninja.exe") or shutil.which("ninja")
+            check(f"{backend}: ninja", bool(ninja), ninja or "not found (VS ships it under CMake; or `winget install Ninja-build.Ninja`)")
+        if backend == "vulkan":
+            if os_tok == "windows":
+                sdk = _find_vulkan_sdk()
+                check("vulkan: SDK (glslc)", bool(sdk), sdk or "install the LunarG Vulkan SDK")
+            else:
+                glslc = shutil.which("glslc")
+                check("vulkan: glslc", bool(glslc), glslc or "install glslc (shaderc) / the Vulkan SDK")
+                hdr = any(Path(d, "vulkan", "vulkan.h").is_file() for d in ("/usr/include", "/usr/local/include"))
+                check("vulkan: headers", hdr, "vulkan/vulkan.h" if hdr else "install libvulkan-dev")
+        if backend == "cuda":
+            nvcc = shutil.which("nvcc")
+            if not nvcc and os.environ.get("CUDA_PATH"):
+                cand = Path(os.environ["CUDA_PATH"], "bin", "nvcc.exe" if os_tok == "windows" else "nvcc")
+                nvcc = str(cand) if cand.is_file() else None
+            if nvcc:
+                ver = subprocess.run([nvcc, "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1:]
+                check("cuda: nvcc", True, f"{nvcc} ({ver[0] if ver else '?'})")
+            else:
+                check("cuda: nvcc", False, "not found on PATH or under CUDA_PATH; install the CUDA toolkit")
+        if os_tok == "linux" and backend == "cpu":
+            zig = shutil.which("zig")
+            if not zig:
+                r = subprocess.run([sys.executable, "-m", "ziglang", "version"], capture_output=True, text=True)
+                zig = f"{sys.executable} -m ziglang {r.stdout.strip()}" if r.returncode == 0 else None
+            check("cpu: zig (maturin --zig)", bool(zig), zig or f"`{sys.executable} -m pip install ziglang` or install zig")
+
+    width = max(len(n) for n, _, _ in results)
+    for name, ok, detail in results:
+        print(f"[preflight] {'ok  ' if ok else 'MISS'} {name:<{width}}  {detail}")
+    missing = [n for n, ok, _ in results if not ok]
+    print(f"[preflight] {os_tok}: {len(results) - len(missing)}/{len(results)} ready"
+          + (f"; missing: {', '.join(missing)}" if missing else ""))
+    return 2 if missing else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -653,6 +778,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"CPython versions (default: {' '.join(_PYTHONS)})")
     parser.add_argument("--install-missing", action="store_true",
                         help="`uv python install` any interpreter not already present")
+    parser.add_argument("--preflight", action="store_true",
+                        help="check every prerequisite of the requested builds and exit (builds nothing)")
     parser.add_argument("--no-smoke-test", dest="smoke", action="store_false",
                         help="skip the post-build import/backend-label check")
     args = parser.parse_args(argv)
@@ -670,6 +797,9 @@ def main(argv: list[str] | None = None) -> int:
                          f"valid: {', '.join(valid_backends)}")
 
     # Resolve interpreters once (shared across backends).
+    if args.preflight:
+        return preflight(os_tok, requested, args.pythons, install_missing=args.install_missing)
+
     print(f"[build_local] host OS: {os_tok}; resolving interpreters via uv...")
     interps: list[str] = []
     for v in args.pythons:
@@ -694,8 +824,8 @@ def main(argv: list[str] | None = None) -> int:
         use_zig = (os_tok == "linux" and backend == "cpu")
         rc = build_one(backend, os_tok, version, interps, use_zig=use_zig)
         rc_total = rc_total or rc
-        if rc == 0 and args.smoke:
-            smoke_test(os_tok, version, backend)
+        if rc == 0 and args.smoke and not smoke_test(os_tok, version, backend):
+            rc_total = rc_total or 3
 
     return rc_total
 

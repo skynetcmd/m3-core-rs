@@ -1,94 +1,212 @@
-//! The single home for `M3_*` env-var reading (plan §9.6). Generic crates take
-//! typed configs; this module is the only place `std::env::var` is called.
-//! Precedence is kwarg > env > default (§9.7) — kwarg handling lives in the
-//! `#[pymethods]` constructors; this module supplies the env-or-default layer.
-
-use std::env;
+//! The in-process embedder's settings, as PARAMETERS from Python.
+//!
+//! m3 reads every setting from its registry (m3_config.toml and its sources)
+//! and passes the values here (m3 memory `9655f30a`: settings reach the core as
+//! parameters, not environment). Per setting: the parameter > its legacy
+//! `M3_*` environment name > the default. The environment name is honoured for
+//! one release when the caller passes nothing, with one warning naming the
+//! parameter and the m3_config.toml key that replace it (owner of that read
+//! and warning: `m3_config::deprecated_env`).
 
 use m3_dispatcher::{BreakerCfg, DispatcherConfig};
 
-/// Parse an `M3_*` env var into `T`, falling back to `default` when unset or
-/// unparseable.
-fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+/// One setting's parameter name, legacy environment name and m3 registry key.
+struct Setting {
+    param: &'static str,
+    env: &'static str,
+    key: &'static str,
 }
 
-/// `M3_EMBED_STREAMS` — concurrent dispatcher streams.
-pub fn embed_streams() -> usize {
-    env_or("M3_EMBED_STREAMS", 8)
+const STREAMS: Setting = Setting {
+    param: "streams",
+    env: "M3_EMBED_STREAMS",
+    key: "embed.streams",
+};
+const COALESCE_MS: Setting = Setting {
+    param: "coalesce_ms",
+    env: "M3_EMBED_COALESCE_MS",
+    key: "embed.coalesce_ms",
+};
+const MAX_BATCH_TOKENS: Setting = Setting {
+    param: "max_batch_tokens",
+    env: "M3_EMBED_MAX_BATCH_TOKENS",
+    key: "embed.max_batch_tokens",
+};
+const CTX: Setting = Setting {
+    param: "ctx",
+    env: "M3_EMBED_CTX",
+    key: "embed.ctx",
+};
+const SEQ_MAX: Setting = Setting {
+    param: "seq_max",
+    env: "M3_EMBED_SEQ_MAX",
+    key: "embed.seq_max",
+};
+const N_BATCH: Setting = Setting {
+    param: "n_batch",
+    env: "M3_EMBED_N_BATCH",
+    key: "embed.n_batch",
+};
+const N_UBATCH: Setting = Setting {
+    param: "n_ubatch",
+    env: "M3_EMBED_N_UBATCH",
+    key: "embed.n_ubatch",
+};
+
+/// `given`, else the legacy environment value, else `default`; a value below
+/// `min` is raised to it. An unparseable environment value is reported with the
+/// name, the raw value and what was used instead: it must not read as the value
+/// the operator set.
+fn value<T>(s: &Setting, given: Option<T>, default: T, min: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
+    T::Err: std::fmt::Display,
+{
+    let (v, from) = match given {
+        Some(v) => (v, format!("{}=", s.param)),
+        None => match m3_config::deprecated_env(s.env, s.param, s.key) {
+            None => return default,
+            Some(raw) => match raw.trim().parse::<T>() {
+                Ok(v) => (v, s.env.to_string()),
+                Err(e) => {
+                    log::warn!(
+                        "ignoring {}={raw:?}: not a valid {} ({e}); using the default {default}",
+                        s.env,
+                        std::any::type_name::<T>()
+                    );
+                    return default;
+                }
+            },
+        },
+    };
+    if v < min {
+        log::warn!(
+            "{from}{v} is below the minimum {min} for {}; using {min}",
+            s.key
+        );
+        return min;
+    }
+    v
 }
 
-/// `M3_EMBED_COALESCE_MS` — coalescing-window width in milliseconds.
-pub fn embed_coalesce_ms() -> u64 {
-    env_or("M3_EMBED_COALESCE_MS", 3)
+/// The settings a caller may pass; `None` = not given.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmbedParams {
+    pub streams: Option<usize>,
+    pub ctx: Option<u32>,
+    pub seq_max: Option<u32>,
+    pub n_batch: Option<u32>,
+    pub n_ubatch: Option<u32>,
+    pub coalesce_ms: Option<u64>,
+    pub max_batch_tokens: Option<usize>,
 }
 
-/// `M3_EMBED_MAX_BATCH_TOKENS` — the dispatcher's coalescing ceiling: how many
-/// tokens' worth of separate jobs are packed into one batch before it is
-/// flushed to the worker pool. Defaults to `M3_EMBED_STREAMS * M3_EMBED_CTX` so
-/// a single coalescing window can fill *every* worker's context at once — the
-/// earlier flat 2048 default capped a batch at roughly one context's worth,
-/// under-feeding the `streams`-wide pool by a factor of `streams`. This knob
-/// bounds host-side queue memory only; per-worker GPU KV-cache stays bounded by
-/// `M3_EMBED_CTX` regardless. `saturating_mul` guards the (unrealistic) overflow
-/// case on 32-bit targets.
-pub fn embed_max_batch_tokens() -> usize {
-    let default = embed_streams().saturating_mul(embed_ctx() as usize);
-    env_or("M3_EMBED_MAX_BATCH_TOKENS", default)
+/// The settings in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbedSettings {
+    pub streams: usize,
+    pub ctx: u32,
+    pub seq_max: u32,
+    pub n_batch: u32,
+    pub n_ubatch: u32,
+    pub coalesce_ms: u64,
+    pub max_batch_tokens: usize,
 }
 
-/// `M3_EMBED_CTX` — total KV-cache token budget per worker context.
-/// Defaults to 8192 (BGE-M3 training context). Shared across all sequences in
-/// one decode call: effective per-sequence capacity = M3_EMBED_CTX / M3_EMBED_SEQ_MAX.
-/// Texts longer than that per-seq limit are decoded alone (using the full budget).
-/// KV memory per worker ≈ M3_EMBED_CTX × 96 KB (BGE-M3 fp16 KV estimate).
-pub fn embed_ctx() -> u32 {
-    env_or("M3_EMBED_CTX", 8192u32)
+/// Resolve every setting.
+///
+/// * `ctx` — total KV-cache token budget per worker context; default 8192 (the
+///   BGE-M3 training context), shared across the sequences of one decode call.
+/// * `seq_max` — sequences packed into one decode call; default 32.
+/// * `n_batch` / `n_ubatch` — default `ctx`. The BERT encoder asserts
+///   `n_ubatch >= n_tokens` over the whole batch and a chunk can hold `ctx`
+///   tokens, so `ctx` is the only encoder-safe default (an earlier 512 / 2048
+///   crashed it on routine inputs); the embed crate floors smaller values.
+/// * `max_batch_tokens` — the dispatcher's coalescing ceiling; default
+///   `streams * ctx`, so one window can fill every worker's context (a flat
+///   2048 under-fed the pool by a factor of `streams`). Bounds host-side queue
+///   memory only. `saturating_mul` guards a 32-bit overflow.
+pub fn resolve(p: EmbedParams) -> EmbedSettings {
+    let streams = value(&STREAMS, p.streams, m3_dispatcher::DEFAULT_STREAMS, 1);
+    let ctx = value(
+        &CTX,
+        p.ctx,
+        m3_embed_llamacpp::DEFAULT_N_CTX,
+        m3_embed_llamacpp::MIN_N_CTX,
+    );
+    EmbedSettings {
+        streams,
+        ctx,
+        seq_max: value(&SEQ_MAX, p.seq_max, m3_embed_llamacpp::DEFAULT_SEQ_MAX, 1),
+        n_batch: value(&N_BATCH, p.n_batch, ctx, 1),
+        n_ubatch: value(&N_UBATCH, p.n_ubatch, ctx, 1),
+        coalesce_ms: value(
+            &COALESCE_MS,
+            p.coalesce_ms,
+            m3_dispatcher::DEFAULT_COALESCE_WINDOW_MS,
+            0,
+        ),
+        max_batch_tokens: value(
+            &MAX_BATCH_TOKENS,
+            p.max_batch_tokens,
+            streams.saturating_mul(ctx as usize),
+            1,
+        ),
+    }
 }
 
-/// `M3_EMBED_SEQ_MAX` — max sequences packed into one llama.cpp decode call per
-/// worker context. Higher values amortise the per-decode overhead across more
-/// texts; lower values reduce KV-cache memory per context. Default: 32.
-/// Each worker context's total token budget per decode is capped by `M3_EMBED_CTX`
-/// regardless of this setting, so effective seqs/decode = min(seq_max, ctx/avg_tokens).
-pub fn embed_seq_max() -> u32 {
-    env_or("M3_EMBED_SEQ_MAX", 32u32)
-}
-
-/// `M3_EMBED_N_BATCH` — llama.cpp's prompt-process batch ceiling. Defaults to
-/// `M3_EMBED_CTX` (8192). It must be >= `n_ubatch`, and `n_ubatch` must cover
-/// the largest decode chunk — which `embed_on_ctx` bounds at `n_ctx` — so the
-/// only encoder-safe default is `n_batch == n_ctx`. The earlier 2048 default
-/// (decoupled from `n_ctx` in wave-3 fix #1) crashed the BERT encoder's
-/// `GGML_ASSERT(n_ubatch >= n_tokens)` on routine BGE-M3 inputs. Operators may
-/// still raise it above `n_ctx`; the embed crate floors any smaller value.
-pub fn embed_n_batch() -> u32 {
-    env_or("M3_EMBED_N_BATCH", embed_ctx())
-}
-
-/// `M3_EMBED_N_UBATCH` — llama.cpp's micro-batch (the inner SIMD tile size).
-/// Defaults to `M3_EMBED_CTX` (8192). The BERT encoder asserts `n_ubatch >=
-/// n_tokens` for the whole batch and a decode chunk can be up to `n_ctx`
-/// tokens, so `n_ubatch` below `n_ctx` is unsafe — the embed crate floors it
-/// up to `n_ctx`. The earlier 512 default was the source of the encoder crash
-/// on any text/chunk over 512 tokens.
-pub fn embed_n_ubatch() -> u32 {
-    env_or("M3_EMBED_N_UBATCH", embed_ctx())
-}
-
-/// `M3_HASH_PROVIDER` — preferred hash backend label.
-pub fn hash_provider() -> String {
-    env::var("M3_HASH_PROVIDER").unwrap_or_else(|_| "ring".to_string())
-}
-
-/// Build a `DispatcherConfig` from the env layer; `length_buckets` and the
-/// circuit breaker keep their crate defaults (no env var defined for them yet).
-pub fn dispatcher_config_from_env() -> DispatcherConfig {
+/// The dispatcher's config from resolved settings; `length_buckets` and the
+/// circuit breaker keep their crate defaults.
+pub fn dispatcher_config(s: &EmbedSettings) -> DispatcherConfig {
     DispatcherConfig {
-        streams: embed_streams(),
-        coalesce_window_ms: embed_coalesce_ms(),
-        max_batch_tokens: embed_max_batch_tokens(),
+        streams: s.streams,
+        coalesce_window_ms: s.coalesce_ms,
+        max_batch_tokens: s.max_batch_tokens,
         length_buckets: DispatcherConfig::default().length_buckets,
         circuit_breaker: BreakerCfg::default(),
+    }
+}
+
+/// The ACTIVE content-hash provider. It is chosen at build time (the
+/// `non-fips-perf` feature), so it is not a setting and has no m3_config.toml
+/// key; `M3_HASH_PROVIDER` is read only to say that a request for another
+/// provider is ignored (deprecated: no longer read after this release).
+pub fn hash_provider() -> String {
+    let active = m3_hash::active_provider();
+    if let Ok(wanted) = std::env::var("M3_HASH_PROVIDER") {
+        if !wanted.is_empty() && !active.starts_with(wanted.trim()) {
+            log::warn!(
+                "M3_HASH_PROVIDER={wanted:?} is ignored: the hash provider is fixed when the wheel \
+                 is built, and this one uses {active:?}. The variable is deprecated and stops being \
+                 read in the next release; unset it"
+            );
+        }
+    }
+    active.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parameters decide without consulting the environment, and the derived
+    /// defaults follow the parameters (n_batch/n_ubatch = ctx, max = streams*ctx).
+    #[test]
+    fn parameters_decide_and_derived_defaults_follow_them() {
+        let s = resolve(EmbedParams {
+            streams: Some(3),
+            ctx: Some(4096),
+            ..Default::default()
+        });
+        assert_eq!((s.streams, s.ctx), (3, 4096));
+        assert_eq!((s.n_batch, s.n_ubatch), (4096, 4096));
+        assert_eq!(s.max_batch_tokens, 3 * 4096);
+        let s = resolve(EmbedParams {
+            streams: Some(0),
+            ctx: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(s.streams, 1, "below the minimum is raised");
+        assert_eq!(s.ctx, m3_embed_llamacpp::MIN_N_CTX);
     }
 }

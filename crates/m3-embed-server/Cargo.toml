@@ -21,13 +21,24 @@ embedded-cuda   = ["embedded", "m3-embed-llamacpp/embedded-cuda"]
 embedded-vulkan = ["embedded", "m3-embed-llamacpp/embedded-vulkan"]
 # Metal GPU backend (macOS).
 embedded-metal  = ["embedded", "m3-embed-llamacpp/embedded-metal"]
+# Link AWS-LC's FIPS module for TLS and the token digest (needs CMake and Go to
+# build). Without it TLS still uses only approved algorithms, but
+# `crypto.fips_strict` refuses to serve TLS. See src/security.rs.
+fips = ["rustls/fips", "aws-lc-rs/fips"]
 
 [dependencies]
 m3-embed-llamacpp = { workspace = true, features = [] }
 m3-dispatcher = { workspace = true }
 m3-error = { workspace = true }
+m3-resilience = { workspace = true }
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time"] }
+# Transport security (src/security.rs): rustls on aws-lc-rs, never ring.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+aws-lc-rs = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful", "service", "http1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
@@ -37,10 +48,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 tracing-log = "0.2"
 anyhow = "1"
-toml = "0.8"
+# m3_config.toml and the secrets file: located and parsed in one place.
+m3-config = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tempfile = "3"
+tokio = { version = "1", features = ["io-util"] }
 
 [[bin]]
 name = "m3-embed-server"

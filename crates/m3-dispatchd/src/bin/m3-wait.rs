@@ -1,0 +1,309 @@
+//! `m3-wait --endpoint PATH --reader ID [--reader ID ...] [--timeout S] [-- CMD ARGS...]`
+//!
+//! Blocks on m3-dispatchd until a reader has mail, holding a few MB instead of
+//! a Python process with m3 loaded. Without CMD it prints the wake as JSON. With
+//! CMD it runs CMD on each wake (the wake JSON in `M3_WAKE`, stdio inherited):
+//! CMD's exit 0 ends the wait, 75 (EX_TEMPFAIL: nothing new after all) waits
+//! again, and any other code is passed through (except 2, 3, 4 and codes
+//! outside 0..=255, which become 1: see `passthrough`). CMD is how m3 confirms and
+//! stamps receipt in its store: the daemon issues no SQL.
+//!
+//! `--exit-when-stdin-closes`: exit (code 4) when stdin reaches end of file. A
+//! parent that holds the pipe open ends this process by dying, however it dies,
+//! so a killed parent leaves no waiter behind running confirm commands.
+//!
+//! Exit: 0 woke, 1 error, 2 timed out, 3 no daemon (the caller polls instead),
+//! 4 stdin closed.
+
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use m3_dispatchd::client::{post, ClientError};
+
+const KEEP_WAITING: i32 = 75;
+const STDIN_CLOSED: i32 = 4;
+/// The daemon caps one wait at an hour (api::MAX_WAIT); longer waits re-wait.
+const ONE_WAIT_S: f64 = 3600.0;
+
+#[derive(Debug)]
+struct Args {
+    endpoint: String,
+    readers: Vec<String>,
+    timeout: Duration,
+    then: Vec<String>,
+    exit_when_stdin_closes: bool,
+}
+
+fn usage() -> &'static str {
+    "usage: m3-wait --endpoint PATH --reader ID [--reader ID ...] [--timeout SECONDS] [--exit-when-stdin-closes] [-- CMD ARGS...]"
+}
+
+fn parse(argv: &[String]) -> Result<Args, String> {
+    let (own, then) = match argv.iter().position(|a| a == "--") {
+        Some(i) => (&argv[..i], argv[i + 1..].to_vec()),
+        None => (argv, Vec::new()),
+    };
+    let (mut endpoint, mut readers, mut timeout) = (None, Vec::new(), 3600.0_f64);
+    let mut exit_when_stdin_closes = false;
+    let mut it = own.iter();
+    while let Some(a) = it.next() {
+        let mut val = || {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("{a} needs a value"))
+        };
+        match a.as_str() {
+            "--endpoint" => endpoint = Some(val()?),
+            "--reader" => readers.push(val()?),
+            "--exit-when-stdin-closes" => exit_when_stdin_closes = true,
+            "--timeout" => {
+                timeout = val()?.parse().map_err(|e| format!("--timeout: {e}"))?;
+                if !(timeout.is_finite() && timeout >= 0.0) {
+                    return Err(format!(
+                        "--timeout must be a non-negative number; got {timeout}"
+                    ));
+                }
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    readers.retain(|r| !r.is_empty());
+    if readers.is_empty() {
+        return Err("at least one --reader is required".into());
+    }
+    let endpoint = endpoint.ok_or("--endpoint PATH is required (m3 passes it)")?;
+    Ok(Args {
+        endpoint,
+        readers,
+        timeout: Duration::from_secs_f64(timeout),
+        then,
+        exit_when_stdin_closes,
+    })
+}
+
+/// Run CMD for one wake; its exit code.
+fn run_then(then: &[String], wake: &str) -> Result<i32, String> {
+    let status = std::process::Command::new(&then[0])
+        .args(&then[1..])
+        .env("M3_WAKE", wake)
+        // Not this process's stdin: that may be the parent's liveness pipe.
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("cannot run {}: {e}", then[0]))?;
+    // A child killed by a signal has no code; it is an error, and said.
+    match status.code() {
+        Some(c) => Ok(c),
+        None => {
+            eprintln!(
+                "m3-wait: {} was killed by {}; exiting 1",
+                then[0],
+                signal_of(&status)
+            );
+            Ok(1)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_of(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .signal()
+        .map(|s| format!("signal {s}"))
+        .unwrap_or_else(|| "a signal".into())
+}
+
+#[cfg(not(unix))]
+fn signal_of(_status: &std::process::ExitStatus) -> String {
+    "an unknown cause".into()
+}
+
+/// The exit code m3-wait gives for CMD's `code`. CMD's code passes through,
+/// except where it would read as one of m3-wait's own (2 timed out, 3 no
+/// daemon, 4 stdin closed) or does not fit an exit status: those become 1,
+/// with a note, so a caller never polls because CMD happened to exit 3.
+fn passthrough(code: i32, cmd: &str) -> u8 {
+    match u8::try_from(code) {
+        Ok(c) if ![2, 3, STDIN_CLOSED as u8].contains(&c) => c,
+        _ => {
+            eprintln!(
+                "m3-wait: {cmd} exited {code}, which would read as m3-wait's own status \
+                 (2 timed out, 3 no daemon, 4 stdin closed) or is out of range; exiting 1"
+            );
+            1
+        }
+    }
+}
+
+async fn run(args: Args) -> u8 {
+    let deadline = Instant::now() + args.timeout;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "timeout": true, "readers": args.readers })
+            );
+            return 2;
+        }
+        let body = serde_json::json!({ "readers": args.readers, "timeout_s": left.as_secs_f64().min(ONE_WAIT_S) });
+        let (status, reply) = match post(&args.endpoint, "/wait", &body).await {
+            Ok(r) => r,
+            Err(e @ ClientError::NoDaemon(_)) => {
+                eprintln!("m3-wait: {e}");
+                return 3;
+            }
+            Err(e) => {
+                eprintln!("m3-wait: {e}");
+                return 1;
+            }
+        };
+        let text = String::from_utf8_lossy(&reply).into_owned();
+        if status != 200 {
+            eprintln!("m3-wait: m3-dispatchd answered {status}: {text}");
+            return 1;
+        }
+        let wake: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("m3-wait: unreadable reply from m3-dispatchd ({e}): {text}");
+                return 1;
+            }
+        };
+        if wake["wake"] == "timeout" {
+            continue;
+        }
+        if args.then.is_empty() {
+            println!("{text}");
+            return 0;
+        }
+        match run_then(&args.then, &text) {
+            Ok(0) => return 0,
+            Ok(KEEP_WAITING) => continue,
+            Ok(code) => return passthrough(code, &args.then[0]),
+            Err(e) => {
+                eprintln!("m3-wait: {e}");
+                return 1;
+            }
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--help" || a == "-h")
+    {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
+    let args = match parse(&argv) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("m3-wait: {e}\n{}", usage());
+            return ExitCode::from(1);
+        }
+    };
+    if args.exit_when_stdin_closes {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut sink = [0u8; 256];
+            let mut stdin = std::io::stdin();
+            // Bytes are ignored; end of file or an error means the parent is gone.
+            while matches!(stdin.read(&mut sink), Ok(n) if n > 0) {}
+            std::process::exit(STDIN_CLOSED);
+        });
+    }
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("m3-wait: cannot start the runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    ExitCode::from(rt.block_on(run(args)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cmd_codes_that_collide_with_m3_waits_own_become_1() {
+        assert_eq!(passthrough(5, "c"), 5);
+        assert_eq!(passthrough(1, "c"), 1);
+        for own in [2, 3, 4] {
+            assert_eq!(passthrough(own, "c"), 1, "{own}");
+        }
+        assert_eq!(passthrough(-1, "c"), 1);
+        assert_eq!(passthrough(300, "c"), 1);
+    }
+
+    #[test]
+    fn arguments() {
+        let a = parse(&v(&[
+            "--endpoint",
+            "/s",
+            "--reader",
+            "a",
+            "--reader",
+            "b@1",
+            "--timeout",
+            "5",
+            "--",
+            "py",
+            "-x",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (a.endpoint.as_str(), a.readers, a.timeout, a.then),
+            (
+                "/s",
+                v(&["a", "b@1"]),
+                Duration::from_secs(5),
+                v(&["py", "-x"])
+            )
+        );
+        assert!(parse(&v(&["--endpoint", "/s"]))
+            .unwrap_err()
+            .contains("--reader"));
+        assert!(parse(&v(&["--reader", "a"]))
+            .unwrap_err()
+            .contains("--endpoint"));
+        assert!(parse(&v(&[
+            "--endpoint",
+            "/s",
+            "--reader",
+            "a",
+            "--timeout",
+            "-1"
+        ]))
+        .is_err());
+        assert!(parse(&v(&["--endpoint", "/s", "--reader", "a", "--bogus"])).is_err());
+        assert!(
+            !parse(&v(&["--endpoint", "/s", "--reader", "a"]))
+                .unwrap()
+                .exit_when_stdin_closes
+        );
+        assert!(
+            parse(&v(&[
+                "--endpoint",
+                "/s",
+                "--reader",
+                "a",
+                "--exit-when-stdin-closes"
+            ]))
+            .unwrap()
+            .exit_when_stdin_closes
+        );
+    }
+}

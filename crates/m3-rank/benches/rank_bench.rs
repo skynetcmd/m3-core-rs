@@ -38,11 +38,18 @@ fn build_inputs() -> (Vec<RankRow>, Vec<RankRow>) {
 
 fn bench_fuse(c: &mut Criterion) {
     let (fts, vector) = build_inputs();
-    let weights = FusionWeights { fts: 0.4, vector: 0.6 };
+    let weights = FusionWeights {
+        fts: 0.4,
+        vector: 0.6,
+    };
     c.bench_function("fuse_n100_n100_30pct_overlap", |b| {
         b.iter(|| {
             // Clone inside the closure: fuse takes Vec by value.
-            fuse(black_box(fts.clone()), black_box(vector.clone()), black_box(weights))
+            fuse(
+                black_box(fts.clone()),
+                black_box(vector.clone()),
+                black_box(weights),
+            )
         });
     });
 }

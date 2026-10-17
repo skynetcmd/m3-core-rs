@@ -8,8 +8,9 @@ How to run:
     maturin develop          # builds + installs m3_core_rs into the active venv
     python tests/smoke.py
 
-Status: written but unverified-by-execution in this environment (maturin not
-available here). Build correctness is covered by `cargo build -p m3-core-py`.
+release.yml runs it against every CPU wheel it builds. Set
+M3_SMOKE_EXPECT_BACKEND (e.g. "cpu") to also assert __build_backend__ and the
+presence of EmbeddedEmbedder.
 """
 
 import os
@@ -113,6 +114,24 @@ def test_resilience() -> None:
     cb.record_success()
     assert cb.state() == "closed"
 
+    # peek() never claims the half-open probe; a probe that never reports is
+    # presumed lost after another reset window.
+    import time
+
+    cb = m.CircuitBreaker(1, 0.2)
+    cb.record_failure("connection refused")
+    assert cb.last_error() == "connection refused"
+    assert not cb.peek() and not cb.allow_request()
+    time.sleep(0.25)
+    assert cb.state() == "half_open"
+    assert cb.peek() and cb.peek()
+    assert cb.allow_request()  # the probe, which never reports
+    assert not cb.peek() and not cb.allow_request()
+    time.sleep(0.25)
+    assert cb.allow_request(), "a lost probe must not refuse every call forever"
+    cb.record_success()
+    assert cb.state() == "closed" and cb.last_error() is None
+
     rp = m.RetryPolicy(5, 0.1, 2.0)
     assert rp.max_attempts == 5
     assert abs(rp.delay_for_attempt(1) - 0.1) < 1e-6
@@ -131,8 +150,30 @@ def test_ner() -> None:
 
 
 def test_dispatcher_and_env() -> None:
-    assert m.estimate_tokens("a" * 40) == 10
-    assert m.estimate_tokens("") == 1
+    # max(bytes // 3, chars) + 2 (the BOS/EOS frame), never under-counting.
+    assert m.estimate_tokens("a" * 40) == 42
+    assert m.estimate_tokens("") == 2
+    assert m.estimate_tokens("\u6570" * 10) == 12  # 30 bytes // 3 = 10 = chars
+
+    # Settings are parameters (m3 passes them from m3_config.toml); the
+    # derived default max_batch_tokens follows the given streams and ctx.
+    cfg3 = m.DispatcherConfig(streams=3, ctx=4096)
+    assert (cfg3.streams, cfg3.max_batch_tokens) == (3, 3 * 4096), cfg3
+
+    # A parameter outranks the legacy environment name.
+    os.environ["M3_EMBED_STREAMS"] = "16"
+    assert m.DispatcherConfig(streams=5).streams == 5
+    del os.environ["M3_EMBED_STREAMS"]
+
+    if hasattr(m, "EmbeddedEmbedder"):
+        # warmup=False defers the model load, so no GGUF is needed to see the
+        # parameter reach the backend's context pool.
+        os.environ["M3_EMBED_STREAMS"] = "16"
+        emb = m.EmbeddedEmbedder("not-loaded.gguf", warmup=False, streams=3, ctx=4096)
+        assert emb.streams() == 3, emb.streams()
+        # Not given: the deprecated environment name still applies, this release.
+        assert m.EmbeddedEmbedder("not-loaded.gguf", warmup=False).streams() == 16
+        del os.environ["M3_EMBED_STREAMS"]
 
     # defaults (assuming no M3_* env vars set)
     cfg = m.DispatcherConfig()
@@ -198,7 +239,7 @@ def test_dispatcher_and_env() -> None:
     assert m.env_config_summary()["M3_EMBED_MAX_BATCH_TOKENS"] == 1024
     del os.environ["M3_EMBED_MAX_BATCH_TOKENS"]
 
-    # env var is picked up when set
+    # The deprecated env name is still picked up when no parameter is given.
     os.environ["M3_EMBED_STREAMS"] = "16"
     assert m.env_config_summary()["M3_EMBED_STREAMS"] == 16
     assert m.DispatcherConfig().streams == 16
@@ -245,9 +286,82 @@ def test_version() -> None:
     assert seen, "no m3-core-rs* distribution found"
 
 
+def test_exceptions() -> None:
+    """Typed exceptions, each still the builtin it used to be."""
+    assert issubclass(m.InputTooLong, m.M3Error) and issubclass(m.InputTooLong, ValueError)
+    assert issubclass(m.BackendError, OSError) and issubclass(m.IoError, OSError)
+    try:
+        m.cosine_batch([1.0, 0.0], [[1.0, 0.0], [1.0, 0.0, 0.0]])
+    except ValueError as e:  # the pre-hierarchy contract
+        assert isinstance(e, m.VectorDimMismatch), type(e)
+        assert (e.expected, e.got, e.index) == (2, 3, 1), (e.expected, e.got, e.index)
+    else:
+        raise AssertionError("dimension mismatch not raised")
+    for bad in (-1.0, float("nan"), float("inf")):
+        try:
+            m.CircuitBreaker(2, bad)
+        except ValueError as e:
+            assert isinstance(e, m.ConfigError) and "reset_after_secs" in str(e), e
+        else:
+            raise AssertionError(f"CircuitBreaker accepted {bad}")
+    try:
+        m.fuse([m.RankRow("a", 1.0, "ftss")], [])
+    except m.ConfigError as e:
+        assert "ftss" in str(e), e
+    else:
+        raise AssertionError("unknown RankRow.source accepted")
+    try:
+        m.decode_spans([0.9, 0.1, 0.2], (2, 1, 2), 0.5)
+    except m.ConfigError:
+        pass
+    else:
+        raise AssertionError("decode_spans accepted a shape that does not fit")
+
+
+def test_vector_index() -> None:
+    idx = m.VectorIndex(2)
+    idx.upsert_packed([1, 2], struct.pack("<4f", 1.0, 0.0, 0.0, 1.0))
+    assert len(idx) == 2 and idx.search([1.0, 0.0], 1)[0][0] == 1
+    try:
+        idx.upsert_packed([3], struct.pack("<2f", float("nan"), 1.0))
+    except m.ConfigError as e:
+        assert "key 3" in str(e), e
+    else:
+        raise AssertionError("NaN vector accepted")
+    assert len(idx) == 2
+
+
+def test_fs_walk() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "a.txt"), "w").close()
+        entries, errors = m.fs_walk_with_errors(d, [])
+        assert [os.path.basename(e["path"]) for e in entries] == ["a.txt"] and errors == []
+        assert len(m.fs_walk(d, [])) == 1
+    try:
+        m.fs_walk(os.path.join(d, "gone"), [])
+    except OSError as e:
+        assert isinstance(e, m.IoError), type(e)
+    else:
+        raise AssertionError("a missing root returned instead of raising")
+
+
+def test_build_backend() -> None:
+    expected = os.environ.get("M3_SMOKE_EXPECT_BACKEND")
+    assert m.__build_backend__ == m.embed_backend_label(), (m.__build_backend__, m.embed_backend_label())
+    if expected:
+        assert m.__build_backend__ == expected, (m.__build_backend__, expected)
+        assert hasattr(m, "EmbeddedEmbedder"), "every built wheel ships EmbeddedEmbedder"
+
+
 def main() -> None:
     tests = [
         test_version,
+        test_build_backend,
+        test_exceptions,
+        test_vector_index,
+        test_fs_walk,
         test_hash,
         test_vector,
         test_redact,

@@ -9,4 +9,5 @@ description = "In-memory graph index and multi-hop traversal."
 
 [dependencies]
 m3-error = { workspace = true }
+m3-resilience = { workspace = true }
 petgraph = "0.6"

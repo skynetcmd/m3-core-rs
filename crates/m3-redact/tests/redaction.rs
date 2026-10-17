@@ -78,8 +78,7 @@ fn aws_keys_group() {
 /// secret and permanently record the leak in git history.
 const STS_ID: &str = "ASIAEXAMPLE1234567XZ";
 const STS_SIG: &str = "c2lnbmF0dXJlRXhhbXBsZTAwMDA%3D";
-const STS_TOKEN: &str =
-    "FwoGZXIvYXdzEExampleSessionTokenPaddingAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const STS_TOKEN: &str = "FwoGZXIvYXdzEExampleSessionTokenPaddingAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 #[test]
 fn aws_sts_temporary_key_is_redacted() {

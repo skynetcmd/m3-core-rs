@@ -91,12 +91,12 @@ jobs:
       # interpreter's wheel ships and users on the other versions fall back to a
       # slow source build.
       #
-      # ⚠ 3.11 IS A ONE-RELEASE COURTESY — DROP IT AFTER THIS TAG. m3-memory's
-      # floor is >=3.12 (raised 2026-09-13, e43f0a1b) and this crate normally
-      # tracks it. 3.11 is included once more as a final set for users still on
-      # it; pyproject's requires-python is temporarily >=3.11 to match, because
-      # a cp311 wheel whose metadata says >=3.12 is refused by pip even on the
-      # direct --no-deps install path. Both revert together next release.
+      # 3.11 was dropped 2026-10-01, with pyproject's floor restored to >=3.12.
+      # Its one-release courtesy set shipped in v2026.9.20. These three places
+      # move TOGETHER — this list, build_local.py's _PYTHONS, and pyproject's
+      # requires-python — because a wheel built for an interpreter the metadata
+      # rejects is uninstallable everywhere, and a floor without a matching
+      # build just wastes a job.
       #
       # ⚠ Nothing resolves these from an index. m3-memory's
       # rust_core_install.py picks the asset BY FILENAME and runs
@@ -114,21 +114,23 @@ jobs:
       # Keep this list == _PYTHONS in build_local.py == the floor in
       # crates/m3-core-py/pyproject.toml. A wheel built for an interpreter the
       # metadata rejects is uninstallable everywhere.
-      - name: Set up Python (3.11–3.15)
+      - name: Set up Python (3.12–3.15)
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           allow-prereleases: true
           python-version: |
-            3.11
             3.12
             3.13
             3.14
             3.15
 
+      # The published wheels are built with a pinned, current stable (the local
+      # builds use the same). The minimum source-build version is
+      # Cargo.toml rust-version, checked by ci.yml's msrv job.
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.99"
 
       - name: Cache cargo + target
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.2.4
@@ -344,7 +346,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libclang-dev
 
       # ── Build the backend wheel via the canonical script ─────────────────
-      # One wheel per (CPython 3.11–3.15, this job's backend). build_wheel.py
+      # One wheel per (CPython 3.12–3.15, this job's backend). build_wheel.py
       # rewrites [project].name to m3-core-rs-<os>-<backend> and forwards the
       # interpreter list to maturin (everything after the literal `--`).
       # setup-python puts every requested version on PATH as pythonX.Y.
@@ -373,7 +375,7 @@ jobs:
             --backend "${{ matrix.backend }}" \
             --os "${{ matrix.os_tok }}" \
             --out "$GITHUB_WORKSPACE/dist" \
-            -- --interpreter python3.11 python3.12 python3.13 python3.14 python3.15 $extra
+            -- --interpreter python3.12 python3.13 python3.14 python3.15 $extra
 
       # Linux CUDA only: maturin left the wheels tagged linux_x86_64 (auditwheel
       # was skipped). PyPI rejects that tag. Re-tag to manylinux with auditwheel,
@@ -392,11 +394,12 @@ jobs:
           done
           ls -la "$GITHUB_WORKSPACE"/dist/*.whl
 
-      # Import-smoke each CPU wheel on its own interpreter (runners have no GPU,
-      # so only CPU wheels are runtime-tested; GPU wheels are import-verified
-      # off-CI on a device — see WHEEL_BUILD_GUIDE.md). The CPU wheel is the
-      # plain vector-ops build (no llama.cpp / no EmbeddedEmbedder by design),
-      # so the smoke test must NOT assert EmbeddedEmbedder.
+      # Smoke-test each CPU wheel on its own interpreter (runners have no GPU,
+      # so only CPU wheels can be imported here; GPU wheels are import-verified
+      # off-CI on a device — see WHEEL_BUILD_GUIDE.md). Every wheel, CPU
+      # included, is built with `embedded` (build_wheel.py's _MATRIX), so the
+      # smoke run ASSERTS __build_backend__ == this job's backend and that
+      # EmbeddedEmbedder exists, then runs the full tests/smoke.py.
       # Run each per-version wheel on its matching interpreter. setup-python
       # exposes the non-default versions differently per OS: on Linux/macOS as
       # `pythonX.Y` on PATH, but on Windows there is no `python3.12.exe` — the
@@ -406,7 +409,7 @@ jobs:
         if: matrix.backend == 'cpu'
         shell: bash
         run: |
-          for v in 3.11 3.12 3.13 3.14 3.15; do
+          for v in 3.12 3.13 3.14 3.15; do
             whl=$(ls "$GITHUB_WORKSPACE"/dist/*-cp${v/./}-*.whl)
             if [ -z "$whl" ]; then
               echo "::error::no wheel matching cp${v/./} in dist/"; exit 1
@@ -429,8 +432,20 @@ jobs:
               exit 1
             fi
             $py -m pip install --force-reinstall "$whl"
-            $py -c "import m3_core_rs as m; assert abs(m.cosine([1.0,0,0],[1.0,0,0]) - 1.0) < 1e-6; assert hasattr(m,'compile_fts_query'); print('smoke OK py$v:', m.embed_backend_label())"
+            # Run from outside the checkout so `import m3_core_rs` resolves the
+            # INSTALLED wheel, not crates/m3-core-py/python/.
+            (cd "$RUNNER_TEMP" && M3_SMOKE_EXPECT_BACKEND="${{ matrix.backend }}" \
+              $py "$GITHUB_WORKSPACE/crates/m3-core-py/tests/smoke.py")
           done
+
+      # GATE: nothing in CI verified wheel CONTENTS until now, which is how
+      # v2026.9.20 published 35 wheels whose m3-embed-server was mode 0600 (not
+      # executable) on every platform. Runs AFTER the CUDA repair on purpose:
+      # `auditwheel repair` repacks into a new wheel and can drop the exec bit
+      # that build_wheel.py set. Fail the release here rather than ship it.
+      - name: Verify wheel contents (exec bit, members, tags)
+        shell: bash
+        run: python crates/m3-core-py/verify_wheels.py "$GITHUB_WORKSPACE/dist"
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

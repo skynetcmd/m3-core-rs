@@ -39,6 +39,28 @@ env:
   MACOSX_DEPLOYMENT_TARGET: "11.0"
 
 jobs:
+  # Cargo.toml rust-version is a promise to anyone building from source (m3's
+  # source fallback uses the user's own cargo). The other jobs use `stable`,
+  # which moves past it, so only this job notices a change that needs a newer
+  # compiler. Check every feature set the wheels use.
+  msrv:
+    name: Minimum Rust (rust-version)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        persist-credentials: false
+    - name: Install the minimum Rust toolchain
+      run: |
+        msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)
+        echo "MSRV=$msrv" >> "$GITHUB_ENV"
+        rustup toolchain install "$msrv" --profile minimal --no-self-update
+    - name: cargo check (workspace, embed-server embedded, core-py embedded+onnx)
+      run: |
+        cargo "+$MSRV" check --workspace --all-targets --locked
+        cargo "+$MSRV" check -p m3-embed-server --features embedded --all-targets --locked
+        cargo "+$MSRV" check -p m3-core-py --features embedded,onnx --all-targets --locked
+
   check:
     name: Check + test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -82,6 +104,14 @@ jobs:
     - name: cargo check (m3-embed-server, embedded feature)
       run: cargo check -p m3-embed-server --features embedded --all-targets
 
+    # m3-core-py's `embedded` and `onnx` features gate the EmbeddedEmbedder /
+    # OrtNer bindings — the code every released wheel ships — and the default
+    # check above compiles neither. `embedded` reuses the llama.cpp cmake
+    # build the embed-server step already does; `onnx` uses ort's
+    # load-dynamic, so no native ONNX Runtime is needed to build.
+    - name: cargo check (m3-core-py, embedded + onnx features)
+      run: cargo check -p m3-core-py --features embedded,onnx --all-targets
+
     - name: cargo test (workspace)
       run: cargo test --workspace
 
@@ -100,3 +130,11 @@ jobs:
     # default-feature run says nothing about it.
     - name: cargo clippy (m3-embed-server, embedded feature)
       run: cargo clippy -p m3-embed-server --features embedded --all-targets -- -D warnings
+
+    - name: cargo clippy (m3-core-py, embedded + onnx features)
+      run: cargo clippy -p m3-core-py --features embedded,onnx --all-targets -- -D warnings
+
+    # The selftest proves verify_wheels.py's checks can fail (exec bit, SBOM
+    # leak, GPU symbols in a CPU wheel). Pure stdlib; no wheel needed.
+    - name: verify_wheels.py selftest
+      run: python crates/m3-core-py/verify_wheels.py --selftest

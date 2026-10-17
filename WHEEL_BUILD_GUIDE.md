@@ -577,6 +577,25 @@ python crates/m3-core-py/verify_wheels.py <dir-of-wheels>   # or, per wheel:
 <venv>/bin/python -c "import m3_core_rs as m; print(m.__version__, m.__build_backend__)"
 ```
 
+`verify_wheels.py --selftest` proves the checks can actually fail (no network,
+no build, runs on any supported OS). `release.yml` runs the verifier before
+uploading, so a bad wheel fails the release rather than shipping.
+
+Two checks worth knowing about, both guarding defects that shipped once:
+
+- **The server binary must be stored `0o100755`** — executable *and* carrying
+  its file-type bits. A permissions-only `0o755` passes a naive `mode & 0o111`
+  test but pip reads it as no mode at all and installs the binary
+  non-executable, which surfaces much later as an unattributable `EACCES`.
+  `build_wheel.py` sets this; the verifier asserts it.
+- **The SBOM must not carry the builder's absolute paths.** maturin writes each
+  crate's source path into its `bom-ref`, which on a developer box means the
+  builder's username and directory layout in a public artifact.
+  `build_wheel.py` scrubs it to CI's generic form on every build (recomputing
+  RECORD in the same pass, or `pip install` fails an integrity check); run
+  `sanitize_sbom.py --check <dir>` to audit, or without `--check` to scrub
+  wheels from an older toolchain.
+
 ### Linux build box (provisioned Debian 13 LXC)
 
 Two operational rules that bite if missed when building inside an LXC over SSH:

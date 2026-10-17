@@ -8,8 +8,13 @@
 //! side caches compiled patterns by a blake2b hash of the config tuple; here
 //! the caller owns the `Redactor` lifetime, so recompilation is just "build a
 //! new Redactor". The convenience `scrub()` fn builds a throwaway Redactor per
-//! call — faithful to Python's per-call `compile_patterns()` (which is a no-op
-//! when the config hash is unchanged, so amortized cost is the same).
+//! call and so recompiles every time — unlike Python, whose per-call
+//! `compile_patterns()` is a no-op for an unchanged config. Hot callers keep a
+//! `Redactor` (m3-core-py caches one per config).
+//!
+//! One deliberate divergence: a `patterns` entry naming no known group is
+//! reported in `compile_errors` (and logged), where Python ignores it. An
+//! ignored typo is a group of secrets that is silently not redacted.
 
 use regex::Regex;
 use std::borrow::Cow;
@@ -39,7 +44,8 @@ pub struct ScrubResult {
     pub match_count: usize,
     /// Group names that had >=1 match, in evaluation order.
     pub groups_fired: Vec<String>,
-    /// custom_regex compilation errors (bad patterns are skipped, not fatal).
+    /// Config errors: custom_regex entries that failed to compile, and
+    /// `patterns` entries naming no known group. Both are skipped, not fatal.
     pub compile_errors: Vec<String>,
 }
 
@@ -143,6 +149,17 @@ impl Redactor {
         }
 
         let pat_set: HashSet<&str> = config.patterns.iter().map(|s| s.as_str()).collect();
+        for (i, name) in config.patterns.iter().enumerate() {
+            if !EVALUATION_ORDER.contains(&name.as_str()) {
+                let msg = format!(
+                    "unknown redaction pattern group {name:?} (patterns[{i}]); it redacts nothing. \
+                     Known groups: {}",
+                    EVALUATION_ORDER.join(", ")
+                );
+                log::warn!("{msg}");
+                compile_errors.push(msg);
+            }
+        }
 
         for &group_name in EVALUATION_ORDER {
             match group_name {
@@ -154,7 +171,9 @@ impl Redactor {
                     if let Some(specs) = builtin_group("pii") {
                         let compiled: Vec<Regex> = specs
                             .iter()
-                            .map(|(_, src)| Regex::new(src).expect("builtin pii regex must compile"))
+                            .map(|(_, src)| {
+                                Regex::new(src).expect("builtin pii regex must compile")
+                            })
                             .collect();
                         groups.push(("pii".to_string(), compiled));
                     }
@@ -164,12 +183,28 @@ impl Redactor {
                         continue;
                     }
                     let mut compiled: Vec<Regex> = Vec::new();
-                    for pat in &config.custom_regex {
+                    for (i, pat) in config.custom_regex.iter().enumerate() {
                         match Regex::new(pat) {
                             Ok(re) => compiled.push(re),
-                            Err(e) => compile_errors.push(format!(
-                                "custom_regex compilation error: {pat}: {e}"
-                            )),
+                            // Never the pattern text: a custom regex is often
+                            // the secret it is meant to catch, and regex's own
+                            // error message quotes it.
+                            Err(e) => {
+                                let kind = match e {
+                                    regex::Error::Syntax(_) => "invalid regex syntax".to_string(),
+                                    regex::Error::CompiledTooBig(limit) => {
+                                        format!("compiled size exceeds the {limit}-byte limit")
+                                    }
+                                    _ => "regex error".to_string(),
+                                };
+                                let msg = format!(
+                                    "custom_regex compilation error: custom_regex[{i}] ({} chars): {kind}; \
+                                     the entry is skipped",
+                                    pat.chars().count()
+                                );
+                                log::warn!("{msg}");
+                                compile_errors.push(msg);
+                            }
                         }
                     }
                     if !compiled.is_empty() {
@@ -183,9 +218,7 @@ impl Redactor {
                     if let Some(specs) = builtin_group(group_name) {
                         let compiled: Vec<Regex> = specs
                             .iter()
-                            .map(|(_, src)| {
-                                Regex::new(src).expect("builtin regex must compile")
-                            })
+                            .map(|(_, src)| Regex::new(src).expect("builtin regex must compile"))
                             .collect();
                         groups.push((group_name.to_string(), compiled));
                     }
@@ -257,7 +290,6 @@ impl Redactor {
     }
 }
 
-
 /// Convenience: build a throwaway `Redactor` and scrub in one call.
 /// Faithful to Python's per-call `compile_patterns()` + `scrub()`.
 ///
@@ -307,5 +339,39 @@ mod tests {
         assert_eq!(out.content, s);
         assert_eq!(out.match_count, 0);
         assert!(out.groups_fired.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_group_is_reported_not_ignored() {
+        let cfg = RedactionConfig {
+            enabled: true,
+            patterns: vec!["api_keys".into(), "api_key".into()],
+            custom_regex: vec![],
+            redact_pii: false,
+        };
+        let errs = Redactor::new(&cfg).compile_errors().to_vec();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].contains("\"api_key\"") && errs[0].contains("patterns[1]"),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_bad_custom_regex_error_never_echoes_the_pattern() {
+        let secret = "sk-live-SECRET[unclosed";
+        let cfg = RedactionConfig {
+            enabled: true,
+            patterns: vec!["custom_regex".into()],
+            custom_regex: vec![secret.into()],
+            redact_pii: false,
+        };
+        let errs = Redactor::new(&cfg).compile_errors().to_vec();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(!errs[0].contains("SECRET"), "pattern text leaked: {errs:?}");
+        assert!(
+            errs[0].contains("custom_regex[0]") && errs[0].contains("23 chars"),
+            "{errs:?}"
+        );
     }
 }

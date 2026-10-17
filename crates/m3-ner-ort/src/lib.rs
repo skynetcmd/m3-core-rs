@@ -11,7 +11,6 @@
 
 #[cfg(not(feature = "onnx"))]
 use m3_dispatcher::{Batch, BatchOutput, ModelBackend};
-#[cfg(not(feature = "onnx"))]
 use m3_error::{M3Error, Result};
 
 /// Quantization variant for the loaded ONNX model.
@@ -34,8 +33,7 @@ pub enum Platform {
 }
 
 /// Execution-provider priority list for a platform (§4b.2). The last entry is
-/// always `"CPU"` as the universal fallback. `m3-core-py` may override this
-/// from `M3_NER_EP_PRIORITY`.
+/// always `"CPU"` as the universal fallback. (No env var overrides it today.)
 pub fn ep_priority(platform: Platform) -> Vec<&'static str> {
     match platform {
         Platform::LinuxNvidia => vec!["CUDA", "TensorRT", "CPU"],
@@ -66,20 +64,38 @@ pub struct Span {
 ///
 /// Steps: threshold filter, then greedy overlap resolution (highest score
 /// wins), then dedup of identical `[start, end, label)` spans.
+///
+/// `scores.len()` must equal the shape's product: a mismatch means the shape
+/// does not describe the tensor, and decoding part of it (as this once did,
+/// silently) would report spans from the wrong geometry.
 pub fn decode_spans(
     scores: &[f32],
     shape: (usize, usize, usize),
     threshold: f32,
-) -> Vec<Span> {
+) -> Result<Vec<Span>> {
     let (max_spans, span_width, num_labels) = shape;
+    let expected = max_spans
+        .checked_mul(span_width)
+        .and_then(|n| n.checked_mul(num_labels));
+    if expected != Some(scores.len()) {
+        return Err(M3Error::Config(format!(
+            "decode_spans: {} scores do not fit shape ({max_spans}, {span_width}, {num_labels}) = {}",
+            scores.len(),
+            expected.map_or_else(|| "an overflowing size".to_string(), |n| format!("{n} scores")),
+        )));
+    }
     let mut candidates: Vec<Span> = Vec::new();
     for s in 0..max_spans {
         for w in 0..span_width {
             for l in 0..num_labels {
-                let idx = (s * span_width + w) * num_labels + l;
-                let Some(&score) = scores.get(idx) else { continue };
+                let score = scores[(s * span_width + w) * num_labels + l];
                 if score >= threshold {
-                    candidates.push(Span { start: s, end: s + w + 1, label: l, score });
+                    candidates.push(Span {
+                        start: s,
+                        end: s + w + 1,
+                        label: l,
+                        score,
+                    });
                 }
             }
         }
@@ -103,16 +119,16 @@ pub fn decode_spans(
             continue;
         }
         // Dedup identical span+label (different widths could collide post-filter).
-        let dup = accepted.iter().any(|a| {
-            a.start == cand.start && a.end == cand.end && a.label == cand.label
-        });
+        let dup = accepted
+            .iter()
+            .any(|a| a.start == cand.start && a.end == cand.end && a.label == cand.label);
         if !dup {
             accepted.push(cand);
         }
     }
 
     accepted.sort_by(|a, b| a.start.cmp(&b.start).then(a.end.cmp(&b.end)));
-    accepted
+    Ok(accepted)
 }
 
 // ============================================================================
@@ -181,6 +197,7 @@ mod onnx_backend {
     use super::{decode_spans, ep_priority, Platform, Quant};
     use m3_dispatcher::{Batch, BatchOutput, ModelBackend};
     use m3_error::{M3Error, Result};
+    use ort::ep::ExecutionProvider;
     use std::sync::Mutex;
     use tokenizers::Tokenizer;
 
@@ -235,10 +252,10 @@ mod onnx_backend {
         /// - `labels`: entity label set, in the order the model emits them.
         /// - `platform`: drives execution-provider priority via `ep_priority`.
         ///
-        /// Execution providers are registered best-effort: each EP in the
-        /// priority list is appended, and `ort` silently skips any that are
-        /// unavailable at runtime (default `fail_silently` behaviour), so a
-        /// machine with no CUDA/DirectML still loads on the CPU EP.
+        /// Execution providers are registered one by one in priority order and
+        /// each outcome is logged (`ort` itself reports through `tracing`,
+        /// which reaches no m3 log): a GPU EP that fails falls through to the
+        /// next, ending on CPU, and that fall-through is a WARN.
         pub fn new(
             model_path: impl AsRef<str>,
             tokenizer_path: impl AsRef<str>,
@@ -248,22 +265,30 @@ mod onnx_backend {
             quant: Quant,
             platform: Platform,
         ) -> Result<Self> {
+            let (model_path, tokenizer_path) = (model_path.as_ref(), tokenizer_path.as_ref());
+            for (what, path) in [("NER model", model_path), ("NER tokenizer", tokenizer_path)] {
+                if !std::path::Path::new(path).is_file() {
+                    return Err(M3Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{what} '{path}' does not exist or is not a file"),
+                    )));
+                }
+            }
             ensure_ort_env(dylib_path)?;
 
             let ep_order = ep_priority(platform);
-            let eps = build_execution_providers(&ep_order);
-
             let mut builder = ort::session::Session::builder()
                 .map_err(|e| M3Error::Backend(format!("ort session builder: {e}")))?;
-            builder = builder
-                .with_execution_providers(eps)
-                .map_err(|e| M3Error::Backend(format!("ort register EPs: {e}")))?;
-            let session = builder
-                .commit_from_file(model_path.as_ref())
-                .map_err(|e| M3Error::Backend(format!("ort load model: {e}")))?;
+            register_execution_providers(&mut builder, &ep_order);
+            let session = builder.commit_from_file(model_path).map_err(|e| {
+                M3Error::Backend(format!("ort could not load NER model '{model_path}': {e}"))
+            })?;
 
-            let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
-                .map_err(|e| M3Error::Backend(format!("tokenizer load: {e}")))?;
+            let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
+                M3Error::Backend(format!(
+                    "could not load NER tokenizer '{tokenizer_path}': {e}"
+                ))
+            })?;
 
             Ok(Self {
                 session: Mutex::new(session),
@@ -280,28 +305,58 @@ mod onnx_backend {
         }
     }
 
-    /// Map the `ep_priority` string list onto concrete `ort` EP dispatches.
-    /// Only the EPs relevant to the target platforms are wired; the CPU EP is
-    /// always appended last as the universal fallback. EPs that are not
-    /// available at runtime are skipped by `ort` (fail-silently).
-    fn build_execution_providers(
+    /// Register every EP `ep_priority` advertises, in order, on `builder`,
+    /// logging each outcome. Returns the first one that registered.
+    ///
+    /// Every advertised name is wired (an advertised-but-dropped EP was a
+    /// silent CPU fallback). Registration success means ONNX Runtime accepted
+    /// the provider, not that every node runs on it.
+    fn register_execution_providers(
+        builder: &mut ort::session::builder::SessionBuilder,
         ep_order: &[&'static str],
-    ) -> Vec<ort::ep::ExecutionProviderDispatch> {
-        let mut eps = Vec::new();
-        for name in ep_order {
-            match *name {
-                "CUDA" => eps.push(ort::ep::CUDA::default().build()),
-                "DirectML" => eps.push(ort::ep::DirectML::default().build()),
-                "CPU" => eps.push(ort::ep::CPU::default().build()),
-                // TensorRT/ROCm/OpenVINO/CoreML: not wired here — the CPU
-                // fallback below still applies. Add as needed.
-                _ => {}
+    ) -> Option<&'static str> {
+        let mut order: Vec<&'static str> = ep_order.to_vec();
+        if !order.contains(&"CPU") {
+            order.push("CPU");
+        }
+        let mut first = None;
+        for name in &order {
+            let res = match *name {
+                "CUDA" => ort::ep::CUDA::default().register(builder),
+                "TensorRT" => ort::ep::TensorRT::default().register(builder),
+                "ROCm" => ort::ep::ROCm::default().register(builder),
+                "OpenVINO" => ort::ep::OpenVINO::default().register(builder),
+                "DirectML" => ort::ep::DirectML::default().register(builder),
+                "CoreML" => ort::ep::CoreML::default().register(builder),
+                "CPU" => ort::ep::CPU::default().register(builder),
+                other => {
+                    log::warn!("NER: execution provider {other:?} in the priority list has no mapping; skipped");
+                    continue;
+                }
+            };
+            match res {
+                Ok(()) => {
+                    log::info!("NER: registered the {name} execution provider");
+                    first.get_or_insert(*name);
+                }
+                Err(e) => log::warn!(
+                    "NER: the {name} execution provider could not be registered ({e}); falling \
+                     through the priority list {order:?}"
+                ),
             }
         }
-        if !ep_order.contains(&"CPU") {
-            eps.push(ort::ep::CPU::default().build());
+        match first {
+            Some("CPU") if order[0] != "CPU" => log::warn!(
+                "NER: running on the CPU execution provider; none of the preferred providers \
+                 {:?} registered",
+                &order[..order.len() - 1]
+            ),
+            None => log::warn!(
+                "NER: no execution provider registered; ONNX Runtime will use its default (CPU)"
+            ),
+            _ => {}
         }
-        eps
+        first
     }
 
     impl ModelBackend for OrtNer {
@@ -381,7 +436,7 @@ mod onnx_backend {
         scores: &[f32],
         shape: (usize, usize, usize),
         threshold: f32,
-    ) -> Vec<super::Span> {
+    ) -> Result<Vec<super::Span>> {
         decode_spans(scores, shape, threshold)
     }
 
@@ -402,7 +457,10 @@ mod tests {
 
     #[test]
     fn ep_priority_tables() {
-        assert_eq!(ep_priority(Platform::LinuxNvidia), ["CUDA", "TensorRT", "CPU"]);
+        assert_eq!(
+            ep_priority(Platform::LinuxNvidia),
+            ["CUDA", "TensorRT", "CPU"]
+        );
         assert_eq!(ep_priority(Platform::LinuxAmd), ["ROCm", "CPU"]);
         assert_eq!(ep_priority(Platform::LinuxIntelGpu), ["OpenVINO", "CPU"]);
         assert_eq!(ep_priority(Platform::Windows), ["DirectML", "CPU"]);
@@ -425,10 +483,26 @@ mod tests {
     fn decode_spans_threshold_filter() {
         // shape (2 spans, 1 width, 2 labels)
         let scores = vec![0.9, 0.1, 0.2, 0.8];
-        let spans = decode_spans(&scores, (2, 1, 2), 0.5);
+        let spans = decode_spans(&scores, (2, 1, 2), 0.5).unwrap();
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0], Span { start: 0, end: 1, label: 0, score: 0.9 });
-        assert_eq!(spans[1], Span { start: 1, end: 2, label: 1, score: 0.8 });
+        assert_eq!(
+            spans[0],
+            Span {
+                start: 0,
+                end: 1,
+                label: 0,
+                score: 0.9
+            }
+        );
+        assert_eq!(
+            spans[1],
+            Span {
+                start: 1,
+                end: 2,
+                label: 1,
+                score: 0.8
+            }
+        );
     }
 
     #[test]
@@ -452,16 +526,44 @@ mod tests {
         scores[idx(0, 1, 0)] = 0.95; // start 0, width idx 1 -> [0,2)
         scores[idx(1, 0, 0)] = 0.6; // start 1, width idx 0 -> [1,2)
         scores[idx(2, 0, 0)] = 0.7; // start 2, width idx 0 -> [2,3)
-        let spans = decode_spans(&scores, (3, 2, 1), 0.5);
+        let spans = decode_spans(&scores, (3, 2, 1), 0.5).unwrap();
         assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0], Span { start: 0, end: 2, label: 0, score: 0.95 });
-        assert_eq!(spans[1], Span { start: 2, end: 3, label: 0, score: 0.7 });
+        assert_eq!(
+            spans[0],
+            Span {
+                start: 0,
+                end: 2,
+                label: 0,
+                score: 0.95
+            }
+        );
+        assert_eq!(
+            spans[1],
+            Span {
+                start: 2,
+                end: 3,
+                label: 0,
+                score: 0.7
+            }
+        );
     }
 
     #[test]
     fn decode_spans_empty_when_all_below_threshold() {
         let scores = vec![0.1, 0.2, 0.3, 0.4];
-        assert!(decode_spans(&scores, (2, 1, 2), 0.9).is_empty());
+        assert!(decode_spans(&scores, (2, 1, 2), 0.9).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decode_spans_rejects_a_shape_that_does_not_fit() {
+        let e = decode_spans(&[0.9, 0.1, 0.2], (2, 1, 2), 0.5)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("3 scores") && e.contains("4 scores"), "{e}");
+        assert!(
+            decode_spans(&[], (usize::MAX, 2, 2), 0.5).is_err(),
+            "overflow is an error, not a panic"
+        );
     }
 
     #[cfg(not(feature = "onnx"))]
@@ -480,8 +582,8 @@ mod tests {
 
     // Proves the `load-dynamic` linkage actually reaches a real ONNX Runtime
     // DLL at runtime. Set `ORT_DYLIB_PATH` to the installed `onnxruntime`
-    // shared library before running, e.g. on this machine:
-    //   $env:ORT_DYLIB_PATH = "C:\Users\...\onnxruntime\capi\onnxruntime.dll"
+    // shared library before running, e.g. (PowerShell, a pip-installed runtime):
+    //   $env:ORT_DYLIB_PATH = "<site-packages>\onnxruntime\capi\onnxruntime.dll"
     //   cargo test -p m3-ner-ort --features onnx -- --ignored ort_dylib_loads
     // Ignored by default because it depends on an env var being set.
     #[cfg(feature = "onnx")]
@@ -491,8 +593,8 @@ mod tests {
         // `init_from` loads the dylib explicitly; `init` would read
         // ORT_DYLIB_PATH. Either way, building a SessionBuilder forces the
         // dylib to be resolved and its API table bound.
-        let path = std::env::var("ORT_DYLIB_PATH")
-            .expect("set ORT_DYLIB_PATH to the onnxruntime DLL");
+        let path =
+            std::env::var("ORT_DYLIB_PATH").expect("set ORT_DYLIB_PATH to the onnxruntime DLL");
         ort::init_from(&path)
             .expect("ort::init_from failed to load the onnxruntime DLL")
             .with_name("m3-ner-ort-test")

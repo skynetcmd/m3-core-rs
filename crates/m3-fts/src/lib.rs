@@ -55,7 +55,10 @@ pub fn sanitize_fts(query: &str, max_len: usize) -> String {
         query.to_string()
     };
     let words_stripped = FTS_OPERATORS.replace_all(&truncated, " ");
-    FTS_NON_TERM.replace_all(&words_stripped, " ").trim().to_string()
+    FTS_NON_TERM
+        .replace_all(&words_stripped, " ")
+        .trim()
+        .to_string()
 }
 
 /// Apply the same lowercase + depunctuate transform as the FTS triggers.
@@ -218,14 +221,23 @@ mod tests {
     #[test]
     fn searchable_lowercases_and_depunctuates() {
         assert_eq!(sanitize_for_searchable("Hello, World!"), "hello  world ");
-        assert_eq!(sanitize_for_searchable("a.b:c;d/e?f\"g'h"), "a b c d e f g h");
+        assert_eq!(
+            sanitize_for_searchable("a.b:c;d/e?f\"g'h"),
+            "a b c d e f g h"
+        );
         assert_eq!(sanitize_for_searchable(""), "");
     }
 
     #[test]
     fn exact_phrase_passthrough() {
-        assert_eq!(compile_fts_query("\"red wine\"", "fts5"), ("\"red wine\"".into(), true));
-        assert_eq!(compile_fts_query("'red wine'", "hybrid"), ("\"red wine\"".into(), true));
+        assert_eq!(
+            compile_fts_query("\"red wine\"", "fts5"),
+            ("\"red wine\"".into(), true)
+        );
+        assert_eq!(
+            compile_fts_query("'red wine'", "hybrid"),
+            ("\"red wine\"".into(), true)
+        );
         // Quirk parity with Python: a lone quote char IS start==end, so it is
         // treated as an exact phrase and `'"'[1:-1]` -> "" -> ('""', True).
         assert_eq!(compile_fts_query("\"", "fts5"), ("\"\"".into(), true));
@@ -241,7 +253,10 @@ mod tests {
 
     #[test]
     fn fts5_multi_token_or_joined() {
-        assert_eq!(compile_fts_query("red wine", "fts5"), ("red OR wine".into(), true));
+        assert_eq!(
+            compile_fts_query("red wine", "fts5"),
+            ("red OR wine".into(), true)
+        );
     }
 
     #[test]
@@ -251,13 +266,19 @@ mod tests {
 
     #[test]
     fn empty_after_sanitize_is_not_ok() {
-        assert_eq!(compile_fts_query("AND OR NOT", "fts5"), (String::new(), false));
+        assert_eq!(
+            compile_fts_query("AND OR NOT", "fts5"),
+            (String::new(), false)
+        );
     }
 
     #[test]
     fn hybrid_single_alnum_wildcarded_else_passthrough() {
         assert_eq!(compile_fts_query("wine", "hybrid"), ("wine*".into(), true));
         // multi-word in hybrid mode is passed through unchanged (depunctuated).
-        assert_eq!(compile_fts_query("red wine", "hybrid"), ("red wine".into(), true));
+        assert_eq!(
+            compile_fts_query("red wine", "hybrid"),
+            ("red wine".into(), true)
+        );
     }
 }

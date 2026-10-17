@@ -1,5 +1,5 @@
-//! In-memory graph index and multi-hop traversal (Phase 4) plus reusable
-//! resilience primitives (Phase 5).
+//! In-memory graph index and multi-hop traversal (Phase 4), plus a re-export of
+//! the resilience primitives owned by `m3-resilience`.
 //!
 //! Maintains a compressed graph of memory relationships for recursive context
 //! assembly. BFS/DFS over thousands of neighbors in microseconds.
@@ -13,7 +13,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
 pub mod resilience;
-pub use resilience::{BreakerState, CircuitBreaker, RetryPolicy};
+pub use resilience::{Admission, BreakerState, BreakerStatus, CircuitBreaker, RetryPolicy};
 
 /// An edge in the relationship graph: a relationship kind and optional weight.
 #[derive(Debug, Clone)]
@@ -136,6 +136,10 @@ impl GraphIndex {
     /// In the real system this pairs with a single batched SQL fetch of the
     /// surrounding turns; this crate is only the in-memory index half.
     pub fn expand(&self, seeds: &[&str], max_hops: usize, limit: usize) -> Vec<String> {
+        // The cap is checked after a push, so `limit == 0` would return one id.
+        if limit == 0 {
+            return Vec::new();
+        }
         let seed_set: HashSet<&str> = seeds.iter().copied().collect();
         let mut out = Vec::new();
         let mut emitted = HashSet::new();

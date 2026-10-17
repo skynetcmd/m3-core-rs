@@ -80,7 +80,15 @@ impl GovernorConfig {
     /// 2. Throttled: `load >= initial` → Throttled, background 10s.
     /// 3. Normal: `elapsed < 30` → Halted (interactive 0); `elapsed < 60` →
     ///    Tapered, background 5s; else → Continuous, background 0.1s.
+    ///
+    /// A NaN input is read as the most restrictive value (load 100, elapsed
+    /// 0): every comparison against NaN is false, so it used to fall through
+    /// to Continuous — full-speed background work on a reading that says
+    /// nothing. This deliberately diverges from the Python table, which has
+    /// the same fall-through.
     pub fn decide(&self, load: f64, elapsed: f64) -> Pacing {
+        let load = if load.is_nan() { 100.0 } else { load };
+        let elapsed = if elapsed.is_nan() { 0.0 } else { elapsed };
         // 1. Critical mode.
         if self.limit_threshold != 100 && load >= self.limit_threshold as f64 {
             return Pacing {

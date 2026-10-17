@@ -11,16 +11,29 @@ for DLL resolution from extension modules — only directories registered via
 install location automatically when `CUDA_PATH` is set in the environment.
 
 For other GPU backends or non-standard install locations, operators can set
-`M3_EMBED_DLL_DIRS` (semicolon-separated on Windows, colon-separated on
-POSIX) to additional directories to pre-register. These are added before
-the import of the compiled extension.
+`M3_EMBED_DLL_DIRS` (Windows only; `;`-separated) to additional directories
+to pre-register. These are added before the import of the compiled
+extension. On POSIX the dynamic loader reads `LD_LIBRARY_PATH` /
+`DYLD_LIBRARY_PATH` instead, and this variable is ignored.
 
 Failing to find the DLLs at import time raises `ImportError: DLL load
-failed while importing m3_core_rs`. See `docs/EMBED_DEPLOYMENT.md`.
+failed while importing m3_core_rs`; the re-raised error lists every
+directory that was registered and every one that could not be.
 """
 
 import os as _os
+import re as _re
 import sys as _sys
+
+# What _register_dll_dirs did, for the ImportError message if the load fails.
+_DLL_DIRS_ADDED: list[str] = []
+_DLL_DIR_ERRORS: list[str] = []
+
+
+def _cuda_version_key(name: str) -> tuple[int, ...]:
+    """`v12.4` -> (12, 4). Numeric, so v12 sorts above v9 (a string sort put
+    v9.x first and loaded the oldest toolkit's DLLs)."""
+    return tuple(int(n) for n in _re.findall(r"\d+", name))
 
 
 def _register_dll_dirs() -> None:
@@ -46,19 +59,20 @@ def _register_dll_dirs() -> None:
         try:
             versions = [d for d in _os.listdir(nvidia_root)
                         if d.startswith("v") and _os.path.isdir(_os.path.join(nvidia_root, d))]
-            # Lexicographic sort works for CUDA's vMAJOR.MINOR scheme up to v9.x;
-            # this is fine until CUDA v100 ships. Add a numeric fallback later.
-            versions.sort(reverse=True)
+            versions.sort(key=_cuda_version_key, reverse=True)  # newest first
             for v in versions:
                 cuda_paths.append(_os.path.join(nvidia_root, v))
-        except OSError:
-            pass
+        except OSError as e:
+            _DLL_DIR_ERRORS.append(f"could not list {nvidia_root}: {e}")
 
     for cp in cuda_paths:
         candidates.append(_os.path.join(cp, "bin", "x64"))  # CUDA 13.x layout
         candidates.append(_os.path.join(cp, "bin"))         # CUDA 12.x and older
 
     # Operator override: M3_EMBED_DLL_DIRS=<dir>;<dir>;... (Windows ; separator).
+    # Stays an environment variable, not an m3_config.toml key: it is a DLL
+    # search-path locator read before the extension loads, so nothing that
+    # reads m3's config can run first, and no caller can pass it as a parameter.
     extra = _os.environ.get("M3_EMBED_DLL_DIRS", "").strip()
     if extra:
         for d in extra.split(_os.pathsep):
@@ -73,15 +87,25 @@ def _register_dll_dirs() -> None:
         seen.add(d)
         try:
             _os.add_dll_directory(d)
-        except (OSError, ValueError):
-            # Best-effort — if we can't register a dir we'll surface the
-            # ImportError from the extension load below.
-            pass
+            _DLL_DIRS_ADDED.append(d)
+        except (OSError, ValueError) as e:
+            # Not fatal by itself; recorded so a failed extension load below
+            # can say which directory was refused and why.
+            _DLL_DIR_ERRORS.append(f"could not register {d}: {e}")
 
 
 _register_dll_dirs()
 
-from .m3_core_rs import *  # noqa: E402,F401,F403
+try:
+    from .m3_core_rs import *  # noqa: E402,F401,F403
+except ImportError as _e:
+    if _sys.platform != "win32":
+        raise
+    raise ImportError(
+        f"{_e}. DLL directories registered: {_DLL_DIRS_ADDED or 'none'}; "
+        f"failures: {_DLL_DIR_ERRORS or 'none'}. A GPU wheel needs its vendor runtime "
+        "(e.g. CUDA: set CUDA_PATH; others: M3_EMBED_DLL_DIRS)."
+    ) from _e
 
 # Mirror the maturin-default __doc__ / __all__ propagation so users see
 # the Rust crate's docstring on `help(m3_core_rs)`.

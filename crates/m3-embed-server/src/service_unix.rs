@@ -38,7 +38,9 @@ fn home_dir() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .ok_or_else(|| "$HOME is not set — cannot locate the per-user service directory".to_string())
+        .ok_or_else(|| {
+            "$HOME is not set — cannot locate the per-user service directory".to_string()
+        })
 }
 
 /// Absolute path to this executable — what the unit file's `ExecStart` /
@@ -47,34 +49,264 @@ fn current_exe() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| format!("cannot resolve current executable path: {e}"))
 }
 
-/// The GGUF path the service must embed with. The unit file pins it into the
-/// service environment so a login-less supervisor still finds the model.
-/// Resolved here (install time) the same way `config::resolve` does at runtime.
-fn resolve_gguf_for_unit() -> Result<String, String> {
-    if let Some(g) = std::env::var("M3_EMBED_GGUF").ok().filter(|s| !s.is_empty()) {
-        return Ok(g);
+/// The unit's arguments (`--config <m3_config.toml>`) and that file, checked as
+/// the supervised service will read it: a bare environment, the file only.
+#[allow(dead_code)] // each Unix target calls it from its own install
+fn service_args() -> Result<(Vec<String>, PathBuf), String> {
+    config::service_args().map_err(|e| format!("{e:#}"))
+}
+
+/// The service's address from config.toml, as an error string for this module.
+fn service_addr() -> Result<(String, u16), String> {
+    config::service_addr().map_err(|e| format!("cannot tell where the service listens: {e:#}"))
+}
+
+/// What a service exit status means; the server sets these (main.rs).
+#[allow(dead_code)] // each Unix target calls it from its own status
+fn exit_status_meaning(code: i64) -> &'static str {
+    match code {
+        0 => "exited cleanly",
+        69 => "the listen port is taken by another program",
+        78 => "the configuration was refused",
+        _ => "startup failed",
     }
-    // Fall back to a config.toml that an earlier run may have written.
-    let file_cfg = config::load_file_config(&config::default_config_path()).unwrap_or_default();
-    file_cfg.embed.gguf.clone().ok_or_else(|| {
-        "M3_EMBED_GGUF is unset and no config.toml has [embed].gguf — \
-         set the env var before `install` so the service can find the model"
-            .to_string()
-    })
+}
+
+/// What `/health` said. `Ok(Some(pid))`: it answered ok and named its process
+/// (3.10.14+). `Ok(None)`: an older server that answers ok without a pid.
+/// `Err`: why it is not serving (refused, timed out, loading, degraded...).
+/// `/health` answers ok only once the model is loaded, so this is "serving",
+/// which a supervisor's "running" (the process exists) is not.
+fn health(host: &str, port: u16) -> Result<Option<u32>, String> {
+    use std::io::{Read, Write};
+    use std::net::ToSocketAddrs;
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("cannot resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{host}:{port} resolves to no address"))?;
+    let timeout = std::time::Duration::from_secs(2);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, timeout)
+        .map_err(|e| format!("cannot connect to {addr}: {e}"))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let req = format!("GET /health HTTP/1.0\r\nHost: {host}\r\n\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("cannot send to {addr}: {e}"))?;
+    let mut response = String::new();
+    if let Err(e) = stream.read_to_string(&mut response) {
+        if response.is_empty() {
+            return Err(format!("no answer from {addr}: {e}"));
+        }
+    }
+    parse_health(&response)
+}
+
+/// The response half of [`health`], split out so it is testable without a socket.
+fn parse_health(response: &str) -> Result<Option<u32>, String> {
+    if response.is_empty() {
+        return Err("connected, but no HTTP answer".into());
+    }
+    let status_line = response.lines().next().unwrap_or_default();
+    let code = status_line.split_whitespace().nth(1).unwrap_or("?");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or(response);
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| format!("answered {code}, but not with m3-embed-server's JSON health body"))?;
+    match v.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => Ok(v
+            .get("pid")
+            .and_then(|p| p.as_u64())
+            .and_then(|p| u32::try_from(p).ok())),
+        Some("degraded") => Err(format!(
+            "answered {code} degraded: {}",
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("no reason given")
+        )),
+        Some(s) if s.starts_with("loading") => {
+            Err(format!("answered {code} {s:?}: still loading the model"))
+        }
+        Some(s) => Err(format!("answered {code} with status {s:?}")),
+        None => Err(format!("answered {code} without a status")),
+    }
+}
+
+/// Whose server answered, given `/health`'s pid and the supervisor's main pid.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    /// The service manager's own process answered.
+    Ours,
+    /// Another process answered (`pid`): the service manager runs a different one.
+    Foreign(u32),
+    /// `pid` answered, and the service manager named no main process to
+    /// compare (it has none, or could not be asked): probably another process.
+    LikelyForeign(u32),
+    /// Cannot tell: an older server without a pid.
+    Unknown,
+}
+
+fn whose(health_pid: Option<u32>, main_pid: Option<u32>) -> Answer {
+    match (health_pid, main_pid) {
+        (Some(h), Some(m)) if h == m => Answer::Ours,
+        (Some(h), Some(_)) => Answer::Foreign(h),
+        (Some(h), None) => Answer::LikelyForeign(h),
+        (None, _) => Answer::Unknown,
+    }
+}
+
+fn foreign_message(label: &str, host: &str, port: u16, pid: u32, certain: bool) -> String {
+    let who = if certain {
+        format!("is answered by another process (pid {pid}), not this service")
+    } else {
+        format!(
+            "is answered by pid {pid}, and the service manager reports no process for this \
+             service (or could not be asked), so it is probably another process"
+        )
+    };
+    format!(
+        "{label}: {host}:{port} {who}; this service cannot use the port while it is taken. On a \
+         shared computer this is often another account's m3. Choose a free port: \
+         m3 config set embed.server.port <port>"
+    )
+}
+
+/// After the supervisor reports the process running, wait for it to serve and
+/// say which it is. `answered_before` is whether the address already answered
+/// before this start: then an ok from a server without a pid may be another
+/// process. `main_pid` asks the supervisor which process it runs now.
+fn report_serving(
+    label: &str,
+    answered_before: bool,
+    secs: u64,
+    log_hint: &str,
+    main_pid: &dyn Fn() -> Option<u32>,
+) -> Result<(), String> {
+    let (host, port) = service_addr()?;
+    let mut last = String::from("not probed");
+    for _ in 0..(secs * 2) {
+        let pid = match health(&host, port) {
+            Ok(pid) => pid,
+            Err(why) => {
+                last = why;
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
+        };
+        match whose(pid, main_pid()) {
+            Answer::Ours => println!("{label}: running, serving on {host}:{port}"),
+            Answer::Foreign(other) => return Err(foreign_message(label, &host, port, other, true)),
+            Answer::LikelyForeign(other) => {
+                return Err(foreign_message(label, &host, port, other, false))
+            }
+            Answer::Unknown if answered_before => {
+                eprintln!(
+                    "WARN: {host}:{port} was already answering before this start; another \
+                     process may hold the port, so this service may not be the one serving"
+                );
+                println!(
+                    "{label}: running; {host}:{port} answers, but it did before this start too"
+                );
+            }
+            Answer::Unknown => println!("{label}: running, serving on {host}:{port}"),
+        }
+        return Ok(());
+    }
+    // The process exists, but nothing answered ok: not a success.
+    Err(format!(
+        "{label}: the process is running, but {host}:{port} did not serve within {secs}s \
+         (last probe: {last}); {log_hint}"
+    ))
+}
+
+/// For `status`: a note when the port answers from a process other than the
+/// service's own. stdout stays the one state word m3 parses.
+fn note_foreign_answer(label: &str, main_pid: Option<u32>) {
+    let (host, port) = match service_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{label}: {e}");
+            return;
+        }
+    };
+    if let Ok(Some(pid)) = health(&host, port) {
+        match whose(Some(pid), main_pid) {
+            Answer::Foreign(other) => {
+                eprintln!("{}", foreign_message(label, &host, port, other, true))
+            }
+            Answer::LikelyForeign(other) => {
+                eprintln!("{}", foreign_message(label, &host, port, other, false))
+            }
+            Answer::Ours | Answer::Unknown => {}
+        }
+    }
+}
+
+/// Whether the service's address answers right now.
+fn serving_now() -> bool {
+    match service_addr() {
+        Ok((host, port)) => health(&host, port).is_ok(),
+        Err(e) => {
+            eprintln!("WARN: {e}; assuming nothing answered before this start");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    const OK_WITH_PID: &str =
+        "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\n\r\n{\"status\":\"ok\",\"model\":\"bge-m3.gguf\",\"pid\":4242}";
+
+    #[test]
+    fn a_new_server_names_its_pid() {
+        assert_eq!(parse_health(OK_WITH_PID), Ok(Some(4242)));
+    }
+
+    #[test]
+    fn an_older_server_answers_without_a_pid() {
+        let r = "HTTP/1.0 200 OK\r\n\r\n{\"status\":\"ok\",\"model\":\"bge-m3.gguf\"}";
+        assert_eq!(parse_health(r), Ok(None));
+    }
+
+    #[test]
+    fn a_loading_degraded_or_wrong_server_is_not_ok_and_says_why() {
+        let loading =
+            parse_health("HTTP/1.0 503 Service Unavailable\r\n\r\n{\"status\":\"loading model\"}");
+        assert!(loading.unwrap_err().contains("still loading"));
+        let degraded = parse_health(
+            "HTTP/1.0 503 Service Unavailable\r\n\r\n{\"status\":\"degraded\",\"reason\":\"breaker open\",\"pid\":1}",
+        );
+        assert!(degraded.unwrap_err().contains("degraded: breaker open"));
+        assert!(parse_health("").unwrap_err().contains("no HTTP answer"));
+        assert!(parse_health("HTTP/1.0 404 Not Found\r\n\r\nnope")
+            .unwrap_err()
+            .contains("404"));
+    }
+
+    #[test]
+    fn the_answer_is_ours_only_when_the_pids_match() {
+        assert_eq!(whose(Some(7), Some(7)), Answer::Ours);
+        assert_eq!(whose(Some(7), Some(8)), Answer::Foreign(7));
+        // No main pid: our process may be gone (it exited because the port
+        // was taken) or the supervisor could not be asked; probably foreign.
+        assert_eq!(whose(Some(7), None), Answer::LikelyForeign(7));
+        assert_eq!(whose(None, Some(7)), Answer::Unknown);
+    }
 }
 
 // ===========================================================================
 // macOS — launchd user agent
 // ===========================================================================
 //
-// VERIFICATION STATUS: this module was written and reviewed but, as of
-// 2026-05-22, NEVER COMPILED — the feature was developed on Windows and the
-// Linux/systemd sibling verified on a Debian box, but no macOS host was
-// available and cross-compiling to *-apple-darwin fails at the llama.cpp/ring
-// C build. Before relying on the launchd path, run `cargo build/test/clippy
-// -p m3-embed-server --features embedded` on a real Mac plus a launchctl
-// install/status/stop/uninstall smoke test. Full checklist: m3-memory to-do
-// `c5508907` ("Verify the macOS launchd path in m3-embed-server").
+// Built and exercised on a real Mac (Apple Silicon, launchd gui domain); the
+// release wheels for macOS are built natively there. Cross-compiling to
+// *-apple-darwin still fails at the llama.cpp/ring C build, so a change here
+// needs a Mac to verify.
 #[cfg(target_os = "macos")]
 pub mod macos {
     use super::*;
@@ -111,7 +343,7 @@ pub mod macos {
 
     pub fn install() -> Result<(), String> {
         let exe = current_exe()?;
-        let gguf = resolve_gguf_for_unit()?;
+        let (args, cfg_file) = service_args()?;
         let log_path = config::default_log_path();
         if let Some(dir) = log_path.parent() {
             std::fs::create_dir_all(dir)
@@ -123,11 +355,7 @@ pub mod macos {
                 .map_err(|e| format!("cannot create LaunchAgents dir {}: {e}", dir.display()))?;
         }
 
-        let body = render_plist(
-            &exe.to_string_lossy(),
-            &gguf,
-            &log_path.to_string_lossy(),
-        );
+        let body = render_plist(&exe.to_string_lossy(), &args, &log_path.to_string_lossy());
         // ⚠ FLUSH TO DISK BEFORE launchd READS IT. `fs::write` returns once the
         // data is in the page cache; launchd opens the file itself moments
         // later. Observed on macOS 2026-09-20: bootstrap raced the in-flight
@@ -150,7 +378,12 @@ pub mod macos {
         // best-effort).
         let domain = gui_domain()?;
         let target = service_target()?;
-        let _ = run_launchctl(&["bootout", &target]);
+        // Re-bootstrap of a loaded label errors, so unload first. Absent is
+        // the expected case here, hence no report.
+        if is_loaded(&target)? {
+            bootout_and_wait(&target)?;
+        }
+        let answered_before = serving_now();
         // ⚠ RETRY ONCE. The EIO above is transient — a plain retry succeeded
         // every time in the 2026-09-20 forensics, with no flags and no sudo.
         // Failing outright on the first attempt turns a recoverable hiccup
@@ -178,61 +411,206 @@ pub mod macos {
 
         println!("launchd agent installed: {LAUNCHD_LABEL}");
         println!("plist:    {}", plist.display());
+        println!("config:   {}", cfg_file.display());
         println!("log file: {}", log_path.display());
-        println!("It will start now and on every login (RunAtLoad + KeepAlive).");
+        // RunAtLoad starts it now; report whether it actually came up.
+        let state = wait_for("running", 10)?;
+        if state == "running" {
+            let hint = format!("see {}", log_path.display());
+            // Registered either way; a taken port is reported, not fatal here.
+            if let Err(e) = report_serving(LAUNCHD_LABEL, answered_before, 30, &hint, &main_pid) {
+                eprintln!("WARN: {e}");
+            }
+        } else {
+            println!("state:    {state}");
+            eprintln!(
+                "WARN: the agent did not reach running within 10s; see {}",
+                log_path.display()
+            );
+        }
         Ok(())
     }
 
     pub fn uninstall() -> Result<(), String> {
         let plist = plist_path()?;
-        // bootout is best-effort — the agent may already be unloaded.
-        if let Ok(target) = service_target() {
-            let _ = run_launchctl(&["bootout", &target]);
+        let target = service_target()?;
+        let loaded = is_loaded(&target)?;
+        if !loaded && !plist.exists() {
+            println!("launchd agent not installed: {LAUNCHD_LABEL}");
+            return Ok(());
+        }
+        if loaded {
+            bootout_and_wait(&target)?;
         }
         if plist.exists() {
             std::fs::remove_file(&plist)
                 .map_err(|e| format!("cannot remove plist {}: {e}", plist.display()))?;
         }
+        let state = observed_state()?;
+        if state != "not installed" {
+            return Err(format!("{LAUNCHD_LABEL} is still {state} after uninstall"));
+        }
         println!("launchd agent removed: {LAUNCHD_LABEL}");
         println!(
-            "config file left in place: {} (delete manually if desired)",
-            config::default_config_path().display()
+            "m3_config.toml is m3's and is left in place: {}",
+            config::located_file()
         );
         Ok(())
     }
 
     pub fn start() -> Result<(), String> {
-        run_launchctl(&["kickstart", &service_target()?])?;
-        println!("start signal sent to {LAUNCHD_LABEL}");
-        Ok(())
+        let plist = plist_path()?;
+        if !plist.exists() {
+            return Err(format!(
+                "launchd agent not installed ({} is missing) — run `m3-embed-server install` first",
+                plist.display()
+            ));
+        }
+        let target = service_target()?;
+        let answered_before = observed_state()? != "running" && serving_now();
+        // `stop` unloads the agent, and kickstart cannot reach an unloaded
+        // label; load it first (RunAtLoad then starts it).
+        if !is_loaded(&target)? {
+            run_launchctl(&["bootstrap", &gui_domain()?, &plist.to_string_lossy()])?;
+        }
+        run_launchctl(&["kickstart", &target])?;
+        let state = wait_for("running", 10)?;
+        if state == "running" {
+            let hint = format!("see {}", config::default_log_path().display());
+            report_serving(LAUNCHD_LABEL, answered_before, 30, &hint, &main_pid)
+        } else {
+            Err(format!(
+                "{LAUNCHD_LABEL} did not reach running within 10s (state: {state}; {}); see {}",
+                last_exit(),
+                config::default_log_path().display()
+            ))
+        }
+    }
+
+    /// The job's last exit, from `launchctl print` (`last exit code = N`),
+    /// with what the server's own codes mean.
+    fn last_exit_code() -> Option<String> {
+        let out = launchctl_raw(&["print", &service_target().ok()?]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("last exit code = ")
+                .map(|v| v.trim().to_string())
+        })
+    }
+
+    fn last_exit() -> String {
+        match last_exit_code() {
+            Some(c) => match c.parse::<i64>() {
+                Ok(n) => format!("last exit code {n}: {}", exit_status_meaning(n)),
+                Err(_) => format!("last exit code {c}"),
+            },
+            None => "no exit code recorded".into(),
+        }
     }
 
     pub fn stop() -> Result<(), String> {
-        // `kill` sends a signal to the running job without unloading it, so a
-        // later `start`/KeepAlive can bring it back.
-        run_launchctl(&["kill", "SIGTERM", &service_target()?])?;
-        println!("stop signal sent to {LAUNCHD_LABEL}");
+        let target = service_target()?;
+        if !is_loaded(&target)? {
+            println!("{LAUNCHD_LABEL} is already stopped (nothing to do)");
+            return Ok(());
+        }
+        // Unload, not `kill`: the plist sets KeepAlive, so launchd restarts a
+        // killed job at once. The plist stays, so `status` says stopped and
+        // RunAtLoad brings it back at the next login.
+        bootout_and_wait(&target)?;
+        println!("{LAUNCHD_LABEL}: {}", observed_state()?);
         Ok(())
     }
 
-    pub fn status() -> Result<(), String> {
-        // `launchctl print` exits non-zero when the label isn't loaded.
-        match launchctl_output(&["print", &service_target()?]) {
-            Ok(out) => {
-                // `print` dumps a big dict; the `state = running` line is the
-                // signal. Absence of that line ⇒ loaded but not running.
-                if out.lines().any(|l| l.trim_start().starts_with("state =") && l.contains("running")) {
-                    println!("running");
-                } else {
-                    println!("stopped");
-                }
-                Ok(())
+    /// `bootout` returns before launchd has torn the job down (measured: the
+    /// label still prints as loaded right after), so wait for it to go. A
+    /// bootout that fails because the job is already unloading is success.
+    fn bootout_and_wait(target: &str) -> Result<(), String> {
+        let result = run_launchctl(&["bootout", target]);
+        for _ in 0..40 {
+            if !is_loaded(target)? {
+                return Ok(());
             }
-            Err(_) => {
-                println!("not installed");
-                Ok(())
-            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
+        result?;
+        Err(format!("{LAUNCHD_LABEL} is still loaded 10s after bootout"))
+    }
+
+    pub fn status() -> Result<(), String> {
+        let state = observed_state()?;
+        println!("{state}");
+        if state == "running" {
+            note_foreign_answer(LAUNCHD_LABEL, main_pid());
+        } else if last_exit_code().is_some_and(|c| c != "0") {
+            // A loaded job that failed. stderr: stdout stays the state word.
+            eprintln!("{LAUNCHD_LABEL}: {}", last_exit());
+        }
+        Ok(())
+    }
+
+    /// The agent's process id, from `launchctl print` (`pid = N`); `None` when
+    /// it has no running process or launchd cannot be asked.
+    fn main_pid() -> Option<u32> {
+        let out = launchctl_raw(&["print", &service_target().ok()?]).ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("pid = ")?.trim().parse().ok())
+    }
+
+    /// Whether launchd has the label loaded. `print` exits non-zero for an
+    /// unknown label; failing to spawn launchctl at all is an error, not "no".
+    fn is_loaded(target: &str) -> Result<bool, String> {
+        Ok(launchctl_raw(&["print", target])?.status.success())
+    }
+
+    /// `running` / `stopped` / `not installed` — the words m3 parses.
+    fn observed_state() -> Result<&'static str, String> {
+        let out = launchctl_raw(&["print", &service_target()?])?;
+        if out.status.success() {
+            // `print` dumps a big dict; the `state = running` line is the
+            // signal. Exact match: `state = not running` also contains "running".
+            let text = String::from_utf8_lossy(&out.stdout);
+            return Ok(if text.lines().any(|l| l.trim() == "state = running") {
+                "running"
+            } else {
+                "stopped"
+            });
+        }
+        // Not loaded is not the same as not installed: `launchctl unload` (what
+        // `m3 stop` does) and our own `stop` leave the plist in place, and the
+        // plist on disk is the registration.
+        Ok(if plist_path()?.exists() {
+            "stopped"
+        } else {
+            "not installed"
+        })
+    }
+
+    /// Poll until the agent is `want` or `secs` pass; returns the last state.
+    fn wait_for(want: &str, secs: u64) -> Result<&'static str, String> {
+        let mut state = observed_state()?;
+        for _ in 0..(secs * 4) {
+            if state == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            state = observed_state()?;
+        }
+        Ok(state)
+    }
+
+    fn launchctl_raw(args: &[&str]) -> Result<std::process::Output, String> {
+        std::process::Command::new("launchctl")
+            .args(args)
+            .output()
+            .map_err(|e| format!("failed to spawn launchctl: {e}"))
     }
 
     fn run_launchctl(args: &[&str]) -> Result<(), String> {
@@ -244,10 +622,7 @@ pub mod macos {
     }
 
     fn launchctl_output(args: &[&str]) -> Result<String, String> {
-        let output = std::process::Command::new("launchctl")
-            .args(args)
-            .output()
-            .map_err(|e| format!("failed to spawn launchctl: {e}"))?;
+        let output = launchctl_raw(args)?;
         if !output.status.success() {
             return Err(format!(
                 "launchctl {} exited {}: {}",
@@ -284,23 +659,55 @@ pub mod linux {
 
     pub fn install() -> Result<(), String> {
         let exe = current_exe()?;
-        let gguf = resolve_gguf_for_unit()?;
+        let (args, cfg_file) = service_args()?;
         let unit = unit_path()?;
         if let Some(dir) = unit.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| format!("cannot create systemd user dir {}: {e}", dir.display()))?;
         }
-        let body = render_unit(&exe.to_string_lossy(), &gguf);
+        let body = render_unit(&exe.to_string_lossy(), &args);
         std::fs::write(&unit, body)
             .map_err(|e| format!("cannot write unit {}: {e}", unit.display()))?;
 
+        let was_running = observed_state() == "running";
+        let answered_before = !was_running && serving_now();
         run_systemctl(&["daemon-reload"])?;
-        // `enable --now` registers it for auto-start AND starts it immediately.
+        // `enable --now` registers it for auto-start AND starts it immediately,
+        // but leaves a unit that is already running on its previous binary
+        // and environment. Re-registering is how a new core reaches it, so
+        // restart a running unit (macOS gets this from bootout + bootstrap).
         run_systemctl(&["enable", "--now", &unit_name()])?;
+        if was_running {
+            run_systemctl(&["restart", &unit_name()])?;
+        }
 
         println!("systemd --user unit installed: {}", unit_name());
         println!("unit:     {}", unit.display());
+        println!("config:   {}", cfg_file.display());
         println!("log:      journalctl --user -u {SERVICE_NAME}");
+        // `enable --now` returns once the start is queued; report the outcome.
+        let state = wait_for("running", 10);
+        if state == "running" {
+            // Registered either way; a taken port is reported, not fatal here.
+            if let Err(e) = report_serving(
+                SERVICE_NAME,
+                answered_before,
+                30,
+                &journal_hint(),
+                &main_pid,
+            ) {
+                eprintln!("WARN: {e}");
+            }
+        } else {
+            println!("state:    {state}");
+            eprintln!(
+                "WARN: the unit did not reach running within 10s; {}",
+                journal_hint()
+            );
+        }
+        if linger_enabled() {
+            return Ok(());
+        }
         println!();
         println!("Note: a `systemd --user` service stops when you log out. To keep");
         println!("the embedder running across logout / on a headless box, enable lingering:");
@@ -308,58 +715,184 @@ pub mod linux {
         Ok(())
     }
 
+    /// Whether systemd keeps this user's services running after logout. An
+    /// unknown answer reads as no, so the note is shown rather than hidden.
+    fn linger_enabled() -> bool {
+        let user = std::env::var("USER").unwrap_or_default();
+        if user.is_empty() {
+            return false;
+        }
+        std::process::Command::new("loginctl")
+            .args(["show-user", &user, "-p", "Linger", "--value"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+            .unwrap_or(false)
+    }
+
     pub fn uninstall() -> Result<(), String> {
         let unit = unit_path()?;
-        // `disable --now` stops it and removes the auto-start symlink.
-        // Best-effort — the unit may already be gone.
-        let _ = run_systemctl(&["disable", "--now", &unit_name()]);
+        if !unit.exists() && observed_state() == "not installed" {
+            println!("systemd --user unit not installed: {}", unit_name());
+            return Ok(());
+        }
+        // `disable --now` stops it and removes the auto-start symlink. A
+        // failure is reported: the result is re-checked below either way.
+        if let Err(e) = run_systemctl(&["disable", "--now", &unit_name()]) {
+            eprintln!("WARN: {e}");
+        }
         if unit.exists() {
             std::fs::remove_file(&unit)
                 .map_err(|e| format!("cannot remove unit {}: {e}", unit.display()))?;
         }
-        let _ = run_systemctl(&["daemon-reload"]);
+        run_systemctl(&["daemon-reload"])?;
+        let state = observed_state();
+        if state != "not installed" {
+            return Err(format!("{} is still {state} after uninstall", unit_name()));
+        }
         println!("systemd --user unit removed: {}", unit_name());
         println!(
-            "config file left in place: {} (delete manually if desired)",
-            config::default_config_path().display()
+            "m3_config.toml is m3's and is left in place: {}",
+            config::located_file()
         );
         Ok(())
     }
 
     pub fn start() -> Result<(), String> {
+        let answered_before = observed_state() != "running" && serving_now();
         run_systemctl(&["start", &unit_name()])?;
-        println!("start signal sent to {SERVICE_NAME}");
-        Ok(())
+        // `start` returns once the main process is forked (Type=simple), so a
+        // bad GGUF or a busy port still exits 0. Report the outcome.
+        let state = wait_for("running", 10);
+        if state == "running" {
+            report_serving(
+                SERVICE_NAME,
+                answered_before,
+                30,
+                &journal_hint(),
+                &main_pid,
+            )
+        } else {
+            Err(format!(
+                "{SERVICE_NAME} did not reach running within 10s (state: {state}; {}); {}",
+                last_exit(),
+                journal_hint()
+            ))
+        }
     }
 
     pub fn stop() -> Result<(), String> {
+        // `systemctl stop` blocks until the unit has stopped.
         run_systemctl(&["stop", &unit_name()])?;
-        println!("stop signal sent to {SERVICE_NAME}");
+        let state = observed_state();
+        if state == "running" {
+            return Err(format!("{SERVICE_NAME} is still running after stop"));
+        }
+        println!("{SERVICE_NAME}: {state}");
         Ok(())
     }
 
     pub fn status() -> Result<(), String> {
-        // `is-active` prints active/inactive/failed/unknown and sets exit code;
+        let state = observed_state_noted(true);
+        println!("{state}");
+        if state == "running" {
+            note_foreign_answer(SERVICE_NAME, main_pid());
+        }
+        Ok(())
+    }
+
+    /// The unit's main process id; `None` when it has none (systemd reports 0)
+    /// or systemd cannot be asked.
+    fn main_pid() -> Option<u32> {
+        let out = systemctl_output(&["show", "-p", "MainPID", "--value", &unit_name()]).ok()?;
+        out.trim().parse::<u32>().ok().filter(|&p| p != 0)
+    }
+
+    fn observed_state() -> String {
+        observed_state_noted(false)
+    }
+
+    fn journal_hint() -> String {
+        format!("see `journalctl --user -u {SERVICE_NAME} -n 50`")
+    }
+
+    /// The main process's last exit, as systemd recorded it, with what the
+    /// server's own codes mean.
+    fn last_exit() -> String {
+        let out = systemctl_output(&["show", "-p", "Result", "-p", "ExecMainStatus", &unit_name()]);
+        let Ok(out) = out else {
+            return "exit status unavailable".into();
+        };
+        let prop = |k: &str| {
+            out.lines()
+                .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+                .unwrap_or("?")
+                .trim()
+                .to_string()
+        };
+        let (result, status) = (prop("Result"), prop("ExecMainStatus"));
+        match status.parse::<i64>() {
+            Ok(code) => format!(
+                "result {result}, exit status {code}: {}",
+                exit_status_meaning(code)
+            ),
+            Err(_) => format!("result {result}, exit status {status}"),
+        }
+    }
+
+    /// The state word m3 parses: `running`, `stopped`, `not installed`, or
+    /// systemd's own transitional word (`activating`, `deactivating`, …).
+    /// Detail an operator needs goes to stderr so stdout stays one word.
+    fn observed_state_noted(report: bool) -> String {
+        // `is-active` prints active/inactive/failed/… and sets the exit code;
         // `is-enabled` distinguishes "not installed" from "installed, stopped".
-        let active = systemctl_output(&["is-active", &unit_name()])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let active = match systemctl_output(&["is-active", &unit_name()]) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                // No answer (no user bus, systemctl missing) is neither
+                // "stopped" nor "not installed": a unit file says it is
+                // registered, not whether it runs.
+                if report {
+                    let unit = match unit_path() {
+                        Ok(p) if p.exists() => format!("the unit file {} exists", p.display()),
+                        Ok(p) => format!("there is no unit file at {}", p.display()),
+                        Err(e) => e,
+                    };
+                    eprintln!("cannot query systemd, so the state is unknown ({unit}): {e}");
+                }
+                return "unknown".to_string();
+            }
+        };
         match active.as_str() {
-            "active" => println!("running"),
-            "" | "inactive" | "failed" | "unknown" => {
-                // Distinguish stopped-but-installed from never-installed.
+            "active" => "running".to_string(),
+            "inactive" | "failed" | "unknown" => {
                 let enabled = systemctl_output(&["is-enabled", &unit_name()])
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
-                if enabled.is_empty() || enabled == "not-found" {
-                    println!("not installed");
-                } else {
-                    println!("stopped");
+                let installed = !(enabled.is_empty() || enabled == "not-found")
+                    || unit_path().map(|p| p.exists()).unwrap_or(false);
+                if !installed {
+                    return "not installed".to_string();
                 }
+                if report && active == "failed" {
+                    eprintln!("the unit failed ({}); {}", last_exit(), journal_hint());
+                }
+                "stopped".to_string()
             }
-            other => println!("{other}"),
+            other => other.to_string(),
         }
-        Ok(())
+    }
+
+    /// Poll until the unit is `want` or `secs` pass; returns the last state.
+    fn wait_for(want: &str, secs: u64) -> String {
+        let mut state = observed_state();
+        for _ in 0..(secs * 4) {
+            if state == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            state = observed_state();
+        }
+        state
     }
 
     fn run_systemctl(args: &[&str]) -> Result<(), String> {

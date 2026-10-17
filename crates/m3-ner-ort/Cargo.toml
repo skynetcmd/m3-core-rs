@@ -20,12 +20,13 @@ onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 [dependencies]
 m3-error = { workspace = true }
 m3-dispatcher = { workspace = true }
+log = "0.4"
 # `load-dynamic`: dlopen the ONNX Runtime DLL at runtime (no .lib/compiler).
 # default-features off: drops `download-binaries` (no network fetch / no
 # bundled lib) — we use a runtime-installed ONNX Runtime instead.
 # `api-24`: pin the ONNX Runtime C API level `ort` binds against (rc.12's
-# default). The installed runtime is 1.25.x; the 1.24 API surface is a
-# forward-compatible subset, so a 1.25 DLL satisfies these bindings.
+# default). Any ONNX Runtime >= 1.24 satisfies these bindings: the C API is
+# forward-compatible, so a newer DLL (e.g. 1.25) loads too.
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-24"], optional = true }
 # default-features off: drops `onig` + `esaxx_fast`, both of which need a C++
 # compiler. `fancy-regex` is the pure-Rust regex backend — builds with no

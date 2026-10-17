@@ -1,9 +1,9 @@
 //! llama.cpp embedding backends (Phase 3b).
 //!
-//! Two backends, same API: `HttpBackend` (POST to llama-server) and
-//! `EmbeddedBackend` (link llama-cpp-rs, zero IPC). The model math stays in
-//! llama.cpp. The default build compiles only `HttpBackend`; `EmbeddedBackend`
-//! is a stub unless the `embedded` cargo feature is enabled.
+//! `EmbeddedBackend` links llama.cpp in process (llama-cpp-rs, zero IPC); the
+//! model math stays in llama.cpp. It is a stub unless the `embedded` cargo
+//! feature is enabled. (The HTTP client backend was removed: nothing used it,
+//! and it was the core's only TLS client, on `ring`.)
 
 // Wave 9.0 — mutual exclusivity for GPU backends: at most one of
 // cuda/vulkan/metal. Enforced at build time because llama-cpp-2's GPU backends
@@ -32,242 +32,57 @@ compile_error!(
      (CPU), embedded-cuda, or embedded-vulkan instead."
 );
 
-/// String label of the active embedded backend, exposed to Python (via
-/// `m3-core-py::embed_backend_label`) so callers can observe which compute
-/// backend served a request — wave 9.4 will surface this in backend stats.
-/// CPU is the default `embedded` build; the GPU variants override.
+/// The backend this build was COMPILED for: `cpu`, `cuda`, `vulkan`, `metal`,
+/// or `none` without `embedded`. The single owner of that fact — m3-core-py's
+/// `__build_backend__` / `embed_backend_label()` and the embed server's
+/// startup line all read it. ⚠ Not what served a request: a GPU build on a
+/// host without a usable device runs on the CPU. The observed label is
+/// [`EmbeddedBackend::runtime_backend`]. The GPU features each imply
+/// `embedded`, so they are tested first.
+pub const COMPILED_BACKEND: &str = if cfg!(feature = "embedded-cuda") {
+    "cuda"
+} else if cfg!(feature = "embedded-vulkan") {
+    "vulkan"
+} else if cfg!(feature = "embedded-metal") {
+    "metal"
+} else if cfg!(feature = "embedded") {
+    "cpu"
+} else {
+    "none"
+};
+
+/// [`COMPILED_BACKEND`], for callers of the older function form.
 #[cfg(feature = "embedded")]
 pub fn active_backend() -> &'static str {
-    #[cfg(feature = "embedded-cuda")]
-    {
-        return "cuda";
-    }
-    #[cfg(feature = "embedded-vulkan")]
-    {
-        return "vulkan";
-    }
-    #[cfg(feature = "embedded-metal")]
-    {
-        return "metal";
-    }
-    #[cfg(not(any(
-        feature = "embedded-cuda",
-        feature = "embedded-vulkan",
-        feature = "embedded-metal"
-    )))]
-    {
-        "cpu"
-    }
+    COMPILED_BACKEND
 }
+
+mod cuda_env;
+pub mod windows;
+
+#[cfg(feature = "embedded")]
+pub use cuda_env::prepare_process_env;
 
 use m3_dispatcher::{Batch, BatchOutput, ModelBackend};
 use m3_error::{M3Error, Result};
-use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
-use std::time::Duration;
 
-/// Process-wide shared `reqwest::Client` used by `HttpBackend::new`. Wave-7
-/// fix #14: previously each `HttpBackend::new` built a fresh
-/// `reqwest::Client`, so independent backend instances couldn't reuse
-/// connections to a localhost llama-server. `reqwest::Client` is internally
-/// `Arc`-wrapped, so cloning out of the OnceLock is cheap and every clone
-/// shares the same connection pool.
-///
-/// Tuning: `pool_max_idle_per_host(16)` gives headroom for an 8-stream
-/// dispatcher; `tcp_keepalive(60s)` keeps long-lived localhost sockets warm.
-/// HTTP/2 prior-knowledge is intentionally NOT enabled here — llama-server's
-/// embedded HTTP layer (cpp-httplib) is HTTP/1.1 only, so forcing prior
-/// knowledge would break every request. Callers who run against an HTTP/2
-/// server can opt in via [`HttpBackend::with_config`] +
-/// [`HttpBackendConfig::http2_prior_knowledge`].
-static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn shared_client() -> reqwest::Client {
-    SHARED_CLIENT
-        .get_or_init(|| {
-            reqwest::Client::builder()
-                .pool_max_idle_per_host(16)
-                .tcp_keepalive(Duration::from_secs(60))
-                .build()
-                .expect("default reqwest client build failed")
-        })
-        .clone()
-}
-
-/// Tunables for [`HttpBackend::with_config`] (wave-7 fix #14). The
-/// `HttpBackend::new` path uses a process-wide shared client with the
-/// defaults below; supplying a non-default config builds a fresh client
-/// dedicated to that backend instance instead.
-#[derive(Debug, Clone)]
-pub struct HttpBackendConfig {
-    /// Max idle connections kept warm per (scheme, host, port). Default 16.
-    pub pool_max_idle_per_host: usize,
-    /// TCP keep-alive interval. `None` disables. Default `Some(60s)`.
-    pub tcp_keepalive: Option<Duration>,
-    /// Force HTTP/2 without ALPN negotiation. **Off by default** — llama-server
-    /// is HTTP/1.1-only, and turning this on against an HTTP/1.1 server fails
-    /// every request. Only enable when you know the server speaks HTTP/2
-    /// unconditionally.
-    pub http2_prior_knowledge: bool,
-    /// Per-request timeout (Fix #27). Default 30s.
-    pub request_timeout: Duration,
-}
-
-impl Default for HttpBackendConfig {
-    fn default() -> Self {
-        Self {
-            pool_max_idle_per_host: 16,
-            tcp_keepalive: Some(Duration::from_secs(60)),
-            http2_prior_knowledge: false,
-            request_timeout: Duration::from_secs(30),
-        }
-    }
-}
-
-/// Selects how a caller wants to talk to llama.cpp. Kept for config ergonomics
-/// in `m3-core-py`; each variant maps to a concrete backend type below.
-pub enum Backend {
-    Http { url: String },
-    Embedded { model_path: String },
-}
-
-/// Request body POSTed to llama-server's `/embedding` endpoint.
-/// OpenAI-ish: `{ "input": ["text a", "text b"] }`.
-#[derive(Debug, Serialize)]
-struct EmbeddingRequest {
-    input: Vec<String>,
-}
-
-/// One element of llama-server's `/embedding` response.
-#[derive(Debug, Deserialize)]
-struct EmbeddingItem {
-    embedding: Vec<f32>,
-}
-
-/// llama-server `/embedding` response: `{ "data": [ { "embedding": [...] } ] }`.
-#[derive(Debug, Deserialize)]
-struct EmbeddingResponse {
-    data: Vec<EmbeddingItem>,
-}
-
-/// HTTP embedding backend — POSTs batches to a llama-server (or any
-/// OpenAI-compatible embedding server).
-pub struct HttpBackend {
-    client: reqwest::Client,
-    endpoint: String,
-    /// Per-request timeout (Fix #27). A wedged llama-server otherwise hangs
-    /// forever — the dispatcher's circuit breaker only trips on errors, so
-    /// "slow but not failed" requests never recover. Defaults to 30s.
-    request_timeout: std::time::Duration,
-}
-
-impl HttpBackend {
-    /// `base_url` is the server root, e.g. `http://127.0.0.1:8081`. The
-    /// `/embedding` path is appended.
-    pub fn new(base_url: impl Into<String>) -> Self {
-        let base = base_url.into();
-        let endpoint = format!("{}/embedding", base.trim_end_matches('/'));
-        // Wave-7 fix #14: share the process-wide tuned client so multiple
-        // HttpBackend instances reuse connections.
-        Self {
-            client: shared_client(),
-            endpoint,
-            request_timeout: Duration::from_secs(30),
-        }
-    }
-
-    pub fn with_client(base_url: impl Into<String>, client: reqwest::Client) -> Self {
-        let base = base_url.into();
-        let endpoint = format!("{}/embedding", base.trim_end_matches('/'));
-        Self {
-            client,
-            endpoint,
-            request_timeout: Duration::from_secs(30),
-        }
-    }
-
-    /// Build an `HttpBackend` from an explicit [`HttpBackendConfig`] (wave-7
-    /// fix #14). Unlike [`HttpBackend::new`] this builds a fresh dedicated
-    /// `reqwest::Client` for this backend instance — use it when the defaults
-    /// (16-idle pool, 60s keep-alive, HTTP/1.1 negotiation, 30s timeout)
-    /// don't fit, e.g. against a non-localhost server or one that speaks
-    /// HTTP/2 unconditionally.
-    pub fn with_config(base_url: impl Into<String>, config: HttpBackendConfig) -> Self {
-        let base = base_url.into();
-        let endpoint = format!("{}/embedding", base.trim_end_matches('/'));
-        let mut builder = reqwest::Client::builder()
-            .pool_max_idle_per_host(config.pool_max_idle_per_host);
-        if let Some(ka) = config.tcp_keepalive {
-            builder = builder.tcp_keepalive(ka);
-        }
-        if config.http2_prior_knowledge {
-            builder = builder.http2_prior_knowledge();
-        }
-        let client = builder
-            .build()
-            .expect("custom reqwest client build failed");
-        Self {
-            client,
-            endpoint,
-            request_timeout: config.request_timeout,
-        }
-    }
-
-    /// Override the per-request timeout (Fix #27). Default: 30s.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
-
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    pub fn request_timeout(&self) -> std::time::Duration {
-        self.request_timeout
-    }
-}
-
-impl ModelBackend for HttpBackend {
-    async fn run(&self, batch: Batch) -> Result<BatchOutput> {
-        let body = EmbeddingRequest { input: batch.texts };
-        let resp = self
-            .client
-            .post(&self.endpoint)
-            .json(&body)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    M3Error::Backend(format!(
-                        "embedding request timed out after {}s",
-                        self.request_timeout.as_secs_f64()
-                    ))
-                } else {
-                    M3Error::Backend(format!("embedding request failed: {e}"))
-                }
-            })?;
-        if !resp.status().is_success() {
-            return Err(M3Error::Backend(format!(
-                "embedding server returned {}",
-                resp.status()
-            )));
-        }
-        let parsed: EmbeddingResponse = resp
-            .json()
-            .await
-            .map_err(|e| M3Error::Backend(format!("embedding response decode failed: {e}")))?;
-        let rows = parsed.data.into_iter().map(|i| i.embedding).collect();
-        Ok(BatchOutput::new(rows))
-    }
-}
+/// Default per-context token window (BGE-M3's training context). Also the
+/// `M3_EMBED_CTX` default in m3-core-py.
+pub const DEFAULT_N_CTX: u32 = 8192;
+/// Default sequences packed per decode (`M3_EMBED_SEQ_MAX` default).
+pub const DEFAULT_SEQ_MAX: u32 = 32;
+/// Pool size used by the constructors that take no stream count. ⚠ Differs
+/// from the dispatcher / `M3_EMBED_STREAMS` default (8); m3-core-py and the
+/// embed server always pass the stream count explicitly.
+pub const DEFAULT_STREAMS: usize = 4;
+/// Smallest context the pool will create; smaller requests are raised (and logged).
+pub const MIN_N_CTX: u32 = 64;
 
 /// Embedded (in-process) backend that links llama.cpp directly via
 /// `llama-cpp-2` — zero IPC, zero JSON. Gated behind the `embedded` cargo
-/// feature, which cmake-builds llama.cpp from source (CPU-only). Without the
-/// feature this struct still constructs but `run` returns a "not compiled"
-/// error.
+/// feature, which cmake-builds llama.cpp from source (CPU, or the GPU backend
+/// an `embedded-*` feature selects). Without the feature this struct still
+/// constructs but `run` returns a "not compiled" error.
 ///
 /// Construction is cheap: `new` only stores the path + stream count. The GGUF
 /// model and the worker-thread context pool are loaded lazily on the first
@@ -281,15 +96,15 @@ impl ModelBackend for HttpBackend {
 /// the pool is `streams` dedicated OS worker threads; each thread owns one
 /// `LlamaContext` for its whole lifetime (the context never leaves the thread
 /// that made it, satisfying `!Send`). `LlamaModel`/`LlamaBackend` *are*
-/// `Send + Sync`, so they are shared via `Arc`. Work is dispatched over an
-/// `mpsc` channel — any idle worker picks up the next batch, so `streams`
+/// `Send + Sync`, so they are shared via `Arc`. Work is dispatched over a
+/// crossbeam MPMC channel — any idle worker picks up the next batch, so `streams`
 /// concurrent `run()` calls genuinely decode in parallel on `streams` cores.
 pub struct EmbeddedBackend {
     #[allow(dead_code)]
     model_path: String,
     /// Size of the worker-thread context pool. Reaches this generic crate as a
     /// typed parameter — never read from an env var here (that is `m3-core-py`'s
-    /// job). Defaults to 4 via `new`; use `with_streams` to override.
+    /// job). Defaults to `DEFAULT_STREAMS` via `new`; use `with_streams` to override.
     #[allow(dead_code)]
     streams: usize,
     /// Per-context token window. Set via `M3_EMBED_CTX` (read in `m3-core-py`).
@@ -300,48 +115,83 @@ pub struct EmbeddedBackend {
     /// Set via `M3_EMBED_SEQ_MAX` (read in `m3-core-py`). Default: 32.
     #[allow(dead_code)]
     seq_max: u32,
-    /// llama.cpp's prompt-processing batch ceiling. Decoupled from `n_ctx` in
-    /// wave-3 fix #1: previously `n_batch == n_ctx == 8192` was wildly
-    /// over-provisioned for typical embed batches and bloated allocator
-    /// pressure. Set via `M3_EMBED_N_BATCH` (read in `m3-core-py`).
+    /// llama.cpp's prompt-processing batch ceiling, floored at `n_ctx` (the
+    /// BERT encoder needs the whole decode chunk in one ubatch). Set via
+    /// `M3_EMBED_N_BATCH` (read in `m3-core-py`).
     #[allow(dead_code)]
     n_batch: u32,
-    /// llama.cpp's micro-batch (the inner SIMD tile size). Smaller than
-    /// `n_batch`; tuned independently. Set via `M3_EMBED_N_UBATCH`.
+    /// llama.cpp's micro-batch, floored at `n_ctx` and capped at `n_batch`.
+    /// Set via `M3_EMBED_N_UBATCH`.
     #[allow(dead_code)]
     n_ubatch: u32,
     #[cfg(feature = "embedded")]
     state: std::sync::OnceLock<std::sync::Arc<embedded::ContextPool>>,
+    /// Serialises the first load: without it, concurrent first calls each
+    /// loaded the GGUF and spun up a whole worker pool, and all but one were
+    /// thrown away.
+    #[cfg(feature = "embedded")]
+    load_lock: std::sync::Mutex<()>,
+}
+
+/// Tokenizes with a loaded model, independently of the backend that loaded it.
+/// Cheap to clone; tokenization never queues behind an embed batch.
+#[cfg(feature = "embedded")]
+#[derive(Clone)]
+pub struct Tokenizer {
+    pool: std::sync::Arc<embedded::ContextPool>,
+}
+
+#[cfg(feature = "embedded")]
+impl Tokenizer {
+    /// Exact token counts, BOS/EOS included. See [`EmbeddedBackend::count_tokens`].
+    pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
+        self.pool.count_tokens(texts)
+    }
+
+    /// Token-exact windows (character offsets). See [`windows::plan_windows`].
+    pub fn token_windows(
+        &self,
+        text: &str,
+        budget: usize,
+        overlap: usize,
+    ) -> Result<Vec<(usize, usize)>> {
+        self.pool.token_windows(text, budget, overlap)
+    }
 }
 
 impl EmbeddedBackend {
-    /// Construct with the default pool size (4 streams), default ctx (8192), and default seq_max (32).
+    /// Construct with `DEFAULT_STREAMS`, `DEFAULT_N_CTX` and `DEFAULT_SEQ_MAX`.
     /// Default n_batch = n_ubatch = n_ctx (the encoder-safe value; see `with_streams_ctx_seqmax`).
     pub fn new(model_path: impl Into<String>) -> Self {
-        Self::with_streams_ctx_seqmax(model_path, 4, 8192, 32)
+        Self::with_streams_ctx_seqmax(model_path, DEFAULT_STREAMS, DEFAULT_N_CTX, DEFAULT_SEQ_MAX)
     }
 
     /// Construct with an explicit context-pool size.
     /// Defaults: n_batch = n_ubatch = n_ctx (the encoder-safe value).
     pub fn with_streams(model_path: impl Into<String>, streams: usize) -> Self {
-        Self::with_streams_ctx_seqmax(model_path, streams, 8192, 32)
+        Self::with_streams_ctx_seqmax(model_path, streams, DEFAULT_N_CTX, DEFAULT_SEQ_MAX)
     }
 
     /// Construct with explicit stream count and per-context token window.
     /// Defaults: n_batch = n_ubatch = n_ctx (the encoder-safe value).
     pub fn with_streams_and_ctx(model_path: impl Into<String>, streams: usize, n_ctx: u32) -> Self {
-        Self::with_streams_ctx_seqmax(model_path, streams, n_ctx, 32)
+        Self::with_streams_ctx_seqmax(model_path, streams, n_ctx, DEFAULT_SEQ_MAX)
     }
 
     /// Construct with explicit stream count, per-context token window, and max sequences per decode.
     /// `n_ctx` is the total token budget per decode call (shared across all sequences in a chunk).
     /// `seq_max` caps how many sequences are packed into one decode call per worker thread.
     /// Defaults n_batch = n_ubatch = n_ctx (encoder-safe; see body for why).
-    pub fn with_streams_ctx_seqmax(model_path: impl Into<String>, streams: usize, n_ctx: u32, seq_max: u32) -> Self {
+    pub fn with_streams_ctx_seqmax(
+        model_path: impl Into<String>,
+        streams: usize,
+        n_ctx: u32,
+        seq_max: u32,
+    ) -> Self {
         // n_batch / n_ubatch default to n_ctx. llama.cpp's BERT encoder asserts
         // `n_ubatch >= n_tokens` for the WHOLE batch it is handed, and a chunk in
         // `embed_on_ctx` can pack up to `n_ctx` tokens (across `seq_max` seqs, or
-        // one solo long text). The earlier wave-3 default of `n_ubatch = 512`
+        // one solo long text). An earlier default of `n_ubatch = 512`
         // therefore crashed the encoder — `GGML_ASSERT(cparams.n_ubatch >=
         // n_tokens)` — on any text/chunk over 512 tokens, which for BGE-M3
         // (8192-token trained ctx) is routine. `n_ctx` is the simplest default
@@ -352,7 +202,7 @@ impl EmbeddedBackend {
         Self::with_streams_ctx_seqmax_batch(model_path, streams, n_ctx, seq_max, n_batch, n_ubatch)
     }
 
-    /// Full-control constructor (wave-3 fix #1). All five tunables explicit:
+    /// Full-control constructor. All five tunables explicit:
     /// pool size, context budget, max sequences/decode, n_batch (prompt-process
     /// batch ceiling), and n_ubatch (micro-batch / SIMD tile). Existing
     /// constructors above are thin shims that pass `n_batch = n_ubatch = n_ctx`.
@@ -362,8 +212,8 @@ impl EmbeddedBackend {
     /// encoder asserts `n_ubatch >= n_tokens` over the whole batch, so `n_ctx`
     /// is the simplest value guaranteed safe for every chunk the worker can
     /// build. A smaller value would crash at `encode()` time; rather than let
-    /// that happen the constructor floors it AND logs a one-line warning to
-    /// stderr so a deliberate small setting isn't silently discarded.
+    /// that happen the constructor floors it AND logs a `log::warn!` so a
+    /// deliberate small setting isn't silently discarded.
     pub fn with_streams_ctx_seqmax_batch(
         model_path: impl Into<String>,
         streams: usize,
@@ -372,7 +222,12 @@ impl EmbeddedBackend {
         n_batch: u32,
         n_ubatch: u32,
     ) -> Self {
-        let n_ctx = n_ctx.max(64);
+        if n_ctx < MIN_N_CTX {
+            log::warn!(
+                "m3-embed: n_ctx {n_ctx} is below the minimum {MIN_N_CTX}; using {MIN_N_CTX}"
+            );
+        }
+        let n_ctx = n_ctx.max(MIN_N_CTX);
         // Floor n_batch / n_ubatch at n_ctx (see doc comment for the encoder
         // assert). n_batch must also stay >= n_ubatch. A value above n_ctx is
         // harmless — just a larger prompt-process tile — so it passes through.
@@ -387,9 +242,17 @@ impl EmbeddedBackend {
                      n_ctx ({n_ctx}); raised to {n_batch}/{n_ubatch} — the BERT \
                      encoder requires n_ubatch >= the largest decode chunk"
                 );
+            } else if req_ubatch > n_ubatch {
+                log::warn!(
+                    "m3-embed: n_ubatch {req_ubatch} exceeds n_batch {n_batch}; lowered to \
+                     {n_ubatch} (llama.cpp requires n_ubatch <= n_batch)"
+                );
             }
             (n_batch, n_ubatch)
         };
+        if streams == 0 || seq_max == 0 {
+            log::warn!("m3-embed: streams={streams} / seq_max={seq_max}: zero is raised to 1");
+        }
         Self {
             model_path: model_path.into(),
             streams: streams.max(1),
@@ -399,6 +262,8 @@ impl EmbeddedBackend {
             n_ubatch,
             #[cfg(feature = "embedded")]
             state: std::sync::OnceLock::new(),
+            #[cfg(feature = "embedded")]
+            load_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -428,6 +293,26 @@ impl EmbeddedBackend {
         pool.count_tokens(texts)
     }
 
+    /// Token-exact windows over `text` (character offsets). See
+    /// [`windows::plan_windows`]. Forces the GGUF load, performs no decode.
+    #[cfg(feature = "embedded")]
+    pub fn token_windows(
+        &self,
+        text: &str,
+        budget: usize,
+        overlap: usize,
+    ) -> Result<Vec<(usize, usize)>> {
+        self.pool()?.token_windows(text, budget, overlap)
+    }
+
+    /// A handle that tokenizes with this backend's model after the backend
+    /// itself has been moved into a dispatcher (the embed server keeps one for
+    /// its `/tokenize/*` routes). Forces the GGUF load.
+    #[cfg(feature = "embedded")]
+    pub fn tokenizer(&self) -> Result<Tokenizer> {
+        Ok(Tokenizer { pool: self.pool()? })
+    }
+
     /// Test-only: peek at the cached `Arc<ContextPool>` without forcing a
     /// load. Returns `None` until `embedding_dim`/`run` has populated the
     /// `OnceLock`. Used by the shared-pool invariant test in `tests` below
@@ -440,10 +325,26 @@ impl EmbeddedBackend {
         self.state.get().cloned()
     }
 
-    /// Get-or-load the cached worker-thread `ContextPool`. Internal helper
-    /// shared by `run` and `embedding_dim`.
+    /// The compute backend that actually holds the model's offloaded layers,
+    /// as observed after load (`cuda`, `vulkan`, `metal`, or `cpu`) — unlike
+    /// [`active_backend`], which is only what the build was compiled for.
+    /// Forces the GGUF load.
+    #[cfg(feature = "embedded")]
+    pub fn runtime_backend(&self) -> Result<String> {
+        Ok(self.pool()?.runtime_backend().to_string())
+    }
+
+    /// Get-or-load the cached worker-thread `ContextPool`: exactly one load per
+    /// backend, however many callers race for the first one. A failed load is
+    /// not cached, so the next call retries it.
     #[cfg(feature = "embedded")]
     fn pool(&self) -> Result<std::sync::Arc<embedded::ContextPool>> {
+        if let Some(p) = self.state.get() {
+            return Ok(p.clone());
+        }
+        // A poisoned lock only means an earlier loader panicked; the OnceLock
+        // is still consistent, so proceed.
+        let _g = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(p) = self.state.get() {
             return Ok(p.clone());
         }
@@ -455,8 +356,7 @@ impl EmbeddedBackend {
             self.n_batch,
             self.n_ubatch,
         )?);
-        let _ = self.state.set(loaded.clone());
-        Ok(self.state.get().cloned().unwrap_or(loaded))
+        Ok(self.state.get_or_init(|| loaded).clone())
     }
 }
 
@@ -469,6 +369,8 @@ pub mod embedded {
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::{AddBos, LlamaModel};
+    use llama_cpp_2::token::LlamaToken;
+    use llama_cpp_2::{list_llama_ggml_backend_devices, LlamaBackendDeviceType};
     use m3_error::{M3Error, Result};
     use std::num::NonZeroU32;
     use std::sync::mpsc as stdmpsc;
@@ -487,12 +389,9 @@ pub mod embedded {
     /// Get-or-init the shared backend. Returns a `&'static LlamaBackend`.
     fn shared_backend() -> Result<&'static LlamaBackend> {
         let slot = BACKEND.get_or_init(|| {
-            // Wave 9.1: Blackwell/595.xx CUDA Graphs workaround — applied before
-            // LlamaBackend::init so the env var is read by ggml-cuda during its
-            // own init. See `maybe_disable_cuda_graphs_for_blackwell` below.
-            #[cfg(feature = "embedded-cuda")]
-            maybe_disable_cuda_graphs_for_blackwell();
-
+            // Before init, so ggml-cuda sees GGML_CUDA_DISABLE_GRAPHS. Hosts
+            // call this earlier still; it runs once (see cuda_env).
+            crate::cuda_env::prepare_process_env();
             LlamaBackend::init().map_err(|e| format!("llama backend init failed: {e}"))
         });
         match slot {
@@ -501,51 +400,27 @@ pub mod embedded {
         }
     }
 
-    /// Auto-detect NVIDIA compute capability via `nvidia-smi`. If sm_120 (Blackwell)
-    /// or newer, set GGML_CUDA_DISABLE_GRAPHS=1 to work around the llama.cpp CUDA
-    /// Graphs / Blackwell-595.xx pathology that drops embed latency from ~2100ms to
-    /// ~8ms. Called exactly once, before LlamaBackend::init().
-    ///
-    /// Safe to call without nvidia-smi available: logs a warning and defaults to
-    /// setting the env var (5-10% throughput cost on pre-Blackwell vs ~260× regression
-    /// on Blackwell with graphs enabled — safer to disable).
-    #[cfg(feature = "embedded-cuda")]
-    pub(crate) fn maybe_disable_cuda_graphs_for_blackwell() {
-        // Skip if the operator already set the var (any value — explicit override wins).
-        if std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_some() {
-            log::info!("GGML_CUDA_DISABLE_GRAPHS already set, leaving it alone");
-            return;
-        }
-
-        let cap = detect_cuda_compute_cap();
-        match cap {
-            Some(c) if c >= 12.0 => {
-                log::info!("detected CUDA compute cap {c:.1} (Blackwell+) — setting GGML_CUDA_DISABLE_GRAPHS=1");
-                std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
-            }
-            Some(c) => {
-                log::info!("detected CUDA compute cap {c:.1} (<12.0) — CUDA Graphs enabled");
-            }
-            None => {
-                log::warn!("could not detect CUDA compute cap — setting GGML_CUDA_DISABLE_GRAPHS=1 defensively");
-                std::env::set_var("GGML_CUDA_DISABLE_GRAPHS", "1");
-            }
-        }
+    /// The ONE tokenizer call: counting, windowing, warmup and embedding all
+    /// go through it, so a count always matches what the embed path measures
+    /// against `n_ctx` (BOS/EOS included — `AddBos::Always`).
+    fn tokenize(model: &LlamaModel, text: &str) -> Result<Vec<LlamaToken>> {
+        model.str_to_token(text, AddBos::Always).map_err(|e| {
+            M3Error::Backend(format!(
+                "tokenize failed for a {}-byte text: {e}",
+                text.len()
+            ))
+        })
     }
 
-    #[cfg(feature = "embedded-cuda")]
-    pub(crate) fn detect_cuda_compute_cap() -> Option<f32> {
-        let output = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
+    /// Text of a panic payload (`&str` or `String`; anything else is opaque).
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "(non-string panic payload)".to_string()
         }
-        let stdout = String::from_utf8(output.stdout).ok()?;
-        // First GPU's compute cap if multi-GPU box.
-        let first_line = stdout.lines().next()?.trim();
-        first_line.parse::<f32>().ok()
     }
 
     /// One job handed to a worker thread: texts to embed + a reply channel.
@@ -565,15 +440,18 @@ pub mod embedded {
     /// `n_embd` is captured at load time so `embedding_dim()` need not round-trip
     /// through a worker.
     pub struct ContextPool {
-        /// Wave-3 fix #4: crossbeam MPMC. `Mutex<Option<Sender<Job>>>` slot is
-        /// retained so the API surface (Drop-time shutdown by taking the
-        /// sender) is identical — only the underlying channel type changed.
-        /// Crossbeam's Sender is Clone+Send+Sync; dropping the last sender
-        /// causes worker `recv()` calls to return `Err`, which exits the loops.
+        /// Crossbeam MPMC sender, in a slot so Drop can take it: dropping the
+        /// last sender makes every worker's `recv()` return `Err`, which ends
+        /// its loop.
         tx: Mutex<Option<Sender<Job>>>,
         workers: Mutex<Vec<JoinHandle<()>>>,
         n_embd: i32,
         streams: usize,
+        /// Per-context token window; `token_windows` validates budgets against it.
+        n_ctx: u32,
+        /// Observed after load: the backend of the device holding the
+        /// offloaded layers, or `cpu`.
+        runtime_backend: String,
         /// The loaded GGUF, retained so `count_tokens` can tokenize WITHOUT
         /// going through a worker.
         ///
@@ -588,13 +466,66 @@ pub mod embedded {
         model: Arc<LlamaModel>,
     }
 
+    /// Which device took the model, as ggml reports it after load. Logged at
+    /// info; a GPU build that ended up on the CPU is logged at WARN, because
+    /// that is a 10-50x slowdown nobody asked for.
+    fn observe_device(model: &LlamaModel, params: &LlamaModelParams, model_path: &str) -> String {
+        let gpus: Vec<_> = list_llama_ggml_backend_devices()
+            .into_iter()
+            .filter(|d| {
+                matches!(
+                    d.device_type,
+                    LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu
+                )
+            })
+            .collect();
+        let requested = params.n_gpu_layers();
+        let n_layer = model.n_layer();
+        // llama.cpp reads a negative or >= n_layer request as "all layers".
+        let offload = if requested < 0 {
+            n_layer
+        } else {
+            (requested as u32).min(n_layer)
+        };
+        let compiled = crate::active_backend();
+        match gpus.first() {
+            Some(d) if offload > 0 => {
+                log::info!(
+                    "m3-embed: loaded '{model_path}' on {} device {} ({}, {} MiB free of {} MiB); \
+                     {offload} of {n_layer} layers requested for offload (n_gpu_layers={requested}; \
+                     the count is inferred from the request, llama.cpp does not report it)",
+                    d.backend,
+                    d.name,
+                    d.description,
+                    d.memory_free / (1 << 20),
+                    d.memory_total / (1 << 20),
+                );
+                d.backend.to_ascii_lowercase()
+            }
+            _ => {
+                if compiled == "cpu" {
+                    log::info!("m3-embed: loaded '{model_path}' on the CPU ({n_layer} layers)");
+                } else {
+                    log::warn!(
+                        "m3-embed: this is a {compiled} build but '{model_path}' runs on the CPU: \
+                         ggml reported {} GPU device(s) and n_gpu_layers={requested}. Check the GPU \
+                         driver / runtime libraries (e.g. CUDA_PATH, the Vulkan loader); embedding \
+                         will be much slower",
+                        gpus.len()
+                    );
+                }
+                "cpu".to_string()
+            }
+        }
+    }
+
     impl ContextPool {
         /// Load the GGUF model once and spin up `streams` worker threads, each
         /// with its own `LlamaContext`. `n_ctx` is the total token budget per
         /// decode call (shared across all sequences in one chunk). `seq_max` is
         /// the max sequences packed into one `LlamaBatch` decode per worker.
         /// `n_batch` / `n_ubatch` are the llama.cpp prompt-process batch and
-        /// micro-batch ceilings (wave-3 fix #1).
+        /// micro-batch ceilings.
         pub fn load(
             model_path: &str,
             streams: usize,
@@ -604,23 +535,26 @@ pub mod embedded {
             n_ubatch: u32,
         ) -> Result<Self> {
             let streams = streams.max(1);
-            let n_ctx = n_ctx.max(64);
+            let n_ctx = n_ctx.max(crate::MIN_N_CTX);
+            if !std::path::Path::new(model_path).is_file() {
+                return Err(M3Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("GGUF model '{model_path}' does not exist or is not a file"),
+                )));
+            }
             // Shared, process-global backend (see `BACKEND` above).
             let backend = shared_backend()?;
+            let params = LlamaModelParams::default();
             let model = Arc::new(
-                LlamaModel::load_from_file(backend, model_path, &LlamaModelParams::default())
-                    .map_err(|e| {
-                        M3Error::Backend(format!(
-                            "failed to load gguf model '{model_path}': {e}"
-                        ))
-                    })?,
+                LlamaModel::load_from_file(backend, model_path, &params).map_err(|e| {
+                    M3Error::Backend(format!("failed to load gguf model '{model_path}': {e}"))
+                })?,
             );
             let n_embd = model.n_embd();
+            let runtime_backend = observe_device(&model, &params, model_path);
 
-            // Wave-3 fix #4: crossbeam_channel::unbounded gives an MPMC pair.
-            // The Receiver is `Clone + Send + Sync`, so each worker holds its
-            // own clone and `recv()` is lock-free — no `Mutex<Receiver>` hot
-            // lock as streams scales.
+            // MPMC: each worker holds its own Receiver clone and `recv()` is
+            // lock-free — no `Mutex<Receiver>` hot lock as streams scales.
             let (tx, rx) = unbounded::<Job>();
 
             // Each worker confirms context creation over this channel so `load`
@@ -635,10 +569,14 @@ pub mod embedded {
                 let handle = std::thread::Builder::new()
                     .name(format!("m3-embed-ctx-{id}"))
                     .spawn(move || {
-                        worker_loop(id, backend, model, rx, ready_tx, n_ctx, seq_max, n_batch, n_ubatch)
+                        worker_loop(
+                            id, backend, model, rx, ready_tx, n_ctx, seq_max, n_batch, n_ubatch,
+                        )
                     })
                     .map_err(|e| {
-                        M3Error::Backend(format!("failed to spawn embed worker {id}: {e}"))
+                        M3Error::Backend(format!(
+                            "failed to spawn embed worker {id} of {streams}: {e}"
+                        ))
                     })?;
                 workers.push(handle);
             }
@@ -653,11 +591,7 @@ pub mod embedded {
                 match ready_rx.recv() {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => {
-                        return Err(M3Error::Backend(
-                            "embed worker died before reporting readiness".into(),
-                        ))
-                    }
+                    Err(_) => return Err(dead_before_ready(&mut workers, streams)),
                 }
             }
 
@@ -666,35 +600,71 @@ pub mod embedded {
                 workers: Mutex::new(workers),
                 n_embd,
                 streams,
+                n_ctx,
+                runtime_backend,
                 model,
             })
         }
 
         /// Exact token counts, one per input, in input order.
         ///
-        /// Uses the SAME tokenizer call the embed path already makes
-        /// (`str_to_token(text, AddBos::Always)`), so a count returned here is
-        /// exactly what `embed_on_ctx` will measure against `n_ctx` — a caller
-        /// that chunks to a budget below `n_ctx` cannot then be surprised by an
-        /// overflow. An estimate cannot offer that guarantee.
-        ///
-        /// Counts INCLUDE the BOS/EOS frame, because `AddBos::Always` is what
-        /// the embed path uses and those tokens occupy `n_ctx` like any other.
+        /// Uses the same `tokenize` the embed path uses, so a count returned
+        /// here is exactly what `embed_on_ctx` will measure against `n_ctx` —
+        /// a caller that chunks to a budget below `n_ctx` cannot then be
+        /// surprised by an overflow. An estimate cannot offer that guarantee.
+        /// Counts INCLUDE the BOS/EOS frame, which occupies `n_ctx` like any
+        /// other token.
         pub fn count_tokens(&self, texts: &[String]) -> Result<Vec<usize>> {
-            let mut out = Vec::with_capacity(texts.len());
-            for text in texts {
-                let tokens = self
-                    .model
-                    .str_to_token(text, AddBos::Always)
-                    .map_err(|e| M3Error::Backend(format!("tokenize failed: {e}")))?;
-                out.push(tokens.len());
+            texts
+                .iter()
+                .map(|t| tokenize(&self.model, t).map(|v| v.len()))
+                .collect()
+        }
+
+        /// Token-exact windows over `text`: `[(start, end), ...]` in CHARACTER
+        /// offsets, each holding at most `budget` tokens (BOS/EOS included, as
+        /// `count_tokens` counts them) and overlapping by about `overlap`. See
+        /// [`crate::windows::plan_windows`].
+        ///
+        /// `budget` must exceed the BOS/EOS frame (else every window would be
+        /// one character) and must not exceed `n_ctx` (else a window cannot
+        /// be embedded): either is a caller error, reported as such.
+        pub fn token_windows(
+            &self,
+            text: &str,
+            budget: usize,
+            overlap: usize,
+        ) -> Result<Vec<(usize, usize)>> {
+            let frame = tokenize(&self.model, "")?.len();
+            if budget <= frame || budget > self.n_ctx as usize {
+                return Err(M3Error::Config(format!(
+                    "token_windows budget {budget} is out of range: it must exceed the {frame}-token \
+                     BOS/EOS frame and be at most n_ctx {} (M3_EMBED_CTX)",
+                    self.n_ctx
+                )));
             }
-            Ok(out)
+            // Byte offset of every character boundary, so a character slice
+            // maps onto `text` without re-encoding.
+            let bounds: Vec<usize> = text
+                .char_indices()
+                .map(|(b, _)| b)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            let n_chars = bounds.len() - 1;
+            let mut count = |s: usize, e: usize| -> Result<usize> {
+                tokenize(&self.model, &text[bounds[s]..bounds[e]]).map(|t| t.len())
+            };
+            crate::windows::plan_windows(n_chars, budget, overlap, &mut count)
         }
 
         /// Embedding dimension reported by the model.
         pub fn n_embd(&self) -> i32 {
             self.n_embd
+        }
+
+        /// The compute backend observed at load (`cuda`, `vulkan`, `metal`, `cpu`).
+        pub fn runtime_backend(&self) -> &str {
+            &self.runtime_backend
         }
 
         /// Number of worker threads / concurrent contexts.
@@ -721,13 +691,46 @@ pub mod embedded {
                     .as_ref()
                     .ok_or_else(|| M3Error::Backend("embed pool shut down".into()))?;
                 sender
-                    .send(Job { texts, reply: reply_tx })
-                    .map_err(|_| M3Error::Backend("embed pool has no live workers".into()))?;
+                    .send(Job {
+                        texts,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| {
+                        M3Error::Backend(format!(
+                        "embed pool has no live workers (all {} exited; see the earlier worker \
+                         panic logs) — recreate the embedder",
+                        self.streams
+                    ))
+                    })?;
             }
-            reply_rx
-                .recv()
-                .map_err(|_| M3Error::Backend("embed worker dropped the job".into()))?
+            // A worker that panics replies with its id and the panic message
+            // before exiting (worker_loop), so this only fires if the reply
+            // itself could not be sent.
+            reply_rx.recv().map_err(|_| {
+                M3Error::Backend("embed worker exited without replying to the job".into())
+            })?
         }
+    }
+
+    /// The error for a worker that died before reporting readiness: names the
+    /// worker and its panic message, found by joining the finished threads.
+    fn dead_before_ready(workers: &mut Vec<JoinHandle<()>>, streams: usize) -> M3Error {
+        let mut why = Vec::new();
+        for (id, h) in workers.drain(..).enumerate() {
+            if h.is_finished() {
+                if let Err(p) = h.join() {
+                    why.push(format!("worker {id} panicked: {}", panic_message(&*p)));
+                }
+            }
+        }
+        M3Error::Backend(format!(
+            "an embed worker (of {streams}) died before reporting readiness: {}",
+            if why.is_empty() {
+                "no panic was recorded".to_string()
+            } else {
+                why.join("; ")
+            }
+        ))
     }
 
     impl Drop for ContextPool {
@@ -738,8 +741,10 @@ pub mod embedded {
                 *g = None;
             }
             if let Ok(mut workers) = self.workers.lock() {
-                for h in workers.drain(..) {
-                    let _ = h.join();
+                for (id, h) in workers.drain(..).enumerate() {
+                    if let Err(p) = h.join() {
+                        log::error!("m3-embed: worker {id} had panicked: {}", panic_message(&*p));
+                    }
                 }
             }
         }
@@ -750,7 +755,7 @@ pub mod embedded {
     /// thread — that is what makes a `!Send` context safe to "pool".
     #[allow(clippy::too_many_arguments)]
     fn worker_loop(
-        _id: usize,
+        id: usize,
         backend: &'static LlamaBackend,
         model: Arc<LlamaModel>,
         rx: Receiver<Job>,
@@ -778,30 +783,31 @@ pub mod embedded {
             .with_n_seq_max(seq_max)
             .with_embeddings(true)
             .with_pooling_type(LlamaPoolingType::Cls)
-            .with_flash_attention_policy(
-                llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED,
-            );
+            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED);
         let mut ctx = match model.new_context(backend, ctx_params) {
             Ok(c) => c,
             Err(e) => {
+                // The usual cause is the KV cache not fitting: every worker
+                // allocates its own n_ctx-sized context, so name the knobs.
                 let _ = ready_tx.send(Err(M3Error::Backend(format!(
-                    "llama context create failed: {e}"
+                    "llama context create failed for worker {id} \
+                     (n_ctx={n_ctx}, seq_max={seq_max}, n_batch={n_batch}, \
+                     n_ubatch={n_ubatch}): {e}. If memory ran out, lower \
+                     M3_EMBED_STREAMS or M3_EMBED_CTX"
                 ))));
                 return;
             }
         };
 
-        // Fix #2: warmup decode. The first real decode call pays the
+        // Warmup decode. The first real decode call pays the
         // kernel-cache + KV-allocator + (on GPU) shader-compile cost — easily
         // 1-5s of first-token latency. Run a single trivial decode + embedding
         // read here so the user-visible cold call only pays the GGUF-load +
         // worker-spawn cost, not the per-context first-decode cost.
-        let warm_tokens = match model.str_to_token("x", AddBos::Always) {
+        let warm_tokens = match tokenize(&model, "x") {
             Ok(t) => t,
             Err(e) => {
-                let _ = ready_tx.send(Err(M3Error::Backend(format!(
-                    "warmup tokenize failed: {e}"
-                ))));
+                let _ = ready_tx.send(Err(M3Error::Backend(format!("worker {id} warmup: {e}"))));
                 return;
             }
         };
@@ -811,20 +817,20 @@ pub mod embedded {
         // See embed_on_ctx for the full rationale.
         if let Err(e) = warm_batch.add_sequence(&warm_tokens, 0, true) {
             let _ = ready_tx.send(Err(M3Error::Backend(format!(
-                "warmup add_sequence failed: {e}"
+                "worker {id} warmup add_sequence failed: {e}"
             ))));
             return;
         }
         ctx.clear_kv_cache();
         if let Err(e) = ctx.encode(&mut warm_batch) {
             let _ = ready_tx.send(Err(M3Error::Backend(format!(
-                "warmup encode failed: {e}"
+                "worker {id} warmup encode failed: {e}"
             ))));
             return;
         }
         if let Err(e) = ctx.embeddings_seq_ith(0) {
             let _ = ready_tx.send(Err(M3Error::Backend(format!(
-                "warmup embeddings read failed: {e}"
+                "worker {id} warmup embeddings read failed: {e}"
             ))));
             return;
         }
@@ -833,7 +839,7 @@ pub mod embedded {
         let _ = ready_tx.send(Ok(()));
         drop(ready_tx);
 
-        // Wave-3 fix #3: keep one LlamaBatch per worker, sized once at the
+        // Keep one LlamaBatch per worker, sized once at the
         // worst case the worker will ever face (`n_ctx` total tokens across
         // `seq_max` sequences). `LlamaBatch::clear()` exists in 0.1.146 and is
         // cheap (just resets counters + zeroes the pos/seq tables in place),
@@ -841,22 +847,47 @@ pub mod embedded {
         // `LlamaBatch::new` per decode.
         let mut batch = LlamaBatch::new(n_ctx as usize, seq_max as i32);
 
-        // Wave-3 fix #2: hoist the L2-normalize destination buffer out of the
+        // Hoist the L2-normalize destination buffer out of the
         // chunk loop too; reused across every sequence in every chunk.
         let mut norm_buf: Vec<f32> = Vec::with_capacity(model.n_embd() as usize);
 
         loop {
-            // Wave-3 fix #4: lock-free recv. crossbeam's Receiver is Sync, so
-            // every worker just calls recv() directly — no Mutex<Receiver>
-            // contention as streams scales.
+            // Lock-free recv: crossbeam's Receiver is Sync.
             let job = match rx.recv() {
                 Ok(j) => j,
                 Err(_) => return, // all senders dropped — pool shutting down
             };
-            let result = embed_on_ctx(
-                &model, &mut ctx, &job.texts, n_ctx, seq_max, &mut batch, &mut norm_buf,
-            );
-            let _ = job.reply.send(result);
+            // A panic inside llama.cpp's Rust wrapper would otherwise drop the
+            // reply channel and leave the caller an anonymous "dropped the
+            // job". Answer with this worker's id and the panic message, then
+            // exit: a context that panicked mid-decode is not trusted again.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                embed_on_ctx(
+                    &model,
+                    &mut ctx,
+                    &job.texts,
+                    n_ctx,
+                    seq_max,
+                    &mut batch,
+                    &mut norm_buf,
+                )
+            }));
+            match result {
+                Ok(r) => {
+                    let _ = job.reply.send(r);
+                }
+                Err(p) => {
+                    let msg = panic_message(&*p);
+                    log::error!(
+                        "m3-embed: worker {id} panicked on a {}-text batch and exited: {msg}",
+                        job.texts.len()
+                    );
+                    let _ = job.reply.send(Err(M3Error::Backend(format!(
+                        "embed worker {id} panicked and exited: {msg}"
+                    ))));
+                    return;
+                }
+            }
         }
     }
 
@@ -891,10 +922,8 @@ pub mod embedded {
         let per_seq_capacity = n_ctx_usize.saturating_div(seq_max_usize.max(1));
         // Tokenize everything up front.
         let mut tokenized = Vec::with_capacity(texts.len());
-        for text in texts {
-            let tokens = model
-                .str_to_token(text, AddBos::Always)
-                .map_err(|e| M3Error::Backend(format!("tokenize failed: {e}")))?;
+        for (index, text) in texts.iter().enumerate() {
+            let tokens = tokenize(model, text)?;
             if tokens.len() > n_ctx_usize {
                 // Typed, not Backend(String): the HTTP layer maps this to 413
                 // while real backend faults stay 500. Counts travel as fields
@@ -903,6 +932,7 @@ pub mod embedded {
                 return Err(M3Error::InputTooLong {
                     tokens: tokens.len(),
                     n_ctx: n_ctx as usize,
+                    index: Some(index),
                 });
             }
             tokenized.push(tokens);
@@ -935,7 +965,7 @@ pub mod embedded {
             }
 
             let chunk = &tokenized[idx..chunk_end];
-            // Wave-3 fix #3: reuse the worker's persistent LlamaBatch. It was
+            // Reuse the worker's persistent LlamaBatch. It was
             // allocated once at worker startup at the worst-case capacity
             // (n_ctx tokens, seq_max sequences). clear() resets counters in
             // place — no per-chunk allocation.
@@ -951,12 +981,10 @@ pub mod embedded {
                 // here marks all tokens up front — same per-call compute
                 // cost as the silent fallback, but no warning, no
                 // re-detection, and no allocator churn under sustained
-                // concurrent load. See reports/hang_diagnosis.md.
+                // concurrent load.
                 batch
                     .add_sequence(tokens, seq_i as i32, true)
-                    .map_err(|e| {
-                        M3Error::Backend(format!("batch add_sequence failed: {e}"))
-                    })?;
+                    .map_err(|e| M3Error::Backend(format!("batch add_sequence failed: {e}")))?;
             }
             // Fresh KV state per chunk; sequences within the chunk are
             // independent so one clear before the decode is enough (no
@@ -966,10 +994,10 @@ pub mod embedded {
             // entry point for embedding contexts. `decode()` works (silent
             // fallback) but logs `decode: cannot decode batches with this
             // context (calling encode() instead)` per call and pays the
-            // re-route cost. See reports/hang_diagnosis.md.
+            // re-route cost.
             ctx.encode(batch)
                 .map_err(|e| M3Error::Backend(format!("llama encode failed: {e}")))?;
-            // Wave-3 fix #2: write into a hoisted reusable buffer, then
+            // Write into a hoisted reusable buffer, then
             // `mem::take` it out into the result vec. The taken Vec carries
             // its allocation away; we reserve a fresh allocation of the same
             // capacity for the next iteration. Replaces the old per-row
@@ -987,7 +1015,7 @@ pub mod embedded {
         Ok(out)
     }
 
-    /// Wave-3 fix #2: in-place L2-normalize from `src` into `dst`. `dst` is
+    /// In-place L2-normalize from `src` into `dst`. `dst` is
     /// cleared first, then refilled via `extend_from_slice` (one bulk memcpy
     /// reusing the existing capacity), then divided in place. Replaces the
     /// old `l2_normalize(&[f32]) -> Vec<f32>` which allocated a fresh Vec
@@ -1031,75 +1059,6 @@ impl ModelBackend for EmbeddedBackend {
 mod tests {
     use super::*;
 
-    #[test]
-    fn http_backend_constructs_endpoint() {
-        let b = HttpBackend::new("http://127.0.0.1:8081/");
-        assert_eq!(b.endpoint(), "http://127.0.0.1:8081/embedding");
-        let b2 = HttpBackend::new("http://localhost:8081");
-        assert_eq!(b2.endpoint(), "http://localhost:8081/embedding");
-    }
-
-    #[test]
-    fn request_body_serializes_to_expected_json_shape() {
-        let req = EmbeddingRequest {
-            input: vec!["hello".to_string(), "world".to_string()],
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json, serde_json::json!({ "input": ["hello", "world"] }));
-    }
-
-    #[test]
-    fn response_body_deserializes() {
-        let raw = serde_json::json!({
-            "data": [
-                { "embedding": [0.1, 0.2, 0.3] },
-                { "embedding": [0.4, 0.5, 0.6] }
-            ]
-        });
-        let parsed: EmbeddingResponse = serde_json::from_value(raw).unwrap();
-        assert_eq!(parsed.data.len(), 2);
-        assert_eq!(parsed.data[0].embedding, vec![0.1, 0.2, 0.3]);
-    }
-
-    /// Fix #27: HttpBackend must surface a timeout error rather than hang
-    /// forever when the upstream server accepts but never responds. We spin
-    /// up a tiny TCP listener that accept()s and then sleeps; the request
-    /// times out at the configured deadline.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn http_backend_request_times_out() {
-        use tokio::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Accept connections forever and just hold them open.
-        tokio::spawn(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                // Pin the socket so the OS keeps the connection open.
-                tokio::spawn(async move {
-                    let _keep = sock;
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                });
-            }
-        });
-
-        let url = format!("http://{addr}");
-        let backend = HttpBackend::new(url).with_timeout(std::time::Duration::from_millis(150));
-        let started = std::time::Instant::now();
-        let err = backend
-            .run(Batch::new(vec!["x".into()], 1))
-            .await
-            .expect_err("should time out");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "should have failed fast on timeout, took {elapsed:?}"
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("timed out"),
-            "expected timeout error, got: {msg}"
-        );
-    }
-
     #[cfg(not(feature = "embedded"))]
     #[tokio::test]
     async fn embedded_backend_is_stub_by_default() {
@@ -1109,19 +1068,21 @@ mod tests {
     }
 
     /// End-to-end inference against a real GGUF model. Opt-in: set
-    /// `M3_TEST_GGUF` to a GGUF embedding model path. Skipped when unset so
-    /// CI without a model file stays green.
+    /// `M3_TEST_GGUF` and run with `--ignored`. Ignored (reported as such),
+    /// never silently passed, when no model is available.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     async fn embedded_backend_runs_real_inference() {
-        let Ok(model_path) = std::env::var("M3_TEST_GGUF") else {
-            eprintln!("M3_TEST_GGUF unset — skipping real-inference test");
-            return;
-        };
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
         // 3-stream pool exercises the worker-thread context pool (CHANGE 1).
         let b = EmbeddedBackend::with_streams(model_path, 3);
         let out = b
-            .run(Batch::new(vec!["hello world".into(), "a different sentence".into()], 4))
+            .run(Batch::new(
+                vec!["hello world".into(), "a different sentence".into()],
+                4,
+            ))
             .await
             .expect("embedding run should succeed");
         assert_eq!(out.rows.len(), 2, "one embedding row per input text");
@@ -1148,15 +1109,17 @@ mod tests {
     /// the same `Arc<ContextPool>` allocation. Proves no double GGUF load.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     async fn shared_pool_invariant_one_arc_per_backend() {
         use m3_dispatcher::{Dispatcher, DispatcherConfig};
-        let Ok(model_path) = std::env::var("M3_TEST_GGUF") else {
-            eprintln!("M3_TEST_GGUF unset — skipping shared-pool invariant test");
-            return;
-        };
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
 
         let backend = EmbeddedBackend::with_streams(model_path, 2);
-        let cfg = DispatcherConfig { streams: 2, ..Default::default() };
+        let cfg = DispatcherConfig {
+            streams: 2,
+            ..Default::default()
+        };
         let dispatcher = Dispatcher::new(cfg, backend);
         // Pull the dispatcher's Arc; this is what `PyEmbeddedEmbedder` keeps.
         let backend_arc = dispatcher.backend().clone();
@@ -1195,11 +1158,10 @@ mod tests {
     /// Opt-in via `M3_TEST_GGUF`.
     #[cfg(feature = "embedded")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
     async fn embedded_backend_concurrent_streams() {
-        let Ok(model_path) = std::env::var("M3_TEST_GGUF") else {
-            eprintln!("M3_TEST_GGUF unset — skipping concurrency test");
-            return;
-        };
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
         let b = std::sync::Arc::new(EmbeddedBackend::with_streams(model_path, 3));
         // Force the model+pool load once before timing the concurrent phase.
         let dim = b.embedding_dim().expect("model should load");
@@ -1226,23 +1188,94 @@ mod tests {
         );
     }
 
-    /// Wave 9.1: confirm the compute-cap detector returns without panicking,
-    /// whether or not `nvidia-smi` is on PATH. Builds only under embedded-cuda.
-    #[cfg(feature = "embedded-cuda")]
+    /// Real-tokenizer windows: every window fits by an exact count of its own
+    /// slice, the text is covered, offsets survive multi-byte characters, and
+    /// prose needs far fewer windows than the estimator's (`max(bytes/3,
+    /// chars) + 2`) plan. Opt-in via `M3_TEST_GGUF`.
+    #[cfg(feature = "embedded")]
     #[test]
-    fn detect_cuda_compute_cap_doesnt_panic() {
-        let _ = super::embedded::detect_cuda_compute_cap();
+    #[ignore = "needs M3_TEST_GGUF (a GGUF embedding model path)"]
+    fn embedded_token_windows_fit_and_beat_the_estimate() {
+        let model_path =
+            std::env::var("M3_TEST_GGUF").expect("set M3_TEST_GGUF to a GGUF embedding model");
+        let b = EmbeddedBackend::new(model_path);
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!(
+                "Memory {i} records that the embedder moved to a free port. "
+            ));
+            if i % 97 == 0 {
+                text.push_str("記憶は共有コンピュータで別のポートを使う 🚀 ");
+            }
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let (budget, overlap) = (512usize, 64usize);
+        // Budgets the pool cannot honour are caller errors, not degenerate plans.
+        assert!(
+            b.token_windows(&text, 2, 0).is_err(),
+            "budget inside the BOS/EOS frame"
+        );
+        assert!(
+            b.token_windows(&text, 1_000_000, 0).is_err(),
+            "budget above n_ctx"
+        );
+        let w = b.token_windows(&text, budget, overlap).expect("windows");
+        assert_eq!(w.first().unwrap().0, 0);
+        assert_eq!(w.last().unwrap().1, chars.len());
+        let slices: Vec<String> = w
+            .iter()
+            .map(|&(s, e)| chars[s..e].iter().collect())
+            .collect();
+        let counts = b.count_tokens(&slices).expect("counts");
+        for (i, c) in counts.iter().enumerate() {
+            assert!(
+                *c <= budget,
+                "window {i} {:?} has {c} tokens > {budget}",
+                w[i]
+            );
+        }
+        let estimate = |s: usize, e: usize| -> Result<usize> {
+            let slice: String = chars[s..e].iter().collect();
+            Ok((slice.len() / 3).max(e - s) + 2)
+        };
+        let est =
+            crate::windows::plan_windows(chars.len(), budget, overlap, &mut { estimate }).unwrap();
+        eprintln!(
+            "{} chars: {} exact windows vs {} estimated",
+            chars.len(),
+            w.len(),
+            est.len()
+        );
+        assert!(
+            w.len() * 2 < est.len(),
+            "exact {} vs estimated {}",
+            w.len(),
+            est.len()
+        );
     }
 
-    /// Wave 9.1: second call must respect whatever the first call set. Once
-    /// GGML_CUDA_DISABLE_GRAPHS is present, the helper must leave it alone.
+    /// The compute-cap probe returns (a list or a cause) whether or not
+    /// `nvidia-smi` is on PATH. Builds only under embedded-cuda.
     #[cfg(feature = "embedded-cuda")]
     #[test]
-    fn maybe_disable_cuda_graphs_idempotent() {
-        super::embedded::maybe_disable_cuda_graphs_for_blackwell();
-        let after_first = std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_some();
-        super::embedded::maybe_disable_cuda_graphs_for_blackwell();
-        let after_second = std::env::var_os("GGML_CUDA_DISABLE_GRAPHS").is_some();
-        assert_eq!(after_first, after_second, "second call must not unset");
+    fn detect_cuda_compute_caps_returns_a_result() {
+        match crate::cuda_env::detect_cuda_compute_caps() {
+            Ok(gpus) => assert!(!gpus.is_empty()),
+            Err(cause) => assert!(!cause.is_empty()),
+        }
+    }
+
+    /// Preparing the environment twice must not change what the first call set.
+    #[cfg(feature = "embedded-cuda")]
+    #[test]
+    fn prepare_process_env_idempotent() {
+        crate::prepare_process_env();
+        let after_first = std::env::var_os("GGML_CUDA_DISABLE_GRAPHS");
+        crate::prepare_process_env();
+        assert_eq!(
+            after_first,
+            std::env::var_os("GGML_CUDA_DISABLE_GRAPHS"),
+            "second call must not change it"
+        );
     }
 }

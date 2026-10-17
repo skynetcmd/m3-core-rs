@@ -1169,7 +1169,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "m3-config"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "libc",
  "log",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "m3-core-py"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "bytemuck",
  "env_logger",
@@ -1206,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "m3-dispatchd"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "anyhow",
  "axum",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "m3-dispatcher"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "criterion",
  "log",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "m3-embed-llamacpp"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "crossbeam-channel",
  "llama-cpp-2",
@@ -1248,7 +1248,7 @@ dependencies = [
 
 [[package]]
 name = "m3-embed-server"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1278,11 +1278,11 @@ dependencies = [
 
 [[package]]
 name = "m3-error"
-version = "3.10.16"
+version = "3.10.17"
 
 [[package]]
 name = "m3-fts"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "m3-error",
  "regex",
@@ -1290,11 +1290,11 @@ dependencies = [
 
 [[package]]
 name = "m3-governor"
-version = "3.10.16"
+version = "3.10.17"
 
 [[package]]
 name = "m3-graph"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "m3-error",
  "m3-resilience",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "m3-hash"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "log",
  "m3-error",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "m3-ingest"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "log",
  "m3-error",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "m3-ner-ort"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "log",
  "m3-dispatcher",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "m3-rank"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "criterion",
  "m3-error",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "m3-redact"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "criterion",
  "log",
@@ -1356,11 +1356,11 @@ dependencies = [
 
 [[package]]
 name = "m3-resilience"
-version = "3.10.16"
+version = "3.10.17"
 
 [[package]]
 name = "m3-route"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "criterion",
  "m3-error",
@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "m3-vector"
-version = "3.10.16"
+version = "3.10.17"
 dependencies = [
  "bytemuck",
  "criterion",

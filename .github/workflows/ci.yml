@@ -112,8 +112,10 @@ jobs:
     - name: cargo check (m3-core-py, embedded + onnx features)
       run: cargo check -p m3-core-py --features embedded,onnx --all-targets
 
+    # --no-fail-fast: one crate's failure must not hide the crates after it
+    # (a Windows-only m3-config failure once left the rest of the workspace unrun).
     - name: cargo test (workspace)
-      run: cargo test --workspace
+      run: cargo test --workspace --no-fail-fast
 
     - name: cargo test (m3-embed-server, embedded feature)
       run: cargo test -p m3-embed-server --features embedded

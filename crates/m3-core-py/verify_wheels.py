@@ -83,6 +83,16 @@ def verify_wheel(path: Path) -> list[str]:
     """Return a list of problem strings (empty = wheel OK)."""
     problems: list[str] = []
     is_win = _is_windows_wheel(path.name)
+    # 0. A Linux wheel must carry a manylinux tag. build_local.py passes
+    # --auditwheel skip, so a local linux-cuda build comes out `linux_x86_64`
+    # until `auditwheel repair --exclude libcuda.so.1` runs; PyPI-style
+    # installers refuse that tag, and 3.10.171's cuda wheels passed this script
+    # unrepaired (2026-10-17).
+    if path.name.endswith("-linux_x86_64.whl"):
+        problems.append(
+            "platform tag is linux_x86_64 (not auditwheel-repaired): run "
+            "`auditwheel repair --exclude libcuda.so.1 -w <dir> <wheel>`"
+        )
     exe = "m3-embed-server.exe" if is_win else "m3-embed-server"
     target = f"m3_core_rs/{exe}"
     with zipfile.ZipFile(path) as z:
@@ -233,6 +243,7 @@ def _synthetic_wheel(
     sbom_root: str | None = None,
     type_bits: bool = True,
     binary_marker: bytes = b"",
+    unrepaired: bool = False,
 ) -> Path:
     """A minimal but VALID cpu wheel, so the only variable is the one under test.
 
@@ -250,7 +261,7 @@ def _synthetic_wheel(
     import hashlib as _hashlib
     import zipfile as _zip
 
-    plat = "win_amd64" if win else "manylinux_2_38_x86_64"
+    plat = "win_amd64" if win else ("linux_x86_64" if unrepaired else "manylinux_2_38_x86_64")
     exe = "m3-embed-server.exe" if win else "m3-embed-server"
     name = f"m3_core_rs_{'windows' if win else 'linux'}_cpu-9.9.9-cp313-cp313-{plat}.whl"
     whl = dirpath / name
@@ -383,6 +394,11 @@ def selftest() -> int:
         probs = verify_wheel(dirty)
         expect("sanitize_sbom clears the leak and keeps the wheel valid",
                scrubbed > 0 and probs == [], f"scrubbed={scrubbed} problems={probs}")
+
+        (d / "unrepaired").mkdir(parents=True)
+        probs = verify_wheel(_synthetic_wheel(d / "unrepaired", mode=0o755, unrepaired=True))
+        expect("a linux_x86_64 (unrepaired) wheel is reported",
+               len(probs) == 1 and "auditwheel" in probs[0], f"problems={probs}")
 
     print()
     if failures:

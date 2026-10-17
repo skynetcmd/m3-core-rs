@@ -112,51 +112,10 @@ pub async fn serve(
 
 #[cfg(windows)]
 mod win {
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    /// The current user's SID as a string ("S-1-5-21-...").
-    pub fn current_user_sid() -> anyhow::Result<String> {
-        unsafe {
-            let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                anyhow::bail!(
-                    "OpenProcessToken failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let mut len = 0u32;
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
-            let mut buf = vec![0u8; len as usize];
-            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
-            CloseHandle(token);
-            if ok == 0 {
-                anyhow::bail!(
-                    "GetTokenInformation failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut wide: *mut u16 = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut wide) == 0 {
-                anyhow::bail!(
-                    "ConvertSidToStringSidW failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            let n = (0..).take_while(|&i| *wide.add(i) != 0).count();
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(wide, n));
-            LocalFree(wide.cast());
-            Ok(s)
-        }
-    }
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
     /// Security attributes for the pipe. Sound to send between threads: the
     /// descriptor they point at is leaked and never written after creation.
@@ -205,7 +164,7 @@ pub async fn serve(
     if !endpoint.starts_with(r"\\.\pipe\") {
         anyhow::bail!(r"a Windows endpoint must be a named pipe (\\.\pipe\NAME); got {endpoint}");
     }
-    let sid = win::current_user_sid()?;
+    let sid = m3_config::os::current_user_sid().map_err(anyhow::Error::msg)?;
     let mut attrs = win::only_user(&sid)?;
     let create = |first: bool, attrs: &mut win::Attrs| -> std::io::Result<NamedPipeServer> {
         let mut opts = ServerOptions::new();

@@ -23,6 +23,15 @@ pub fn no_console_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// The SID of the account this process runs as, e.g. `S-1-5-18` for a
+/// service (Windows). One owner: the secrets-file access check and the
+/// dispatch daemon's pipe both use it. The daemon carried a copy that read
+/// `TOKEN_USER` from a byte buffer with no alignment guarantee.
+#[cfg(windows)]
+pub fn current_user_sid() -> Result<String, String> {
+    crate::winacl::current_user_sid()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +55,12 @@ mod tests {
         let out = no_console_window(&mut cmd).output().expect("spawn");
         assert_eq!(out.status.code(), Some(3));
         assert!(String::from_utf8_lossy(&out.stdout).contains("m3"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_current_user_sid_is_a_sid() {
+        let sid = current_user_sid().expect("sid");
+        assert!(sid.starts_with("S-1-"), "{sid}");
     }
 }

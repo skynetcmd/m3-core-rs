@@ -624,7 +624,8 @@ def smoke_test(os_tok: str, version: str, backend: str) -> bool:
         print(f"[smoke] {os_tok}/{backend}: no wheel to test", file=sys.stderr)
         return False
     # Test with the interpreter the wheel was built for, read from its tag
-    # (cp314 -> 3.14). A fixed 3.13 failed every `--pythons` build without 3.13.
+    # (cp314 -> 3.14): a fixed interpreter fails any `--pythons` build that
+    # does not include it.
     wheel = wheels[0]
     tag = re.search(r"-cp3(\d+)-", wheel.name)
     if not tag:

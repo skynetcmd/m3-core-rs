@@ -121,9 +121,9 @@ mod tests {
         );
     }
 
-    /// The seam's gate: no other crate names a FIPS key. A second reader is how
-    /// FIPS from m3_config.toml went missing (the embed server read its own file,
-    /// m3 Python read env alone).
+    /// The seam's gate: no other crate names a FIPS key. A second reader can
+    /// decide the tier from a different source than m3_config.toml and leave a
+    /// process silently outside FIPS mode.
     #[test]
     fn only_this_module_names_the_fips_keys() {
         let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

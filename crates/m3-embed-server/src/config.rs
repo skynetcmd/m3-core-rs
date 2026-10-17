@@ -107,8 +107,8 @@ fn default_of(key: &Key) -> Option<Value> {
         "embed.server.streams" => Value::Int(default_streams() as i64),
         "embed.server.seq_max" => Value::Int(DEFAULT_SEQ_MAX.into()),
         // n_batch / n_ubatch follow embed.ctx (resolved in load), as in the
-        // in-process core: a fixed default below ctx was raised at the FFI and
-        // warned about on every start although nothing had been set.
+        // in-process core: a fixed default below ctx would be raised at the FFI
+        // with a warning on every start, for a value nobody set.
         "embed.server.coalesce_ms" => Value::Int(DEFAULT_COALESCE_MS as i64),
         "embed.server.max_batch_tokens" => Value::Int(DEFAULT_MAX_BATCH_TOKENS as i64),
         n if n == FIPS_MODE.name || n == FIPS_STRICT.name => Value::Bool(false),

@@ -130,7 +130,9 @@ fn check_private(p: &Path) -> Result<(), ConfigError> {
     } else {
         None
     };
-    let foreign = crate::sddl::foreign_principals(&sddl, &user, owner);
+    let mut names = vec![user.as_str()];
+    names.extend(crate::winacl::user_aliases(&user));
+    let foreign = crate::sddl::foreign_principals(&sddl, &names, owner);
     if foreign.is_empty() {
         return Ok(());
     }

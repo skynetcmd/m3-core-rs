@@ -9,11 +9,11 @@ use std::ptr;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertStringSidToSidW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+    PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -62,6 +62,38 @@ pub(crate) fn current_user_sid() -> Result<String, String> {
     }
 }
 
+/// The SDDL aliases that stand for `user_sid` in a descriptor's text. SDDL
+/// writes two user accounts as aliases, never as their SID: `LA` (the built-in
+/// Administrator, RID 500) and `LG` (Guest, RID 501). A check that compares
+/// SIDs alone reads that user's own ace as someone else's.
+pub(crate) fn user_aliases(user_sid: &str) -> Vec<&'static str> {
+    ["LA", "LG"]
+        .into_iter()
+        .filter(|a| alias_sid(a).as_deref() == Some(user_sid))
+        .collect()
+}
+
+/// The SID an SDDL alias stands for on this machine, or None if Windows does
+/// not resolve it.
+fn alias_sid(alias: &str) -> Option<String> {
+    let wide: Vec<u16> = alias.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the SID and the
+    // string Windows allocates are freed with LocalFree.
+    unsafe {
+        let mut psid: PSID = ptr::null_mut();
+        if ConvertStringSidToSidW(wide.as_ptr(), &mut psid) == 0 {
+            return None;
+        }
+        let mut out: *mut u16 = ptr::null_mut();
+        let ok = ConvertSidToStringSidW(psid, &mut out);
+        LocalFree(psid);
+        if ok == 0 {
+            return None;
+        }
+        Some(take_wide(out))
+    }
+}
+
 /// The owner and DACL of `path` as an SDDL string.
 pub(crate) fn file_sddl(path: &Path) -> Result<String, String> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -102,5 +134,23 @@ pub(crate) fn file_sddl(path: &Path) -> Result<String, String> {
             ));
         }
         Ok(take_wide(out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn la_resolves_to_this_machines_administrator_and_names_only_that_user() {
+        let admin = alias_sid("LA").expect("Windows resolves LA");
+        assert!(
+            admin.starts_with("S-1-5-21-") && admin.ends_with("-500"),
+            "{admin}"
+        );
+        assert_eq!(user_aliases(&admin), vec!["LA"]);
+        let me = current_user_sid().unwrap();
+        assert_eq!(user_aliases(&me).contains(&"LA"), me == admin, "{me}");
+        assert!(user_aliases("S-1-5-18").is_empty());
     }
 }

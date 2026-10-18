@@ -271,7 +271,7 @@ fn hash_provider() -> &'static str {
 /// The FIPS tier the Rust core computes from m3_config.toml: `"off"`, `"mode"`
 /// or `"strict"`, the strings of m3's `crypto_provider.fips_tier()`. `config_file`
 /// names the file; None locates it as m3 does (M3_CONFIG_ROOT, then
-/// M3_MEMORY_ROOT/config, then ~/.m3/config). For m3's Python/Rust parity test:
+/// ~/.m3/config). For m3's Python/Rust parity test:
 /// the same file must give the same tier in both languages.
 #[pyfunction]
 #[pyo3(signature = (config_file=None))]
@@ -1510,9 +1510,10 @@ fn embed_backend_label() -> &'static str {
     m3_embed_llamacpp::COMPILED_BACKEND
 }
 
-/// DEPRECATED: the settings an `EmbeddedEmbedder` built with no parameters
-/// would use (legacy environment names, else defaults), under the legacy
-/// names. m3 passes the parameters instead; kept for one release.
+/// The settings an `EmbeddedEmbedder` built with no parameters uses: the
+/// defaults (environment names are not read), keyed by the settings' former
+/// environment names. For tests that pin the computed defaults; m3 passes the
+/// parameters.
 #[pyfunction]
 fn env_config_summary(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let s = config::resolve(config::EmbedParams::default());

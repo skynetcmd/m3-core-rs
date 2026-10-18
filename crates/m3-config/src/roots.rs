@@ -3,8 +3,8 @@
 //! Mirrors m3's owner, `m3_memory/_roots.py` (`config_root_with_tier`,
 //! `_derived`, `abs_root`) and `bin/m3_core/config/loader.py` (`locate`):
 //!
-//! `--config <file>` > `M3_CONFIG_ROOT` > `M3_MEMORY_ROOT/config` (legacy)
-//! > `~/.m3/config`; the file is `<root>/m3_config.toml`.
+//! `--config <file>` > `M3_CONFIG_ROOT` > `~/.m3/config`; the file is
+//! `<root>/m3_config.toml`. `M3_MEMORY_ROOT` is not read (logged once if set).
 //!
 //! The two languages cannot share the function, so the cases are pinned by the
 //! tests below; a change to the Python precedence must change this file too.
@@ -24,7 +24,6 @@ pub const CONFIG_FILE_NAME: &str = "m3_config.toml";
 pub enum Tier {
     Arg,
     Env,
-    Legacy,
     Default,
 }
 
@@ -33,7 +32,6 @@ impl Tier {
         match self {
             Tier::Arg => "arg:--config",
             Tier::Env => "env:M3_CONFIG_ROOT",
-            Tier::Legacy => "legacy:M3_MEMORY_ROOT/config",
             Tier::Default => "default:~/.m3/config",
         }
     }
@@ -72,12 +70,16 @@ pub fn locate(explicit: Option<&Path>, env: &dyn Env) -> Result<Location, String
         });
     }
     let (root, tier) = config_root_with_tier(env)?;
-    if tier == Tier::Legacy {
-        log::warn!(
-            "the m3 config root comes from the legacy M3_MEMORY_ROOT/config tier ({}), which m3 \
-             removes at N+3. Set M3_CONFIG_ROOT, or pass --config <file>",
-            root.display()
-        );
+    if tier == Tier::Default {
+        if let Some(mem) = env.var(MEMORY_ROOT_ENV) {
+            // No longer a tier: said once so a leftover pin is not silently ignored.
+            log::warn!(
+                "{MEMORY_ROOT_ENV} is set ({mem:?}) but not read: the config root is {}. If your \
+                 m3_config.toml lives elsewhere, set {CONFIG_ROOT_ENV} or pass --config <file>; \
+                 then unset {MEMORY_ROOT_ENV}",
+                root.display()
+            );
+        }
     }
     // One separator style for display (`abs_root` returns forward slashes).
     let root: PathBuf = root.components().collect();
@@ -94,16 +96,9 @@ pub fn config_root_with_tier(env: &dyn Env) -> Result<(PathBuf, Tier), String> {
     if let Some(root) = env.var(CONFIG_ROOT_ENV) {
         return Ok((PathBuf::from(abs_root(&root, env)?), Tier::Env));
     }
-    if let Some(mem) = env.var(MEMORY_ROOT_ENV) {
-        return Ok((
-            PathBuf::from(format!("{}/config", abs_root(&mem, env)?)),
-            Tier::Legacy,
-        ));
-    }
     let home = env.home().ok_or_else(|| {
         "cannot locate m3_config.toml: no home directory could be determined (HOME / USERPROFILE) \
-         and neither M3_CONFIG_ROOT nor M3_MEMORY_ROOT is set. Pass --config <file>, or set \
-         M3_CONFIG_ROOT"
+         and M3_CONFIG_ROOT is not set. Pass --config <file>, or set M3_CONFIG_ROOT"
             .to_string()
     })?;
     Ok((home.join(".m3").join("config"), Tier::Default))
@@ -208,11 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn memory_root_gives_its_config_subdirectory_as_the_legacy_tier() {
+    fn memory_root_is_not_read() {
         let env = base().with(MEMORY_ROOT_ENV, "/srv/mem");
         let loc = locate(None, &env).unwrap();
-        assert_eq!(loc.tier, Tier::Legacy);
-        assert_eq!(s(&loc.root), "/srv/mem/config");
+        assert_eq!(loc.tier, Tier::Default);
+        assert_eq!(s(&loc.file), "/h/user/.m3/config/m3_config.toml");
     }
 
     #[test]
@@ -227,7 +222,7 @@ mod tests {
         let env = base()
             .with(CONFIG_ROOT_ENV, "")
             .with(MEMORY_ROOT_ENV, "/srv/mem");
-        assert_eq!(locate(None, &env).unwrap().tier, Tier::Legacy);
+        assert_eq!(locate(None, &env).unwrap().tier, Tier::Default);
     }
 
     #[test]
@@ -281,7 +276,6 @@ mod tests {
     fn tier_names_match_m3() {
         assert_eq!(Tier::Arg.as_str(), "arg:--config");
         assert_eq!(Tier::Env.as_str(), "env:M3_CONFIG_ROOT");
-        assert_eq!(Tier::Legacy.as_str(), "legacy:M3_MEMORY_ROOT/config");
         assert_eq!(Tier::Default.as_str(), "default:~/.m3/config");
     }
 }

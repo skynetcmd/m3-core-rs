@@ -13,7 +13,7 @@
 //!                     service. (Unix supervisors run foreground mode directly.)
 //!
 //! Config: m3's m3_config.toml and the secrets file it names (src/config.rs).
-//! Per key: `--set` > m3_config.toml > the legacy environment name > default.
+//! Per key: `--set` > m3_config.toml > default (environment names are not read).
 
 #[cfg(feature = "embedded")]
 mod config;
@@ -166,9 +166,9 @@ fn print_help() {
          USAGE:\n  \
            m3-embed-server [--config <m3_config.toml>] [\"--set={{key=value, ...}}\"] [SUBCOMMAND]\n\
          \n\
-         Settings come from m3's m3_config.toml (M3_CONFIG_ROOT > M3_MEMORY_ROOT/config > ~/.m3/config,\n\
-         or --config) and the secrets file it names. --set (foreground and secure only) outranks the\n\
-         file; legacy M3_* environment names rank below it. `install` records --config for the service.\n\
+         Settings come from m3's m3_config.toml (--config > M3_CONFIG_ROOT > ~/.m3/config) and the\n\
+         secrets file it names. --set (foreground and secure only) outranks the file; no other M3_*\n\
+         environment variable is read. `install` records --config for the service.\n\
          \n\
          SUBCOMMANDS:\n  \
            (none)        run in foreground (dev mode); Ctrl-C to stop \

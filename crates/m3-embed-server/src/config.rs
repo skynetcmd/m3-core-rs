@@ -4,7 +4,8 @@
 //! files (m3 memory `9655f30a`); `m3_config` locates and parses them. This
 //! module says WHICH keys the server reads, their defaults, and what a
 //! supervised service will see. Precedence per key, m3's:
-//! `--set` > m3_config.toml > the legacy environment name > the default.
+//! `--set` > m3_config.toml > the default. A former environment name is not
+//! read; one still set is logged once at startup.
 //!
 //! A service is started with `--config <m3_config.toml>` (`install` pins it):
 //! the Windows service runs as LocalSystem, and launchd / systemd start it
@@ -18,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use m3_config::{secrets, Config, Key, Overrides, ProcessEnv, Source, Value};
+use m3_config::{secrets, Config, Key, Overrides, ProcessEnv, Source};
 
 // ── The keys the server reads (m3 registry names) ───────────────────────────
 pub const GGUF: Key = Key::path("embed.gguf", &["M3_EMBED_GGUF"]);
@@ -99,24 +100,6 @@ const DEFAULT_SEQ_MAX: u32 = 32;
 const DEFAULT_COALESCE_MS: u64 = 3;
 const DEFAULT_MAX_BATCH_TOKENS: usize = 2048;
 
-/// The default a key takes when nothing sets it (`None`: no default).
-fn default_of(key: &Key) -> Option<Value> {
-    Some(match key.name {
-        "embed.server.host" => Value::Str(DEFAULT_HOST.into()),
-        "embed.server.port" => Value::Int(DEFAULT_PORT.into()),
-        "embed.ctx" => Value::Int(DEFAULT_CTX.into()),
-        "embed.server.streams" => Value::Int(default_streams() as i64),
-        "embed.server.seq_max" => Value::Int(DEFAULT_SEQ_MAX.into()),
-        // n_batch / n_ubatch follow embed.ctx (resolved in load), as in the
-        // in-process core: a fixed default below ctx would be raised at the FFI
-        // with a warning on every start, for a value nobody set.
-        "embed.server.coalesce_ms" => Value::Int(DEFAULT_COALESCE_MS as i64),
-        "embed.server.max_batch_tokens" => Value::Int(DEFAULT_MAX_BATCH_TOKENS as i64),
-        n if n == FIPS_MODE.name || n == FIPS_STRICT.name => Value::Bool(false),
-        _ => return None,
-    })
-}
-
 // ── The command line's global options ───────────────────────────────────────
 /// `--config <file>` and `--set={...}`, given before the subcommand.
 #[derive(Debug, Default, Clone)]
@@ -162,7 +145,7 @@ fn load_with(overrides: bool, aliases: bool) -> anyhow::Result<Config> {
     )?)
 }
 
-/// This process's settings: `--set`, the file, the legacy environment names.
+/// This process's settings: `--set`, then the file, then the defaults.
 pub fn load() -> anyhow::Result<Config> {
     load_with(true, true)
 }
@@ -182,22 +165,12 @@ pub fn located_file() -> String {
 }
 
 /// What `install` pins into the service's command line: `--config <file>`,
-/// after checking the service can start from that file alone. Refused when
-/// this shell sets something (a legacy environment name) the service would
-/// not see, or when the file does not give the service a working config.
+/// after checking the service can start from that file alone. Settings come
+/// only from the file (and --set), so this shell cannot give the server
+/// anything the service would not see.
 pub fn service_args() -> anyhow::Result<(Vec<String>, PathBuf)> {
-    let cli = load()?;
     let svc = load_service_view()?;
     let file = svc.location().file.clone();
-    let unseen = unseen_by_service(&cli, &svc)?;
-    if !unseen.is_empty() {
-        anyhow::bail!(
-            "refusing to install: the service reads only {} and would run with other settings than \
-             this shell gives:\n  - {}\nRecord them in the file, then install again",
-            file.display(),
-            unseen.join("\n  - ")
-        );
-    }
     resolve(&svc).map_err(|e| {
         anyhow::anyhow!(
             "refusing to install: the service could not start from {}: {e:#}",
@@ -288,13 +261,16 @@ fn int<T: TryFrom<i64> + Copy>(
 pub fn resolve(cfg: &Config) -> anyhow::Result<ResolvedConfig> {
     let file = cfg.location().file.clone();
     let mut sources = Vec::new();
-    let (gguf, from) =
-        cfg.path(&GGUF)?.ok_or_else(|| {
-            anyhow::anyhow!(
-            "embed.gguf is not set: {} ({}; located by {}) has no [embed] gguf, and no --set or \
-             M3_EMBED_GGUF gives one. Set it: m3 config set embed.gguf <model.gguf>{}",
+    let (gguf, from) = cfg.path(&GGUF)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "embed.gguf is not set: {} ({}; located by {}) has no [embed] gguf, and no --set \
+             gives one. Set it: m3 config set embed.gguf <model.gguf>{}",
             file.display(),
-            if cfg.file_present() { "present" } else { "absent" },
+            if cfg.file_present() {
+                "present"
+            } else {
+                "absent"
+            },
             cfg.location().tier,
             if config_given() {
                 ""
@@ -303,7 +279,7 @@ pub fn resolve(cfg: &Config) -> anyhow::Result<ResolvedConfig> {
                  (`m3-embed-server --config <file> install` records it)"
             }
         )
-        })?;
+    })?;
     note(&mut sources, &GGUF, &from);
     let gguf_source = from.to_string();
     let gguf = gguf.to_string_lossy().into_owned();
@@ -394,48 +370,6 @@ pub fn security_config(
         fips_strict_source,
         token_from,
     })
-}
-
-/// The settings this shell would give the server that a supervised service
-/// would NOT see: a legacy environment value that differs from what the
-/// file (or the default) gives. `install` refuses them: the service would
-/// silently run with something else.
-pub fn unseen_by_service(cli: &Config, service: &Config) -> anyhow::Result<Vec<String>> {
-    let mut out = Vec::new();
-    for key in KEYS.iter() {
-        let Some((value, Source::LegacyEnv { name, .. })) = cli.get(key)? else {
-            continue;
-        };
-        let svc = service
-            .get(key)?
-            .map(|(v, _)| v)
-            .or_else(|| default_of(key));
-        if svc.as_ref() == Some(&value) {
-            continue;
-        }
-        let shown = match &svc {
-            Some(v) => format!("would use {}", show(v)),
-            None => "would have none".to_string(),
-        };
-        out.push(format!(
-            "{name} sets {} = {} here, but the service does not see this environment and {shown}. \
-             Record it: m3 config set {} {}",
-            key.name,
-            show(&value),
-            key.name,
-            show(&value)
-        ));
-    }
-    Ok(out)
-}
-
-fn show(v: &Value) -> String {
-    match v {
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Str(s) => format!("{s:?}"),
-        Value::Path(p) => format!("{:?}", p.to_string_lossy()),
-    }
 }
 
 /// Where the SUPERVISED service listens: the file's host and port, or the
@@ -609,7 +543,8 @@ mod tests {
     }
 
     /// The trigger: a FIPS setting made in m3_config.toml must reach the server,
-    /// outrank the legacy environment name, and be reported as the file's.
+    /// win over a former environment name (which is not read), and be reported
+    /// as the file's.
     #[test]
     fn fips_flags_set_only_in_m3_config_take_effect_and_outrank_the_env() {
         let f = Fixture::new();
@@ -699,24 +634,27 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_env_names_apply_below_the_file_and_set_wins_over_all() {
+    fn the_legacy_env_names_are_not_read_and_set_wins_over_all() {
         let f = Fixture::new();
+        let text = format!("[embed]\ngguf = {}\n", f.gguf_toml());
         let env = MapEnv::new()
             .with("M3_EMBED_SERVER_PORT", "8094")
             .with("M3_FIPS_MODE", "1")
-            .with("M3_EMBED_GGUF", &f.gguf.to_string_lossy());
-        let r = resolve(&f.config("", env.clone(), None)).unwrap();
-        assert_eq!(r.port, 8094);
-        assert!(r.security.fips_mode);
+            .with("M3_EMBED_GGUF", "/elsewhere/other.gguf");
+        let r = resolve(&f.config(&text, env.clone(), None)).unwrap();
+        assert_eq!(r.port, 8082, "M3_EMBED_SERVER_PORT must not be read");
+        assert!(!r.security.fips_mode, "M3_FIPS_MODE must not be read");
         assert!(
-            r.security.fips_mode_from.contains("M3_FIPS_MODE"),
+            !r.gguf_source.contains("M3_EMBED_GGUF"),
             "{}",
-            r.security.fips_mode_from
+            r.gguf_source
         );
-        assert!(r.gguf_source.contains("M3_EMBED_GGUF"), "{}", r.gguf_source);
 
         let r = resolve(&f.config(
-            "[embed.server]\nport = 8095\n",
+            &format!(
+                "[embed]\ngguf = {}\n[embed.server]\nport = 8095\n",
+                f.gguf_toml()
+            ),
             env,
             Some("{embed.server.port=8096, crypto.fips_mode=false}"),
         ))
@@ -876,33 +814,6 @@ mod tests {
             "{e}"
         );
         assert!(e.contains("m3 config set embed.gguf"), "{e}");
-    }
-
-    #[test]
-    fn install_refuses_env_settings_the_service_will_not_see() {
-        let f = Fixture::new();
-        let text = format!("[embed]\ngguf = {}\n", f.gguf_toml());
-        // The same port as the default and the same model as the file: fine.
-        let env = MapEnv::new()
-            .with("M3_EMBED_SERVER_PORT", "8082")
-            .with("M3_EMBED_GGUF", &f.gguf.to_string_lossy());
-        let cli = f.config(&text, env, None);
-        let svc = f.config(&text, MapEnv::new(), None);
-        assert!(unseen_by_service(&cli, &svc).unwrap().is_empty());
-        // A different port only in the environment: refused, with the fix.
-        let cli = f.config(
-            &text,
-            MapEnv::new().with("M3_EMBED_SERVER_PORT", "8083"),
-            None,
-        );
-        let found = unseen_by_service(&cli, &svc).unwrap();
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(
-            found[0].contains("M3_EMBED_SERVER_PORT")
-                && found[0].contains("would use 8082")
-                && found[0].contains("m3 config set embed.server.port 8083"),
-            "{found:?}"
-        );
     }
 
     #[test]

@@ -17,15 +17,18 @@ The binary lands at `target\release\m3-embed-server.exe`.
 The server reads m3's two config files, the same ones m3 reads:
 
 * `m3_config.toml`, found as m3 finds it: `--config <file>` > `M3_CONFIG_ROOT`
-  > `M3_MEMORY_ROOT/config` > `~/.m3/config`.
+  > `~/.m3/config`.
 * the secrets file it names (`[secrets] file`, default
   `<config root>/m3_secrets.toml`, user-only), for the token digest only.
 
-Per setting: `"--set={key=value, ...}"` > `m3_config.toml` > the legacy
-environment name (deprecated, warned) > the default. The startup log names
-where every non-default value came from.
+Per setting: `"--set={key=value, ...}"` > `m3_config.toml` > the default. The
+startup log names where every non-default value came from. The only
+environment variables read are `M3_CONFIG_ROOT` and, for debugging, `M3_DEBUG`
+and `RUST_LOG`. A former environment name (second column) is not read: if one
+is still set, the server says so once, with the `m3 config set` that replaces
+it (`m3 config import-env` moves them all).
 
-| key (m3_config.toml) | legacy env name | default |
+| key (m3_config.toml) | former env name (not read) | default |
 |---|---|---|
 | `[embed] gguf` | `M3_EMBED_GGUF` | none (required) |
 | `[embed] ctx` | `M3_EMBED_CTX` | 8192 |
@@ -78,8 +81,8 @@ The binary is its own service installer — no nssm, no external tooling.
 
 What `install` does:
 1. Checks that the service can start from that file alone (it will not see
-   this shell's environment or a `--set`); a legacy environment value that
-   differs from the file is refused with the `m3 config set` that records it.
+   this shell's environment or a `--set`, and no former `M3_*` environment name
+   is read by either).
 2. Creates a service named `m3-embed-server` (auto-start, LocalSystem account)
    whose `binPath` is `<self>.exe --config <m3_config.toml> run-as-service`
    (LocalSystem cannot find your config root on its own). An existing

@@ -267,14 +267,14 @@ class OrtNer:
 def sanitize_fts(query: str, max_len: int = 500) -> str: ...
 def compile_fts_query(query: str, mode: str) -> tuple[str, bool]: ...
 
-# --- m3-dispatcher + M3_* env config --------------------------------------
+# --- m3-dispatcher config ---------------------------------------------------
 
 def estimate_tokens(text: str) -> int:
     """max(len(text.encode()) // 3, len(text)) + 2; never under-counts BGE-M3."""
     ...
 
 class DispatcherConfig:
-    """Per setting: the argument > its legacy M3_* environment name (deprecated) > default.
+    """Per setting: the argument > default (environment names are not read).
     ctx only feeds the max_batch_tokens default (streams * ctx)."""
 
     streams: int
@@ -291,7 +291,8 @@ class DispatcherConfig:
     def __repr__(self) -> str: ...
 
 def env_config_summary() -> dict[str, object]:
-    """DEPRECATED: what an EmbeddedEmbedder built with no setting arguments would use."""
+    """The defaults an EmbeddedEmbedder built with no setting arguments uses, keyed by
+    the settings' former environment names (which are not read)."""
     ...
 def embed_backend_label() -> str:
     """The COMPILED backend; see EmbeddedEmbedder.runtime_backend for the observed one."""

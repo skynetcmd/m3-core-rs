@@ -3,8 +3,7 @@
 //! m3 has exactly two config files (user decision, m3 memory `9655f30a`):
 //!
 //! * `m3_config.toml`: every setting, readable. Located by [`roots::locate`]:
-//!   `--config <file>` > `M3_CONFIG_ROOT` > `M3_MEMORY_ROOT/config` >
-//!   `~/.m3/config`.
+//!   `--config <file>` > `M3_CONFIG_ROOT` > `~/.m3/config`.
 //! * the secrets file it names (`[secrets] file`, default
 //!   `<config root>/m3_secrets.toml`), user-only. [`secrets`] reads one value
 //!   from it.
@@ -16,7 +15,8 @@
 //! the ONE place in the Rust core that locates or parses either file.
 //!
 //! Precedence for one key, as m3's registry has it:
-//! `--set` > m3_config.toml > the key's legacy environment name > default.
+//! `--set` > m3_config.toml > default. A key's former environment name is not
+//! read; it is kept only to name the variable in messages.
 //! Every resolved value carries its [`Source`], so a message can name the
 //! setting that decided it.
 

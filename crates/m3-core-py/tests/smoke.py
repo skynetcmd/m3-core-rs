@@ -160,20 +160,25 @@ def test_dispatcher_and_env() -> None:
     cfg3 = m.DispatcherConfig(streams=3, ctx=4096)
     assert (cfg3.streams, cfg3.max_batch_tokens) == (3, 3 * 4096), cfg3
 
-    # A parameter outranks the legacy environment name.
+    # A parameter decides; the former environment name is not read.
     os.environ["M3_EMBED_STREAMS"] = "16"
-    assert m.DispatcherConfig(streams=5).streams == 5
-    del os.environ["M3_EMBED_STREAMS"]
+    try:
+        assert m.DispatcherConfig(streams=5).streams == 5
+    finally:
+        del os.environ["M3_EMBED_STREAMS"]
 
     if hasattr(m, "EmbeddedEmbedder"):
         # warmup=False defers the model load, so no GGUF is needed to see the
         # parameter reach the backend's context pool.
         os.environ["M3_EMBED_STREAMS"] = "16"
-        emb = m.EmbeddedEmbedder("not-loaded.gguf", warmup=False, streams=3, ctx=4096)
-        assert emb.streams() == 3, emb.streams()
-        # Not given: the deprecated environment name still applies, this release.
-        assert m.EmbeddedEmbedder("not-loaded.gguf", warmup=False).streams() == 16
-        del os.environ["M3_EMBED_STREAMS"]
+        try:
+            emb = m.EmbeddedEmbedder("not-loaded.gguf", warmup=False, streams=3, ctx=4096)
+            assert emb.streams() == 3, emb.streams()
+            # Not given: the default, never the former environment name.
+            plain = m.EmbeddedEmbedder("not-loaded.gguf", warmup=False).streams()
+            assert plain != 16, plain
+        finally:
+            del os.environ["M3_EMBED_STREAMS"]
 
     # defaults (assuming no M3_* env vars set)
     cfg = m.DispatcherConfig()
@@ -222,30 +227,21 @@ def test_dispatcher_and_env() -> None:
         f"{summary['M3_EMBED_STREAMS']} * {summary['M3_EMBED_CTX']}"
     )
 
-    # n_ubatch / n_batch track n_ctx when ctx is raised via env; and
-    # max_batch_tokens recomputes from the new ctx too.
+    # The former environment names are not read (3.10.171 / 3.10.172): setting
+    # one changes neither the defaults nor a DispatcherConfig built without it.
+    default_streams = summary["M3_EMBED_STREAMS"]
+    os.environ["M3_EMBED_STREAMS"] = str(default_streams + 7)
     os.environ["M3_EMBED_CTX"] = "4096"
-    bumped = m.env_config_summary()
-    assert bumped["M3_EMBED_N_UBATCH"] == 4096, bumped["M3_EMBED_N_UBATCH"]
-    assert bumped["M3_EMBED_N_BATCH"] == 4096, bumped["M3_EMBED_N_BATCH"]
-    assert (
-        bumped["M3_EMBED_MAX_BATCH_TOKENS"]
-        == bumped["M3_EMBED_STREAMS"] * 4096
-    ), bumped["M3_EMBED_MAX_BATCH_TOKENS"]
-    del os.environ["M3_EMBED_CTX"]
-
-    # An explicit M3_EMBED_MAX_BATCH_TOKENS still overrides the computed default.
-    os.environ["M3_EMBED_MAX_BATCH_TOKENS"] = "1024"
-    assert m.env_config_summary()["M3_EMBED_MAX_BATCH_TOKENS"] == 1024
-    del os.environ["M3_EMBED_MAX_BATCH_TOKENS"]
-
-    # The deprecated env name is still picked up when no parameter is given.
-    os.environ["M3_EMBED_STREAMS"] = "16"
-    assert m.env_config_summary()["M3_EMBED_STREAMS"] == 16
-    assert m.DispatcherConfig().streams == 16
-    # kwarg still wins over env
-    assert m.DispatcherConfig(streams=4).streams == 4
-    del os.environ["M3_EMBED_STREAMS"]
+    try:
+        again = m.env_config_summary()
+        assert again["M3_EMBED_STREAMS"] == default_streams, again
+        assert again["M3_EMBED_CTX"] == summary["M3_EMBED_CTX"], again
+        assert m.DispatcherConfig().streams == default_streams
+        # a parameter is the way to choose a value
+        assert m.DispatcherConfig(streams=4).streams == 4
+    finally:
+        del os.environ["M3_EMBED_STREAMS"]
+        del os.environ["M3_EMBED_CTX"]
 
 
 def test_version() -> None:

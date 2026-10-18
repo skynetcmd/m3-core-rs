@@ -1,10 +1,9 @@
-//! Reading settings from m3_config.toml, `--set` and legacy environment names.
+//! Reading settings from m3_config.toml and `--set`.
 //!
 //! Precedence for one key, as m3's registry has it
-//! (`bin/m3_core/config/resolve.py`): `--set` > m3_config.toml > the key's
-//! legacy environment name > the default. A file value is checked against the
-//! key's TOML type (`Key.coerce_file_value`); an environment value is parsed
-//! with m3's parser for the kind (`registry.parse_bool` / `parse_int`).
+//! (`bin/m3_core/config/resolve.py`): `--set` > m3_config.toml > the default.
+//! A key's former environment name is not read; one still set is logged once.
+//! A file value is checked against the key's TOML type (`Key.coerce_file_value`).
 //! An invalid value is an error naming the key, where it was set and the fix,
 //! never a silent fall back to the default (DESIGN_PHILOSOPHIES §3).
 
@@ -28,7 +27,8 @@ pub enum Kind {
 }
 
 /// One setting: its m3 registry name (`table.leaf`), kind, and the legacy
-/// environment names honoured below the file.
+/// environment names it once answered to. Those are never read for a value: a
+/// leftover one is reported (and named in a `--set` refusal), nothing more.
 #[derive(Debug, Clone, Copy)]
 pub struct Key {
     pub name: &'static str,
@@ -116,7 +116,6 @@ pub enum Value {
 pub enum Source {
     Set { key: String },
     File { key: String, file: PathBuf },
-    LegacyEnv { name: String, key: String },
     Default,
 }
 
@@ -130,9 +129,6 @@ impl std::fmt::Display for Source {
                     None => key.clone(),
                 };
                 write!(f, "{shown} in {}", file.display())
-            }
-            Source::LegacyEnv { name, key } => {
-                write!(f, "the environment variable {name} (legacy name of {key})")
             }
             Source::Default => f.write_str("the default"),
         }
@@ -224,21 +220,6 @@ fn from_toml(key: &Key, v: &toml::Value, home: Option<&dyn Env>) -> Result<Value
             expected(kind),
             toml_type(other)
         )),
-    }
-}
-
-/// An environment value parsed by the kind's parser.
-fn from_text(key: &Key, raw: &str, home: Option<&dyn Env>) -> Result<Value, String> {
-    match key.kind {
-        Kind::Bool => parse_bool(raw).map(Value::Bool).ok_or_else(|| {
-            format!("{raw:?} is not a boolean; use one of true/false, 1/0, yes/no, on/off")
-        }),
-        Kind::Int { .. } => match raw.trim().parse::<i64>() {
-            Ok(v) => int_in_range(key.kind, v),
-            Err(_) => Err(format!("{raw:?} is not an integer")),
-        },
-        Kind::Str => Ok(Value::Str(raw.to_string())),
-        Kind::Path => path_value(raw, home),
     }
 }
 
@@ -434,8 +415,9 @@ impl std::fmt::Debug for Config {
 impl Config {
     /// Read the file at `location`. An absent file is not an error (every key
     /// takes its default); an unreadable or invalid one is refused with the
-    /// path and the fix. `aliases`: where legacy environment names are read
-    /// (`None`: not at all, e.g. for what a supervised service will see).
+    /// path and the fix. `aliases`: where a key's former environment names are
+    /// looked up, only to log once that one is set and not read (`None`: not at
+    /// all, e.g. for what a supervised service will see).
     /// `home` expands `~` in path values.
     pub fn load(
         location: Location,
@@ -526,38 +508,26 @@ impl Config {
                 },
             )));
         }
-        let Some(env) = self.aliases.as_deref() else {
-            return Ok(None);
-        };
-        for name in key.legacy_env {
-            let Some(raw) = env.var(name) else { continue };
-            let v = from_text(key, &raw, self.home()).map_err(|e| {
-                ConfigError(format!(
-                    "the environment variable {name} (legacy name of {}) is invalid: {e}. Unset it and \
-                     set {} in {}",
-                    key.name,
-                    key.file_line("<value>"),
-                    self.location.file.display()
-                ))
-            })?;
-            if once(&format!("legacy:{name}")) {
-                log::warn!(
-                    "{name} decides {} ({raw:?}): environment names for m3 settings are deprecated and \
-                     rank below m3_config.toml. Set it in {} as {} (`m3 config set {} <value>`), \
-                     then unset {name}",
-                    key.name,
-                    self.location.file.display(),
-                    key.file_line("<value>"),
-                    key.name
-                );
+        // Environment names are not read for settings (only M3_CONFIG_ROOT, as a
+        // locator, and M3_DEBUG): a leftover one is said once, with the fix, and
+        // the default applies. It used to rank below the file, so a variable only a
+        // shell saw could give a process settings a service never had.
+        if let Some(env) = self.aliases.as_deref() {
+            for name in key.legacy_env {
+                if let Some(raw) = env.var(name) {
+                    if once(&format!("legacy:{name}")) {
+                        log::warn!(
+                            "{name} is set ({raw:?}) but not read: m3 takes {} only from {} \
+                             (or its default). Set it there as {} (`m3 config set {} <value>`; \
+                             `m3 config import-env` moves every leftover), then unset {name}",
+                            key.name,
+                            self.location.file.display(),
+                            key.file_line("<value>"),
+                            key.name
+                        );
+                    }
+                }
             }
-            return Ok(Some((
-                v,
-                Source::LegacyEnv {
-                    name: (*name).into(),
-                    key: key.name.into(),
-                },
-            )));
         }
         Ok(None)
     }
@@ -690,20 +660,16 @@ mod tests {
     }
 
     #[test]
-    fn the_legacy_env_name_applies_only_below_the_file_and_is_reported() {
-        let env = MapEnv::new().with("M3_FIPS_MODE", "yes");
+    fn a_legacy_env_name_is_not_read_even_with_no_file_value() {
+        let env = MapEnv::new()
+            .with("M3_FIPS_MODE", "yes")
+            .with("M3_EMBED_SERVER_PORT", "9999");
         let (_d, cfg) = config(None, Overrides::default(), env);
-        let (on, from) = cfg.bool_or(&FLAG, false).unwrap();
-        assert!(on);
+        assert_eq!(cfg.bool_or(&FLAG, false).unwrap(), (false, Source::Default));
         assert_eq!(
-            from,
-            Source::LegacyEnv {
-                name: "M3_FIPS_MODE".into(),
-                key: "crypto.fips_mode".into()
-            }
+            cfg.int_or::<u16>(&PORT, 8082).unwrap(),
+            (8082, Source::Default)
         );
-        let (port, from) = cfg.int_or::<u16>(&PORT, 8082).unwrap();
-        assert_eq!((port, from), (8082, Source::Default));
     }
 
     #[test]
@@ -737,17 +703,13 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_legacy_env_value_is_an_error_not_the_default() {
+    fn an_invalid_legacy_env_value_is_not_read_either() {
         let (_d, cfg) = config(
             None,
             Overrides::default(),
             MapEnv::new().with("M3_FIPS_MODE", "maybe"),
         );
-        let e = cfg.bool_or(&FLAG, false).unwrap_err().0;
-        assert!(
-            e.contains("M3_FIPS_MODE") && e.contains("not a boolean"),
-            "{e}"
-        );
+        assert_eq!(cfg.bool_or(&FLAG, false).unwrap(), (false, Source::Default));
     }
 
     #[test]
